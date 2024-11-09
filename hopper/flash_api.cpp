@@ -1844,6 +1844,8 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
     }
 
     // Because we're using TMA reduce add, we need to zero out dk_expanded and dv_expanded
+    dk_expanded = dk_expanded.to(at::kFloat);
+    dv_expanded = dv_expanded.to(at::kFloat);
     dk_expanded.zero_();
     dv_expanded.zero_();
 
@@ -1889,10 +1891,17 @@ flex_flash_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x 
         softmax_d.zero_();
     }
 
+    dk_expanded = dk_expanded.to(q_dtype);
+    dv_expanded = dv_expanded.to(q_dtype);
+
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
         at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
         at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
+    }
+    else{
+        dk = dk_expanded;
+        dv = dv_expanded;
     }
 
     if (head_size_og % 8 != 0) {

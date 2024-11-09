@@ -245,12 +245,12 @@ struct CollectiveMainloopBwd {
         // has no swizzle.
         // If the address is only 128 bytes aligned, it's possible that the 1st row has swizzle
         // and when we read it back in the postprocess kernel, the swizzle will not match.
-        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>, 1024> smem_dqacc;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdO>> smem_do;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutdS>> smem_ds;
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_lse;
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_dpsum;
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>, 1024> smem_dqacc;
     };
 
     static constexpr int SharedStorageQdOSize = sizeof(decltype((TensorStorage{}).smem_q)) + sizeof(decltype((TensorStorage{}).smem_do)) + sizeof(decltype((TensorStorage{}).smem_ds)) + sizeof(decltype((TensorStorage{}).smem_dqacc));

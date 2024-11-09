@@ -40,18 +40,15 @@ struct CollectiveEpilogueBwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
-    using SmemLayoutAtomdKVTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+    using SmemLayoutAtomdKVTMA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, ElementAccum,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutdKVTMA = decltype(tile_to_shape(SmemLayoutAtomdKVTMA{}, select<1, 2>(TileShape_MNK{})));
 
-    using SmemLayoutAtomdKV = SmemLayoutAtomdKVTMA;
-    using SmemLayoutdKV = decltype(tile_to_shape(SmemLayoutAtomdKV{}, select<1, 2>(TileShape_MNK{})));
+    using SmemCopyAtomdKV = Copy_Atom<cute::DefaultCopy, ElementAccum>;
 
-    using SmemCopyAtomdKV = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
-
-    struct TensorStorage : cute::aligned_struct<128> {
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>> smem_dk;
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutdKV>> smem_dv;
+    struct TensorStorage : cute::aligned_struct<1024> {
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVTMA>, 1024> smem_dk;
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdKVTMA>, 1024> smem_dv;
     };
 
     using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_q, d, head, batch)
@@ -60,17 +57,17 @@ struct CollectiveEpilogueBwd {
 
     using TMA_dKV = decltype(make_tma_copy(
         GmemTiledCopydKVTMA{},
-        make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapedKV{}, StridedKV{}),
+        make_tensor(make_gmem_ptr(static_cast<ElementAccum*>(nullptr)), ShapedKV{}, StridedKV{}),
         SmemLayoutdKVTMA{},
         select<1, 2>(TileShape_MNK{}),
         _1{}));  // no mcast for dKV
 
     // Host side kernel arguments
     struct Arguments {
-        Element* ptr_dK;
+        ElementAccum* ptr_dK;
         ShapedKV const shape_dK;
         StridedKV const stride_dK;
-        Element* ptr_dV;
+        ElementAccum* ptr_dV;
         StridedKV const stride_dV;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
@@ -79,10 +76,10 @@ struct CollectiveEpilogueBwd {
 
     // Device side kernel params
     struct Params {
-        Element* ptr_dK;
+        ElementAccum* ptr_dK;
         ShapedKV const shape_dK;
         StridedKV const stride_dK;
-        Element* ptr_dV;
+        ElementAccum* ptr_dV;
         StridedKV const stride_dV;
         TMA_dKV tma_store_dK, tma_store_dV;
         int const* cu_seqlens = nullptr;
@@ -132,13 +129,13 @@ struct CollectiveEpilogueBwd {
           ) {
 
         auto [n_block, bidh, bidb] = block_coord;
-        Tensor sdK = make_tensor(make_smem_ptr(shared_storage.epilogue.smem_dk.data()), SmemLayoutdKV{});
-        Tensor sdV = make_tensor(make_smem_ptr(shared_storage.epilogue.smem_dv.data()), SmemLayoutdKV{});
+        Tensor sdK = make_tensor(make_smem_ptr(shared_storage.epilogue.smem_dk.data()), SmemLayoutdKVTMA{});
+        Tensor sdV = make_tensor(make_smem_ptr(shared_storage.epilogue.smem_dv.data()), SmemLayoutdKVTMA{});
         auto smem_tiled_copy_dKV = make_tiled_copy_C(SmemCopyAtomdKV{}, tiled_mma);
         auto smem_thr_copy_dKV = smem_tiled_copy_dKV.get_thread_slice(thread_idx);
 
-        Tensor tdVrdV_out = flash::convert_type<Element>(tdVrdV);
-        Tensor tdKrdK_out = flash::convert_type<Element>(tdKrdK);
+        Tensor tdKrdK_out = flash::convert_type<ElementAccum>(tdKrdK);
+        Tensor tdVrdV_out = flash::convert_type<ElementAccum>(tdVrdV);
         Tensor taccdKrdK = smem_thr_copy_dKV.retile_S(tdKrdK_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
         Tensor taccdVrdV = smem_thr_copy_dKV.retile_S(tdVrdV_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
         Tensor taccdKsdK = smem_thr_copy_dKV.partition_D(sdK);     // ((Atom,AtomNum),PIPE_M,PIPE_N)

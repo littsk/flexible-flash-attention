@@ -95,10 +95,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.q_ranges, params.k_ranges
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
-        static_cast<Element*>(params.dk_ptr),
+        static_cast<ElementAccum*>(params.dk_ptr),
         {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1},  // shape_dK
         {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0},  // stride_dK
-        static_cast<Element*>(params.dv_ptr),
+        static_cast<ElementAccum*>(params.dv_ptr),
         {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0}, // stride_dV
         params.cu_seqlens_k,
         params.seqused_k,
@@ -120,6 +120,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // Get the ptr to kernel function.
     void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
     int smem_size = AttnKernel::SharedStorageSize;
+    std::cout << "smem_size = " << smem_size << std::endl;
     // int smem_size_q = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_q));
     // int smem_size_do = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_do));
     // int smem_size_ds = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_ds));

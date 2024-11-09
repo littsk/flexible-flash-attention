@@ -409,7 +409,7 @@ class FlexFlashAttnFunc(torch.autograd.Function):
         # dq is not padded because we will using dqaccum in cpp code
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         
-        _flex_flash_attn_backward(
+        _, dk, dv, _ = _flex_flash_attn_backward(
             dout,
             q,
             k,
