@@ -58,6 +58,8 @@ class FlashAttentionForwardBase:
         qhead_per_kvhead: int = 1,
         is_causal: bool = False,
         is_local: bool = False,
+        is_arbitrary: bool = False,
+        func_num: int = 0,
         pack_gqa: bool = True,
         tile_m: int = 128,
         tile_n: int = 128,
@@ -100,6 +102,8 @@ class FlashAttentionForwardBase:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_arbitrary = is_arbitrary
+        self.func_num = func_num
         self.pack_gqa = pack_gqa
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -1991,6 +1995,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                mask_arbitrary=self.is_arbitrary,
+                func_num=self.func_num,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
             )

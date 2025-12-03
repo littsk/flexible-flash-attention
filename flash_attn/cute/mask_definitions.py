@@ -61,6 +61,15 @@ def flex_mini_causal_mask(b, h, q_idx, kv_idx):
 def flex_document_mask(b, h, q_idx, kv_idx, doc_id):
     return doc_id[b, h, q_idx] == doc_id[b, h, kv_idx]
 
+def flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func):
+    zero = h * 0
+    value_valid = kv_idx < arbitrary_func[b, zero, zero, q_idx]
+    n_func = arbitrary_func.shape[2]
+    for i in range(n_func // 2):
+        in_range = (kv_idx >= arbitrary_func[b, zero, zero + (2*i+1), q_idx]) & (kv_idx < arbitrary_func[b, zero, zero + (2*i+2), q_idx])
+        value_valid = value_valid | in_range
+    return value_valid
+
 
 # CuTe versions for kernel compilation
 def get_cute_causal_mask(offset: int):
@@ -125,6 +134,24 @@ def cute_document_mask(
     m_doc = utils.scalar_to_ssa(doc_id[batch[0], head[0], m_idx[0]], cutlass.Int32)
     n_doc = utils.scalar_to_ssa(doc_id[batch[0], head[0], n_idx[0]], cutlass.Int32)
     return m_doc == n_doc
+
+@cute.jit
+def cute_arbitrary_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    aux_tensors: list,
+) -> cute.TensorSSA:
+    arbitrary_func = aux_tensors[0]
+    value_valid = False
+    if n_idx[0] < arbitrary_func[batch[0], 0, 0, m_idx[0]]:
+        value_valid = True
+    n_func = arbitrary_func.shape[2]
+    for i in range(n_func // 2):
+        if n_idx[0] >= arbitrary_func[batch[0], 0, 2 * i + 1, m_idx[0]] and n_idx[0] < arbitrary_func[batch[0], 0, 2 * i + 2, m_idx[0]]:
+            value_valid = True
+    return utils.scalar_to_ssa(value_valid, cutlass.Boolean)
 
 
 @cute.jit
@@ -236,6 +263,26 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
+def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu"):
+    arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
+    lengths = [315, 1021, 2201, 199, 1266, 494, 1204, 2669, 555, 6, 1217, 1351, 1136, 281, 2475]
+    offset = 0
+    for i in range(len(lengths)):
+        if i == 0:
+            for j in range(lengths[i]):
+                arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
+                arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
+                arbitrary_func_tensor[:, :, 2, offset + j] = j + 2
+        else:
+            for j in range(lengths[i]):
+                arbitrary_func_tensor[:, :, 0, offset + j] = 0
+                arbitrary_func_tensor[:, :, 1, offset + j] = offset
+                arbitrary_func_tensor[:, :, 2, offset + j] = offset + j + 1
+        offset += lengths[i]
+    # coef = 1 / n_func
+    # for i in range(n_func):
+    #     arbitrary_func_tensor[:, :, i, :] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)
+    return arbitrary_func_tensor
 
 STATIC_MASKS = {
     "block_diagonal": (cute_block_diagonal_mask, flex_block_diagonal_mask),
@@ -244,6 +291,7 @@ STATIC_MASKS = {
     "dilated_sliding_window": (cute_dilated_sliding_window_mask, flex_dilated_sliding_window_mask),
     "document": (cute_document_mask, flex_document_mask),
     "ima": (cute_ima_mask, flex_ima_mask),
+    "arbitrary": (cute_arbitrary_mask, flex_arbitrary_mask),
 }
 
 PARAMETERIZED_MASK_FACTORIES = {

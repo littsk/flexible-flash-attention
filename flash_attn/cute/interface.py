@@ -44,7 +44,8 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
-    to_cute_block_sparse_tensors,
+    LinearBlockSparseTensorsTorch,
+    to_cute_linear_block_sparse_tensors,
     normalize_block_sparse_tensors,
 )
 
@@ -80,6 +81,7 @@ def _flash_attn_fwd(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    arbitrary: bool = False,
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
@@ -95,7 +97,7 @@ def _flash_attn_fwd(
     _compute_capability: Optional[int] = None,
     score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
-    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -107,7 +109,7 @@ def _flash_attn_fwd(
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
-        block_sparse_tensors: A tuple of tensors used for block sparsity. 
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -272,22 +274,23 @@ def _flash_attn_fwd(
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-        m_block_size_block = m_block_size
-        if compute_capability == 10:
-            # TODO: This multiplier should really be q_stage, wire up in later PR
-            # 1 cta handles 2*tile_m row
-            m_block_size_block = 2 * m_block_size
-        expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
-        expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
-        block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=(batch_size, num_head, expected_m_blocks),
-            expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
-        )
-        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
+        # m_block_size_block = m_block_size
+        # if compute_capability == 10:
+        #     # TODO: This multiplier should really be q_stage, wire up in later PR
+        #     # 1 cta handles 2*tile_m row
+        #     m_block_size_block = 2 * m_block_size
+        # expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
+        # expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
+        # block_sparse_tensors = normalize_block_sparse_tensors(
+        #     block_sparse_tensors,
+        #     expected_count_shape=(batch_size, num_head, expected_m_blocks),
+        #     expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
+        # )
+        sparse_tensors = to_cute_linear_block_sparse_tensors(block_sparse_tensors)
 
     use_block_sparsity = sparse_tensors is not None
 
+    func_num = 0
     if mask_mod is None:
         if causal:
             window_size_right = 0
@@ -297,8 +300,17 @@ def _flash_attn_fwd(
                 causal, local = True, False
             else:
                 causal, local = False, True
+        if arbitrary:
+            window_size_left, window_size_right = 0, 0
+            causal, local = False, False
     else:
-        causal, local = False, False
+        causal, local, arbitrary = False, False, False
+    if arbitrary:
+        if aux_tensors is None:
+            raise ValueError("aux_tensors must be provided for arbitrary mask")
+        if aux_tensors[0].shape[2] % 2 == 0:
+            raise ValueError("aux_tensors must have an odd number of functions for arbitrary mask")
+        func_num = aux_tensors[0].shape[2]
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -346,7 +358,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
-        lse_tensor = None 
+        lse_tensor = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -394,7 +406,7 @@ def _flash_attn_fwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     compile_key = (
         dtype,
@@ -402,6 +414,8 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         causal,
+        arbitrary,
+        func_num,
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
@@ -435,6 +449,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
                 pack_gqa=pack_gqa,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
@@ -455,6 +471,8 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
@@ -539,6 +557,7 @@ def _flash_attn_bwd(
     lse: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    arbitrary: bool = False,
     softcap: float = 0.0,
     m_block_size: int = 64,
     n_block_size: int = 128,
@@ -557,6 +576,8 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = torch.cuda.get_device_capability()[0]
@@ -772,7 +793,16 @@ def _flash_attn_bwd(
         if t is not None else None
         for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
     ]
+    sparse_tensors = None
+    if block_sparse_tensors is not None:
+        sparse_tensors = to_cute_linear_block_sparse_tensors(block_sparse_tensors)
+
+    func_num = aux_tensors[0].shape[2] if arbitrary and aux_tensors is not None else 0
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
@@ -840,6 +870,9 @@ def _flash_attn_bwd(
             head_dim_v,
             qhead_per_kvhead,
             causal,
+            arbitrary,
+            func_num,
+            block_sparse_tensors is not None,
             softcap != 0.0,
             m_block_size,
             n_block_size,
@@ -896,6 +929,8 @@ def _flash_attn_bwd(
                 head_dim,
                 head_dim_v,
                 is_causal=causal,
+                is_arbitrary=arbitrary,
+                func_num=func_num,
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
@@ -921,6 +956,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            blocksparse_tensors=sparse_tensors,
+            aux_tensors=cute_aux_tensors,
             mdQ_semaphore=dQ_semaphore_tensor,
             mdK_semaphore=dK_semaphore_tensor,
             mdV_semaphore=dV_semaphore_tensor,
@@ -941,6 +978,8 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        blocksparse_tensors=sparse_tensors,
+        aux_tensors=cute_aux_tensors,
         mdQ_semaphore=dQ_semaphore_tensor,
         mdK_semaphore=dK_semaphore_tensor,
         mdV_semaphore=dV_semaphore_tensor,
@@ -949,6 +988,7 @@ def _flash_attn_bwd(
     num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
+    torch.cuda.synchronize()
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
@@ -1046,6 +1086,7 @@ class FlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
+        arbitrary: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
@@ -1053,26 +1094,19 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         mask_mod: Optional[Callable] = None,
-        full_block_cnt: Optional[torch.Tensor] = None,
-        full_block_idx: Optional[torch.Tensor] = None,
-        mask_block_cnt: Optional[torch.Tensor] = None,
-        mask_block_idx: Optional[torch.Tensor] = None,
+        linear_k_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
+        linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
+        aux_tensors: Optional[list[torch.Tensor]] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
-        block_sparse_tensors = None
-        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
-            block_sparse_tensors = BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-            )
+        block_sparse_tensors = linear_k_block_sparse_tensors
         out, lse = _flash_attn_fwd(
             q,
             k,
             v,
             softmax_scale=softmax_scale,
             causal=causal,
+            arbitrary=arbitrary,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
@@ -1080,14 +1114,18 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
+        ctx.arbitrary = arbitrary
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.linear_q_block_sparse_tensors = linear_q_block_sparse_tensors
+        ctx.aux_tensors = aux_tensors
         return out, lse
 
     @staticmethod
@@ -1102,7 +1140,10 @@ class FlashAttnFunc(torch.autograd.Function):
             lse,
             ctx.softmax_scale,
             ctx.causal,
+            ctx.arbitrary,
             ctx.softcap,
+            block_sparse_tensors=ctx.linear_q_block_sparse_tensors,
+            aux_tensors=ctx.aux_tensors,
             deterministic=ctx.deterministic,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
@@ -1186,6 +1227,7 @@ def flash_attn_func(
     v: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    arbitrary: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
@@ -1193,10 +1235,9 @@ def flash_attn_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     mask_mod: Optional[Callable] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
+    linear_k_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
+    linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1204,6 +1245,7 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
+        arbitrary,
         window_size,
         learnable_sink,
         softcap,
@@ -1211,10 +1253,9 @@ def flash_attn_func(
         pack_gqa,
         deterministic,
         mask_mod,
-        full_block_cnt,
-        full_block_idx,
-        mask_block_cnt,
-        mask_block_idx,
+        linear_k_block_sparse_tensors,
+        linear_q_block_sparse_tensors,
+        aux_tensors,
     )
 
 

@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
 from flash_attn.cute import utils
 
 
@@ -440,6 +440,7 @@ def consume_block_sparse_loads(
 @cute.jit
 def load_block_list_sm100(
     block_indices: cute.Tensor,
+    block_offset,
     block_count,
     load_q_with_first: cutlass.Constexpr,
     m_block,
@@ -453,7 +454,7 @@ def load_block_list_sm100(
     """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count)."""
     if block_count > 0:
         # First iteration: load Q alongside K if requested
-        n_block_first = block_indices[block_count - 1]
+        n_block_first = block_indices[block_offset + block_count - 1]
 
         if const_expr(load_q_with_first):
             # SM100 loads Q0 and optionally Q1
@@ -470,7 +471,7 @@ def load_block_list_sm100(
 
         # Remaining blocks
         for offset in cutlass.range(1, block_count):
-            n_block = block_indices[block_count - 1 - offset]
+            n_block = block_indices[block_offset + block_count - 1 - offset]
             load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
             kv_producer_state.advance()
             load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
@@ -482,7 +483,7 @@ def load_block_list_sm100(
 # SM100-specific tile processor using SM100 helpers
 @cute.jit
 def produce_block_sparse_loads_sm100(
-    blocksparse_tensors: BlockSparseTensors,
+    blocksparse_tensors: LinearBlockSparseTensors,
     batch_idx,
     head_idx,
     m_block,
@@ -499,16 +500,19 @@ def produce_block_sparse_loads_sm100(
     SM100 uses PipelineTmaUmma which doesn't support extra_tx_count, so we use
     simplified block processing that just calls producer_acquire without extras.
     """
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[m_block]
+    curr_mask_block_offset = mask_block_offset[m_block]
+    curr_mask_block_idx = mask_block_idx
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[m_block]
+        curr_full_block_offset = full_block_offset[m_block]
+        curr_full_block_idx = full_block_idx
     else:
         curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
         curr_full_block_idx = None
 
     mask_empty = curr_mask_block_cnt == 0
@@ -520,6 +524,7 @@ def produce_block_sparse_loads_sm100(
         # No masked blocks: process full list with Q loading
         kv_producer_state = load_block_list_sm100(
             curr_full_block_idx,
+            curr_full_block_offset,
             curr_full_block_cnt,
             load_q_with_first=True,
             m_block=m_block,
@@ -535,6 +540,7 @@ def produce_block_sparse_loads_sm100(
         # Process masked blocks with Q loading
         kv_producer_state = load_block_list_sm100(
             curr_mask_block_idx,
+            curr_mask_block_offset,
             curr_mask_block_cnt,
             load_q_with_first=True,
             m_block=m_block,
@@ -551,6 +557,7 @@ def produce_block_sparse_loads_sm100(
             # Process full blocks without Q loading
             kv_producer_state = load_block_list_sm100(
                 curr_full_block_idx,
+                curr_full_block_offset,
                 curr_full_block_cnt,
                 load_q_with_first=False,
                 m_block=m_block,
@@ -569,20 +576,213 @@ def produce_block_sparse_loads_sm100(
 
 
 @cute.jit
+def load_block_list_bwd_sm100(
+    block_indices: cute.Tensor,
+    block_offset,
+    block_count,
+    load_kv_with_first: cutlass.Constexpr,
+    load_Q,
+    load_K,
+    load_V,
+    load_dO,
+    copy_stats,
+    gLSE,
+    sLSE,
+    gdPsum,
+    sdPsum,
+    pipeline_Q,
+    pipeline_LSE,
+    pipeline_dO,
+    pipeline_dPsum,
+    producer_state_Q_LSE,
+    producer_state_dO_dPsum,
+    tma_copy_bytes,
+):
+    """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count)."""
+    if block_count > 0:
+        if const_expr(load_kv_with_first):
+            # First iteration: load Q alongside K if requested
+            m_block_first = block_indices[block_offset + block_count - 1]
+            # K & Q
+            pipeline_Q.producer_acquire(
+                producer_state_Q_LSE, extra_tx_count=tma_copy_bytes["K"]
+            )
+            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+            load_Q(m_block_first, producer_state=producer_state_Q_LSE)
+            pipeline_Q.producer_commit(producer_state_Q_LSE)
+            # LSE
+            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gLSE[None, m_block_first],
+                    sLSE[None, producer_state_Q_LSE.index],
+                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                )
+            producer_state_Q_LSE.advance()
+            # V & dO
+            pipeline_dO.producer_acquire(
+                producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes["V"]
+            )
+            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
+            load_dO(m_block_first, producer_state=producer_state_dO_dPsum)
+            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+            # dPsum
+            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gdPsum[None, m_block_first],
+                    sdPsum[None, producer_state_dO_dPsum.index],
+                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                )
+            producer_state_dO_dPsum.advance()
+
+            block_count -= 1
+
+        # Remaining blocks
+        for offset in cutlass.range(0, block_count):
+            m_block = block_indices[block_offset + block_count - 1 - offset]
+            # Q
+            pipeline_Q.producer_acquire(producer_state_Q_LSE)
+            load_Q(m_block, producer_state=producer_state_Q_LSE)
+            pipeline_Q.producer_commit(producer_state_Q_LSE)
+            # LSE
+            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gLSE[None, m_block],
+                    sLSE[None, producer_state_Q_LSE.index],
+                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                )
+            producer_state_Q_LSE.advance()
+            # dO
+            pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+            load_dO(m_block, producer_state=producer_state_dO_dPsum)
+            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+            # dPsum
+            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gdPsum[None, m_block],
+                    sdPsum[None, producer_state_dO_dPsum.index],
+                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                )
+            producer_state_dO_dPsum.advance()
+
+    return producer_state_Q_LSE, producer_state_dO_dPsum
+
+
+# SM100-specific tile processor using SM100 helpers
+@cute.jit
+def produce_block_sparse_loads_bwd_sm100(
+    blocksparse_tensors: LinearBlockSparseTensors,
+    n_block,
+    load_Q,
+    load_K,
+    load_V,
+    load_dO,
+    copy_stats,
+    gLSE,
+    sLSE,
+    gdPsum,
+    sdPsum,
+    pipeline_Q,
+    pipeline_LSE,
+    pipeline_dO,
+    pipeline_dPsum,
+    producer_state_Q_LSE,
+    producer_state_dO_dPsum,
+    tma_copy_bytes,
+):
+    """SM100 entry point for sparse block iteration.
+
+    SM100 uses PipelineTmaUmma which doesn't support extra_tx_count, so we use
+    simplified block processing that just calls producer_acquire without extras.
+    """
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[n_block]
+    curr_mask_block_offset = mask_block_offset[n_block]
+    curr_mask_block_idx = mask_block_idx
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[n_block]
+        curr_full_block_offset = full_block_offset[n_block]
+        curr_full_block_idx = full_block_idx
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
+        curr_full_block_idx = None
+
+    mask_empty = curr_mask_block_cnt == 0
+    full_empty = curr_full_block_cnt == 0
+
+    load_block_list_bwd_sm100_fn = partial(
+        load_block_list_bwd_sm100,
+        load_Q=load_Q,
+        load_K=load_K,
+        load_V=load_V,
+        load_dO=load_dO,
+        copy_stats=copy_stats,
+        gLSE=gLSE,
+        sLSE=sLSE,
+        gdPsum=gdPsum,
+        sdPsum=sdPsum,
+        pipeline_Q=pipeline_Q,
+        pipeline_LSE=pipeline_LSE,
+        pipeline_dO=pipeline_dO,
+        pipeline_dPsum=pipeline_dPsum,
+        tma_copy_bytes=tma_copy_bytes,
+    )
+
+    if mask_empty:
+        producer_state_Q_LSE, producer_state_dO_dPsum = load_block_list_bwd_sm100_fn(
+            block_indices=curr_full_block_idx,
+            block_offset=curr_full_block_offset,
+            block_count=curr_full_block_cnt,
+            producer_state_Q_LSE=producer_state_Q_LSE,
+            producer_state_dO_dPsum=producer_state_dO_dPsum,
+            load_kv_with_first=True,
+        )
+    else:
+        # Process masked blocks with Q loading
+        producer_state_Q_LSE, producer_state_dO_dPsum = load_block_list_bwd_sm100_fn(
+            block_indices=curr_mask_block_idx,
+            block_offset=curr_mask_block_offset,
+            block_count=curr_mask_block_cnt,
+            producer_state_Q_LSE=producer_state_Q_LSE,
+            producer_state_dO_dPsum=producer_state_dO_dPsum,
+            load_kv_with_first=True,
+        )
+
+        if not full_empty:
+            # Process full blocks without Q loading
+            producer_state_Q_LSE, producer_state_dO_dPsum = load_block_list_bwd_sm100_fn(
+                block_indices=curr_full_block_idx,
+                block_offset=curr_full_block_offset,
+                block_count=curr_full_block_cnt,
+                producer_state_Q_LSE=producer_state_Q_LSE,
+                producer_state_dO_dPsum=producer_state_dO_dPsum,
+                load_kv_with_first=False,
+            )
+
+    return producer_state_Q_LSE, producer_state_dO_dPsum
+
+
+@cute.jit
 def get_total_block_count(
-    blocksparse_tensors: BlockSparseTensors,
+    blocksparse_tensors: LinearBlockSparseTensors,
     batch_idx,
     head_idx,
     m_block,
 ):
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, _, _, full_block_cnt, _, _ = blocksparse_tensors
     if const_expr(full_block_cnt is not None):
         return (
-            mask_block_cnt[batch_idx, head_idx, m_block]
-            + full_block_cnt[batch_idx, head_idx, m_block]
+            mask_block_cnt[m_block]
+            + full_block_cnt[m_block]
         )
     else:
-        return mask_block_cnt[batch_idx, head_idx, m_block]
+        return mask_block_cnt[m_block]
 
 
 @cute.jit
@@ -700,7 +900,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
 @cute.jit
 def softmax_block_sparse_sm100(
-    blocksparse_tensors: BlockSparseTensors,
+    blocksparse_tensors: LinearBlockSparseTensors,
     batch_idx,
     head_idx,
     m_block,
@@ -718,16 +918,19 @@ def softmax_block_sparse_sm100(
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
 ):
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[m_block]
+    curr_mask_block_offset = mask_block_offset[m_block]
+    curr_mask_block_idx = mask_block_idx
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[m_block]
+        curr_full_block_offset = full_block_offset[m_block]
+        curr_full_block_idx = full_block_idx
     else:
         curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
         curr_full_block_idx = None
 
     total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
@@ -739,21 +942,9 @@ def softmax_block_sparse_sm100(
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_empty_offset + stage_idx)
     else:
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
-            (
-                mma_si_consumer_phase,
-                si_corr_producer_phase,
-                s0_s1_sequence_phase,
-            ) = softmax_step(
-                mma_si_consumer_phase,
-                si_corr_producer_phase,
-                s0_s1_sequence_phase,
-                mask_n_block,
-                is_first=True,
-                mask_fn=partial(mask_fn, mask_seqlen=True),  # last block could oob
-            )
-            for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+            for i in cutlass.range(0, curr_mask_block_cnt):
+                mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -767,8 +958,9 @@ def softmax_block_sparse_sm100(
                 )
 
         if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
-            if curr_mask_block_cnt == 0:
+            # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+            for i in cutlass.range(0, curr_full_block_cnt):
+                full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -778,34 +970,8 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     full_n_block,
-                    is_first=True,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=True),
-                )
-            else:
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    is_first=False,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=False),
-                )
-            for i in cutlass.range(1, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                    # mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                    mask_fn=None,
                 )
 
     return (
@@ -813,4 +979,114 @@ def softmax_block_sparse_sm100(
         si_corr_producer_phase,
         s0_s1_sequence_phase,
         total_block_cnt == 0,
+    )
+
+
+@cute.jit
+def compute_block_sparse_bwd_sm100(
+    blocksparse_tensors: LinearBlockSparseTensors,
+    n_block,
+    compute_step_fn: Callable,
+    mask_fn: Callable,
+    mask_fn_seqlen: Callable,
+    consumer_state_LSE,
+    consumer_state_S_P_dP,
+    consumer_state_dPsum,
+    producer_state_dS,
+):
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[n_block]
+    curr_mask_block_offset = mask_block_offset[n_block]
+    curr_mask_block_idx = mask_block_idx
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[n_block]
+        curr_full_block_offset = full_block_offset[n_block]
+        curr_full_block_idx = full_block_idx
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
+        curr_full_block_idx = None
+
+    if curr_mask_block_cnt > 0:
+        # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+        for i in cutlass.range(0, curr_mask_block_cnt):
+            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
+            (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
+                m_block=mask_m_block,
+                mask_fn=mask_fn,
+                consumer_state_LSE=consumer_state_LSE,
+                consumer_state_S_P_dP=consumer_state_S_P_dP,
+                consumer_state_dPsum=consumer_state_dPsum,
+                producer_state_dS=producer_state_dS,
+            )
+
+    if curr_full_block_cnt > 0:
+        # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+        for i in cutlass.range(0, curr_full_block_cnt):
+            full_m_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+            (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
+                m_block=full_m_block,
+                mask_fn=mask_fn_seqlen,
+                consumer_state_LSE=consumer_state_LSE,
+                consumer_state_S_P_dP=consumer_state_S_P_dP,
+                consumer_state_dPsum=consumer_state_dPsum,
+                producer_state_dS=producer_state_dS,
+            )
+
+    return (
+        consumer_state_LSE,
+        consumer_state_S_P_dP,
+        consumer_state_dPsum,
+        producer_state_dS,
+    )
+
+
+@cute.jit
+def reduce_block_sparse_bwd_sm100(
+    blocksparse_tensors: LinearBlockSparseTensors,
+    n_block,
+    reduce_step_fn: Callable,
+    dQ_consumer_state,
+    dQ_tma_store_producer_state
+):
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[n_block]
+    curr_mask_block_offset = mask_block_offset[n_block]
+    curr_mask_block_idx = mask_block_idx
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[n_block]
+        curr_full_block_offset = full_block_offset[n_block]
+        curr_full_block_idx = full_block_idx
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
+        curr_full_block_idx = None
+
+    if curr_mask_block_cnt > 0:
+        # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+        for i in cutlass.range(0, curr_mask_block_cnt):
+            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
+            (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_step_fn(
+                m_block=mask_m_block,
+                dQ_consumer_state=dQ_consumer_state,
+                dQ_tma_store_producer_state=dQ_tma_store_producer_state,
+            )
+
+    if curr_full_block_cnt > 0:
+        # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
+        for i in cutlass.range(0, curr_full_block_cnt):
+            full_m_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+            (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_step_fn(
+                m_block=full_m_block,
+                dQ_consumer_state=dQ_consumer_state,
+                dQ_tma_store_producer_state=dQ_tma_store_producer_state,
+            )
+
+    return (
+        dQ_consumer_state,
+        dQ_tma_store_producer_state,
     )

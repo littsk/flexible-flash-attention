@@ -37,6 +37,55 @@ class BlockSparseTensorsTorch(NamedTuple):
     full_block_idx: Optional[torch.Tensor] = None
 
 
+class LinearBlockSparseTensors(NamedTuple):
+    mask_block_cnt: cute.Tensor
+    mask_block_offset: cute.Tensor
+    mask_block_idx: cute.Tensor
+    full_block_cnt: Optional[cute.Tensor]
+    full_block_offset: Optional[cute.Tensor]
+    full_block_idx: Optional[cute.Tensor]
+
+    def __new_from_mlir_values__(self, values):
+        if len(values) == 3:
+            values = (*values, None, None, None)
+        return LinearBlockSparseTensors(*values)
+
+
+class LinearBlockSparseTensorsTorch(NamedTuple):
+    mask_block_cnt: torch.Tensor # (n_blocks_q)
+    mask_block_offset: torch.Tensor # (n_blocks_q + 1)
+    mask_block_idx: torch.Tensor # (O(n_blocks_q))
+    full_block_cnt: Optional[torch.Tensor] = None # (n_blocks_q)
+    full_block_offset: Optional[torch.Tensor] = None # (n_blocks_q + 1)
+    full_block_idx: Optional[torch.Tensor] = None # (O(n_blocks_q))
+
+
+def bhqk_to_linear_sparse_tensors(bhqk_tensors: BlockSparseTensorsTorch) -> LinearBlockSparseTensorsTorch:
+    mask_block_cnt = bhqk_tensors.mask_block_cnt.flatten()
+    n_blocks_q = mask_block_cnt.shape[0]
+    mask_block_offset = torch.cat([torch.zeros(1, device=bhqk_tensors.mask_block_cnt.device, dtype=torch.int32), torch.cumsum(mask_block_cnt, dim=0)], dim=0)
+    mask_block_idx = []
+    for i in range(n_blocks_q):
+        mask_block_idx.append(bhqk_tensors.mask_block_idx[0, 0, i, : mask_block_cnt[i].item()])
+    mask_block_idx = torch.cat(mask_block_idx, dim=0)
+    full_block_cnt = bhqk_tensors.full_block_cnt.flatten() if bhqk_tensors.full_block_cnt is not None else None
+    full_block_offset = torch.cat([torch.zeros(1, device=bhqk_tensors.full_block_cnt.device, dtype=torch.int32), torch.cumsum(full_block_cnt, dim=0)], dim=0) if full_block_cnt is not None else None
+    if bhqk_tensors.full_block_idx is not None:
+        full_block_idx = []
+        for i in range(n_blocks_q):
+            full_block_idx.append(bhqk_tensors.full_block_idx[0, 0, i, : full_block_cnt[i].item()])
+        full_block_idx = torch.cat(full_block_idx, dim=0)
+    else:
+        full_block_idx = None
+    return LinearBlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_offset=mask_block_offset,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_offset=full_block_offset,
+        full_block_idx=full_block_idx,
+    )
+
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],
@@ -148,6 +197,51 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
         full_block_cnt_tensor,
+        full_block_idx_tensor,
+    )
+
+
+def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) -> Optional[LinearBlockSparseTensors]:
+    if not is_block_sparsity_enabled(tensors):
+        return None
+
+    mask_block_cnt_tensor = from_dlpack(
+        tensors.mask_block_cnt.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+    mask_block_offset_tensor = from_dlpack(
+        tensors.mask_block_offset.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+    mask_block_idx_tensor = from_dlpack(
+        tensors.mask_block_idx.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+    full_block_cnt_tensor = (
+        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=0
+        )
+        if tensors.full_block_cnt is not None
+        else None
+    )
+    full_block_offset_tensor = (
+        from_dlpack(
+            tensors.full_block_offset.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=0)
+        if tensors.full_block_offset is not None
+        else None
+    )
+    full_block_idx_tensor = (
+        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=0
+        )
+        if tensors.full_block_idx is not None
+        else None
+    )
+
+    return LinearBlockSparseTensors(
+        mask_block_cnt_tensor,
+        mask_block_offset_tensor,
+        mask_block_idx_tensor,
+        full_block_cnt_tensor,
+        full_block_offset_tensor,
         full_block_idx_tensor,
     )
 
