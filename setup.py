@@ -368,6 +368,26 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             ],
         )
     )
+
+    # Add magi_to_hstu CUDA extension
+    ext_modules.append(
+        CUDAExtension(
+            name="magi_to_hstu_cuda",
+            sources=[
+                "csrc/utils/magi_to_hstu_api.cpp",
+                "csrc/utils/magi_to_hstu.cu",
+            ],
+            extra_compile_args={
+                "cxx": compiler_c17_flag,
+                "nvcc": append_nvcc_threads(
+                    ["-O3", "--use_fast_math"] + cc_flag
+                ),
+            },
+            include_dirs=[
+                Path(this_dir) / "csrc" / "utils",
+            ],
+        )
+    )
 elif not SKIP_CUDA_BUILD and IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
