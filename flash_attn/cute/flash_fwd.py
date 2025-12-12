@@ -29,7 +29,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
@@ -1282,7 +1282,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
@@ -1577,7 +1577,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: Optional[LinearBlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1761,7 +1761,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k: cutlass.pipeline.PipelineAsync,
         pipeline_v: cutlass.pipeline.PipelineAsync,
         mbar_ptr_Q: cutlass.Pointer,
-        blocksparse_tensors: Optional[BlockSparseTensors],
+        blocksparse_tensors: Optional[LinearBlockSparseTensors],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,

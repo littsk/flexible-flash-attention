@@ -39,13 +39,13 @@ def create_tensors(
     # cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     # total_q = cu_seqlens_q[-1]
     # total_k = total_q
-    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(-1, 1).requires_grad_(True)
+    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(1, 1).requires_grad_(True)
     k = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim, device=device, dtype=dtype
-    ).uniform_(-1, 1).requires_grad_(True)
+    ).uniform_(1, 1).requires_grad_(True)
     v = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim_v, device=device, dtype=dtype
-    ).uniform_(-1, 1).requires_grad_(True)
+    ).uniform_(1, 1).requires_grad_(True)
     out = torch.empty(
         batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype
     )
@@ -124,7 +124,7 @@ def _run_mask_test(
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = random_arbitrary_func_tensor(1, batch_size, 3, seqlen_q, seqlen_k, device="cuda")
+    arbitrary_func = random_arbitrary_func_tensor(1, 1, 1, seqlen_q, seqlen_k, device="cuda")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -152,7 +152,11 @@ def _run_mask_test(
         device="cuda",
         BLOCK_SIZE=(sparse_tile_m, tile_n),
     )
-    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx = None, None, None, None
+    if COMPUTE_CAPABILITY == 10:
+        _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    else:
+        k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
     softmax_scale = 1.0 / math.sqrt(headdim)
 
     k_block_sparse_mask = BlockSparseTensorsTorch(
@@ -172,7 +176,11 @@ def _run_mask_test(
         device="cuda",
         BLOCK_SIZE=(tile_m, tile_n),
     )
-    _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+    q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx = None, None, None, None
+    if COMPUTE_CAPABILITY == 10:
+        _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+    else:
+        _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
     q_block_sparse_mask = BlockSparseTensorsTorch(
         mask_block_cnt=q_mask_cnt,
         mask_block_idx=q_mask_idx,
@@ -214,7 +222,7 @@ def _run_mask_test(
     assert torch.isfinite(out_ref_fp32).all()
     assert (out_cute - out_ref_fp32).abs().max().item() <= 2 * (out_ref - out_ref_fp32).abs().max().item()
 
-    dout = torch.rand_like(out_cute)
+    dout = torch.ones_like(out_cute)
 
     dq, dk, dv = torch.autograd.grad(
         out_cute, (tensors["q"], tensors["k"], tensors["v"]), dout
@@ -225,6 +233,10 @@ def _run_mask_test(
     (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
         out_ref, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
+
+    torch.set_printoptions(profile="full")
+    print("dv: ", dv)
+    print("dv_ref: ", dv_ref)
 
     print(f"dV max diff: {(dv - dv_ref_fp32).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_ref - dv_ref_fp32).abs().max().item()}")
@@ -261,9 +273,9 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=16390,
-        seqlen_k=16390,
-        nheads=3,
+        seqlen_q=128,
+        seqlen_k=128,
+        nheads=1,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,

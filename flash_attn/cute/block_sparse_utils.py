@@ -20,6 +20,7 @@ from flash_attn.cute import utils
 @cute.jit
 def load_block_list(
     block_indices: cute.Tensor,
+    block_offset,
     block_count,
     load_q_with_first: cutlass.Constexpr,
     first_block_preloaded: cutlass.Constexpr,
@@ -50,7 +51,7 @@ def load_block_list(
         if const_expr(not intra_wg_overlap):
             # Peel first iteration: the first block may need to load Q alongside K,
             # Parameters are already Constexpr, so no need to wrap in const_expr()
-            n_block_first = block_indices[block_count - 1]
+            n_block_first = block_indices[block_offset + block_count - 1]
             extra_tx = tma_q_bytes if const_expr(load_q_with_first) and const_expr(use_tma_q) else 0
             pipeline_k.producer_acquire(kv_producer_state, extra_tx_count=extra_tx)
 
@@ -63,14 +64,14 @@ def load_block_list(
             kv_producer_state.advance()
 
             for offset in cutlass.range(1, block_count):
-                n_block = block_indices[block_count - 1 - offset]
+                n_block = block_indices[block_offset + block_count - 1 - offset]
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block, producer_state=kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
                 load_V(src_idx=n_block, producer_state=kv_producer_state)
                 kv_producer_state.advance()
         else:
-            n_block_first = block_indices[block_count - 1]
+            n_block_first = block_indices[block_offset + block_count - 1]
             if const_expr(not first_block_preloaded):
                 extra_tx = (
                     tma_q_bytes if const_expr(load_q_with_first) and const_expr(use_tma_q) else 0
@@ -83,8 +84,8 @@ def load_block_list(
                 load_K(src_idx=n_block_first, producer_state=kv_producer_state)
 
             for idx in cutlass.range(block_count - 1, unroll=1):
-                n_block_prev = block_indices[block_count - 1 - idx]
-                n_block = block_indices[block_count - 2 - idx]
+                n_block_prev = block_indices[block_offset + block_count - 1 - idx]
+                n_block = block_indices[block_offset + block_count - 2 - idx]
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -115,7 +116,7 @@ def finish_overlap_v_load(
 
 @cute.jit
 def produce_block_sparse_loads(
-    blocksparse_tensors: BlockSparseTensors,
+    blocksparse_tensors: LinearBlockSparseTensors,
     batch_idx,
     head_idx,
     m_block,
@@ -141,16 +142,19 @@ def produce_block_sparse_loads(
 
     """
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[m_block]
+    curr_mask_block_offset = mask_block_offset[m_block]
+    curr_mask_block_idx = mask_block_idx
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[m_block]
+        curr_full_block_offset = full_block_offset[m_block]
+        curr_full_block_idx = full_block_idx
     else:
         curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
         curr_full_block_idx = None
 
     mask_empty = curr_mask_block_cnt == 0
@@ -160,6 +164,7 @@ def produce_block_sparse_loads(
         # No masked blocks: the full list owns the initial Q+K load.
         kv_producer_state = load_block_list(
             curr_full_block_idx,
+            curr_full_block_offset,
             curr_full_block_cnt,
             load_q_with_first=True,
             first_block_preloaded=False,
@@ -187,6 +192,7 @@ def produce_block_sparse_loads(
         # start immediately. When overlap is disabled this fully drains the list.
         kv_producer_state = load_block_list(
             curr_mask_block_idx,
+            curr_mask_block_offset,
             curr_mask_block_cnt,
             load_q_with_first=True,
             first_block_preloaded=False,
@@ -214,8 +220,8 @@ def produce_block_sparse_loads(
             if const_expr(intra_wg_overlap):
                 # Bridge the masked list to the full list by overlapping the pending masked V
                 # with the first full K load.
-                n_block_mask_last = curr_mask_block_idx[0]
-                n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
+                n_block_mask_last = curr_mask_block_idx[curr_mask_block_offset]
+                n_block_full_first = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1]
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -225,6 +231,7 @@ def produce_block_sparse_loads(
 
                 kv_producer_state = load_block_list(
                     curr_full_block_idx,
+                    curr_full_block_offset,
                     curr_full_block_cnt,
                     load_q_with_first=False,
                     first_block_preloaded=True,
@@ -251,6 +258,7 @@ def produce_block_sparse_loads(
                 # reload because the masked list already issued it).
                 kv_producer_state = load_block_list(
                     curr_full_block_idx,
+                    curr_full_block_offset,
                     curr_full_block_cnt,
                     load_q_with_first=False,
                     first_block_preloaded=False,
@@ -269,8 +277,169 @@ def produce_block_sparse_loads(
 
 
 @cute.jit
+def load_block_list_bwd(
+    block_indices: cute.Tensor,
+    block_offset,
+    block_count,
+    load_kv_with_first: cutlass.Constexpr,
+    load_Q,
+    load_K,
+    load_V,
+    load_dO,
+    load_LSE,
+    load_dPsum,
+    Q_stage: cutlass.Constexpr,
+    dO_stage: cutlass.Constexpr,
+    pipeline_Q,
+    pipeline_dO,
+    producer_state_Q,
+    producer_state_dO,
+    tma_copy_bytes: cutlass.Constexpr,
+):
+    if block_count > 0:
+        producer_state_dO_cur = (
+            producer_state_dO
+            if const_expr(Q_stage != dO_stage)
+            else producer_state_Q
+        )
+        if const_expr(load_kv_with_first):
+            # First iteration: load Q alongside K if requested
+            m_block_first = block_indices[block_offset]
+            # K & Q
+            pipeline_Q.producer_acquire(
+                producer_state_Q, extra_tx_count=tma_copy_bytes["K"]
+            )
+            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
+            load_Q(m_block_first, producer_state=producer_state_Q)
+            # cp.async.bulk is using ptx, so we need to elect one thread to do it
+            with cute.arch.elect_one():
+                load_LSE(m_block_first, producer_state=producer_state_Q)
+            producer_state_dO_cur = (
+                producer_state_dO
+                if const_expr(Q_stage != dO_stage)
+                else producer_state_Q
+            )
+            pipeline_dO.producer_acquire(
+                producer_state_dO_cur, extra_tx_count=tma_copy_bytes["V"]
+            )
+            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
+            load_dO(m_block_first, producer_state=producer_state_dO_cur)
+            with cute.arch.elect_one():
+                load_dPsum(m_block_first, producer_state=producer_state_dO_cur)
+            producer_state_Q.advance()
+            producer_state_dO.advance()
+
+        # Remaining blocks
+        for offset in cutlass.range(1, block_count):
+            m_block = block_indices[block_offset + offset]
+            pipeline_Q.producer_acquire(producer_state_Q)
+            load_Q(m_block, producer_state=producer_state_Q)
+            # cp.async.bulk is using ptx, so we need to elect one thread to do it
+            with cute.arch.elect_one():
+                load_LSE(m_block, producer_state=producer_state_Q)
+            producer_state_dO_cur = (
+                producer_state_dO
+                if const_expr(Q_stage != dO_stage)
+                else producer_state_Q
+            )
+            pipeline_dO.producer_acquire(producer_state_dO_cur)
+            load_dO(m_block, producer_state=producer_state_dO_cur)
+            with cute.arch.elect_one():
+                load_dPsum(m_block, producer_state=producer_state_dO_cur)
+            producer_state_Q.advance()
+            producer_state_dO.advance()
+
+    return producer_state_Q, producer_state_dO
+
+
+@cute.jit
+def produce_block_sparse_loads_bwd(
+    blocksparse_tensors: LinearBlockSparseTensors,
+    n_block,
+    load_Q,
+    load_K,
+    load_V,
+    load_dO,
+    load_LSE,
+    load_dPsum,
+    Q_stage: cutlass.Constexpr,
+    dO_stage: cutlass.Constexpr,
+    pipeline_Q,
+    pipeline_dO,
+    producer_state_Q,
+    producer_state_dO,
+    tma_copy_bytes,
+):
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[n_block]
+    curr_mask_block_offset = mask_block_offset[n_block]
+    curr_mask_block_idx = mask_block_idx
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[n_block]
+        curr_full_block_offset = full_block_offset[n_block]
+        curr_full_block_idx = full_block_idx
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
+        curr_full_block_idx = None
+
+    mask_empty = curr_mask_block_cnt == 0
+    full_empty = curr_full_block_cnt == 0
+
+    load_block_list_bwd_fn = partial(
+        load_block_list_bwd,
+        load_Q=load_Q,
+        load_K=load_K,
+        load_V=load_V,
+        load_dO=load_dO,
+        load_LSE=load_LSE,
+        load_dPsum=load_dPsum,
+        Q_stage=Q_stage,
+        dO_stage=dO_stage,
+        pipeline_Q=pipeline_Q,
+        pipeline_dO=pipeline_dO,
+        tma_copy_bytes=tma_copy_bytes,
+    )
+
+    if mask_empty:
+        producer_state_Q, producer_state_dO = load_block_list_bwd_fn(
+            block_indices=curr_full_block_idx,
+            block_offset=curr_full_block_offset,
+            block_count=curr_full_block_cnt,
+            producer_state_Q=producer_state_Q,
+            producer_state_dO=producer_state_dO,
+            load_kv_with_first=True,
+        )
+    else:
+        # Process masked blocks with Q loading
+        producer_state_Q, producer_state_dO = load_block_list_bwd_fn(
+            block_indices=curr_mask_block_idx,
+            block_offset=curr_mask_block_offset,
+            block_count=curr_mask_block_cnt,
+            producer_state_Q=producer_state_Q,
+            producer_state_dO=producer_state_dO,
+            load_kv_with_first=True,
+        )
+
+        if not full_empty:
+            # Process full blocks without Q loading
+            producer_state_Q, producer_state_dO = load_block_list_bwd_fn(
+                block_indices=curr_full_block_idx,
+                block_offset=curr_full_block_offset,
+                block_count=curr_full_block_cnt,
+                producer_state_Q=producer_state_Q,
+                producer_state_dO=producer_state_dO,
+                load_kv_with_first=False,
+            )
+
+    return producer_state_Q, producer_state_dO
+
+
+@cute.jit
 def consume_block_sparse_loads(
-    blocksparse_tensors: BlockSparseTensors,
+    blocksparse_tensors: LinearBlockSparseTensors,
     batch_idx,
     head_idx,
     m_block,
@@ -293,18 +462,20 @@ def consume_block_sparse_loads(
     Mirrors `produce_block_sparse_loads` so that the consumer pipeline
     """
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
-    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[m_block]
+    curr_mask_block_offset = mask_block_offset[m_block]
+    curr_mask_block_idx = mask_block_idx
+    curr_full_block_cnt = full_block_cnt[m_block]
+    curr_full_block_offset = full_block_offset[m_block]
+    curr_full_block_idx = full_block_idx
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
 
     if const_expr(not intra_wg_overlap):
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1]
             warp_scheduler_barrier_sync()
             kv_consumer_state = mma_one_n_block(
                 kv_consumer_state,
@@ -320,7 +491,7 @@ def consume_block_sparse_loads(
             )
             O_should_accumulate = True
             for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
@@ -333,7 +504,7 @@ def consume_block_sparse_loads(
                 warp_scheduler_barrier_arrive()
 
         if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+            full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1]
             if curr_mask_block_cnt == 0:
                 warp_scheduler_barrier_sync()
                 kv_consumer_state = mma_one_n_block(
@@ -345,7 +516,7 @@ def consume_block_sparse_loads(
                 )
                 O_should_accumulate = True
                 for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
                         n_block=full_n_block,
@@ -364,7 +535,7 @@ def consume_block_sparse_loads(
                 )
                 O_should_accumulate = True
                 for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
                         n_block=full_n_block,
@@ -376,7 +547,7 @@ def consume_block_sparse_loads(
             warp_scheduler_barrier_arrive()
     else:
         if curr_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+            mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1]
             kv_consumer_state = process_first_half_block(
                 n_block=mask_n_block,
                 kv_consumer_state=kv_consumer_state,
@@ -390,7 +561,7 @@ def consume_block_sparse_loads(
                 is_first_block=True,
             )
             for i in cutlass.range(1, curr_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
@@ -400,7 +571,7 @@ def consume_block_sparse_loads(
                 O_should_accumulate = True
 
         if curr_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+            full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1]
             if curr_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(
                     n_block=full_n_block,
@@ -418,7 +589,7 @@ def consume_block_sparse_loads(
                 )
                 O_should_accumulate = True
             for i in cutlass.range(1, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
