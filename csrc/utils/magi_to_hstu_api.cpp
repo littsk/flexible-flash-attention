@@ -63,7 +63,7 @@ at::Tensor magi_to_hstu(
     
     // Allocate output tensor, initialized to -1 (unused)
     auto opts = q_ranges.options().dtype(torch::kInt32);
-    at::Tensor func_out = torch::full({n_max_func, seqlen_q}, -1, opts);
+    at::Tensor func_out = torch::full({n_max_func, seqlen_q}, 0, opts);
     
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
