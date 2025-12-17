@@ -2224,7 +2224,8 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur=mdQ_semaphore_cur,
                 is_tma_warp=is_tma_warp,
                 read_flag=read_flag,
-                delay_semaphore_release=delay_semaphore_release
+                delay_semaphore_release=delay_semaphore_release,
+                tidx=tidx
             )
 
             if const_expr(self.use_block_sparsity):
@@ -2273,7 +2274,8 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore_cur,
         is_tma_warp,
         read_flag,
-        delay_semaphore_release
+        delay_semaphore_release,
+        tidx
     ):
         pipeline_dQ.consumer_wait(dQ_consumer_state)
         # TMEM -> RMEM

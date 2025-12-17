@@ -14,7 +14,7 @@
 
 import math
 from typing import Optional
-from einops import rearrange
+from einops import rearrange, repeat
 
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
@@ -39,13 +39,13 @@ def create_tensors(
     # cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     # total_q = cu_seqlens_q[-1]
     # total_k = total_q
-    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(1, 1).requires_grad_(True)
+    q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(-1, 1).requires_grad_(True)
     k = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim, device=device, dtype=dtype
-    ).uniform_(1, 1).requires_grad_(True)
+    ).uniform_(-1, 1).requires_grad_(True)
     v = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim_v, device=device, dtype=dtype
-    ).uniform_(1, 1).requires_grad_(True)
+    ).uniform_(-1, 1).requires_grad_(True)
     out = torch.empty(
         batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype
     )
@@ -74,17 +74,29 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     headdim = q.shape[3]
     scale = 1.0 / math.sqrt(headdim)
 
-    qk_attn = torch.einsum(
-        "bnhd,bmhd->bhnm",
-        q * scale,
-        k,
-    )
+    if nheads_kv == nheads:
+        qk_attn = torch.einsum(
+            "bnhd,bmhd->bhnm",
+            q * scale,
+            k,
+        )
+    else:
+        k = repeat(k, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        v = repeat(v, "b s h d -> b s (h g) d", g=nheads // nheads_kv)
+        qk_attn = torch.einsum(
+            "bnhd,bmhd->bhnm",
+            q * scale,
+            k,
+        )
 
     func_num = arbitrary_func.shape[2]
     for i in range(seqlen_q):
-        for j in range(func_num // 2):
-            qk_attn[:, :, i, arbitrary_func[0, 0, 2 * j, i]:arbitrary_func[0, 0, 2 * j + 1, i]] = -float("inf")
-        qk_attn[:, :, i, arbitrary_func[0, 0, func_num - 1, i]:] = -float("inf")
+        for j in range(seqlen_k):
+            value_valid = j < arbitrary_func[0, 0, 0, i]
+            for k in range(func_num // 2):
+                if j >= arbitrary_func[0, 0, 2 * k + 1, i] and j < arbitrary_func[0, 0, 2 * k + 2, i]:
+                    value_valid = True
+            qk_attn[:, :, i, j] = -float("inf") if not value_valid else qk_attn[:, :, i, j]
 
     softmax_attn = F.softmax(qk_attn, dim=-1)
     out = torch.einsum(
@@ -124,7 +136,7 @@ def _run_mask_test(
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = random_arbitrary_func_tensor(1, 1, 1, seqlen_q, seqlen_k, device="cuda")
+    arbitrary_func = random_arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -222,7 +234,7 @@ def _run_mask_test(
     assert torch.isfinite(out_ref_fp32).all()
     assert (out_cute - out_ref_fp32).abs().max().item() <= 2 * (out_ref - out_ref_fp32).abs().max().item()
 
-    dout = torch.ones_like(out_cute)
+    dout = torch.rand_like(out_cute)
 
     dq, dk, dv = torch.autograd.grad(
         out_cute, (tensors["q"], tensors["k"], tensors["v"]), dout
@@ -233,10 +245,6 @@ def _run_mask_test(
     (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
         out_ref, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
-
-    torch.set_printoptions(profile="full")
-    print("dv: ", dv)
-    print("dv_ref: ", dv_ref)
 
     print(f"dV max diff: {(dv - dv_ref_fp32).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_ref - dv_ref_fp32).abs().max().item()}")
@@ -277,7 +285,7 @@ if __name__ == "__main__":
         seqlen_k=128,
         nheads=1,
         kv_mode="mha",
-        headdim=128,
+        headdim=64,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,

@@ -510,7 +510,6 @@ class AttentionMask:
                 global_col_for_mod = global_col
                 if const_expr(wrap_aux_indices):
                     _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
-                kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
 
                 value_valid = global_col_for_mod < col_max[0]
                 for j in cutlass.range_constexpr(func_num // 2, unroll_full=True):
@@ -612,11 +611,11 @@ class AttentionMask:
                 block_col = tScS_t2r[i][COL]
                 col = block_col + base_col
                 arbitrary_func = aux_tensors[0]
+                value_valid = col < arbitrary_func[0, 0, 0, row]
                 for j in cutlass.range(func_num // 2, unroll_full=True):
-                    if col >= arbitrary_func[0, 0, 2 * j, row] and col < arbitrary_func[0, 0, 2 * j + 1, row]:
-                        acc_S[i] = -cutlass.Float32.inf
-                if col >= arbitrary_func[0, 0, func_num - 1, row]:
-                    acc_S[i] = -cutlass.Float32.inf
+                    if col >= arbitrary_func[0, 0, 2 * j + 1, row] and col < arbitrary_func[0, 0, 2 * j + 2, row]:
+                        value_valid = True
+                acc_S[i] = -cutlass.Float32.inf if not value_valid else acc_S[i]
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]

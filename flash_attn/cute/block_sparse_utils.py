@@ -773,7 +773,7 @@ def load_block_list_bwd_sm100(
     if block_count > 0:
         if const_expr(load_kv_with_first):
             # First iteration: load Q alongside K if requested
-            m_block_first = block_indices[block_offset + block_count - 1]
+            m_block_first = block_indices[block_offset]
             # K & Q
             pipeline_Q.producer_acquire(
                 producer_state_Q_LSE, extra_tx_count=tma_copy_bytes["K"]
@@ -811,7 +811,7 @@ def load_block_list_bwd_sm100(
 
         # Remaining blocks
         for offset in cutlass.range(0, block_count):
-            m_block = block_indices[block_offset + block_count - 1 - offset]
+            m_block = block_indices[block_offset + offset]
             # Q
             pipeline_Q.producer_acquire(producer_state_Q_LSE)
             load_Q(m_block, producer_state=producer_state_Q_LSE)
@@ -1183,7 +1183,7 @@ def compute_block_sparse_bwd_sm100(
     if curr_mask_block_cnt > 0:
         # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
         for i in cutlass.range(0, curr_mask_block_cnt):
-            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
+            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + i]
             (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
                 m_block=mask_m_block,
                 mask_fn=mask_fn,
@@ -1196,7 +1196,7 @@ def compute_block_sparse_bwd_sm100(
     if curr_full_block_cnt > 0:
         # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
         for i in cutlass.range(0, curr_full_block_cnt):
-            full_m_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+            full_m_block = curr_full_block_idx[curr_full_block_offset + i]
             (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
                 m_block=full_m_block,
                 mask_fn=mask_fn_seqlen,
@@ -1240,7 +1240,7 @@ def reduce_block_sparse_bwd_sm100(
     if curr_mask_block_cnt > 0:
         # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
         for i in cutlass.range(0, curr_mask_block_cnt):
-            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
+            mask_m_block = curr_mask_block_idx[curr_mask_block_offset + i]
             (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_step_fn(
                 m_block=mask_m_block,
                 dQ_consumer_state=dQ_consumer_state,
@@ -1250,7 +1250,7 @@ def reduce_block_sparse_bwd_sm100(
     if curr_full_block_cnt > 0:
         # for arbitrary mask, we do not need this to check boundary, and two-level code structure will cause register spilling.
         for i in cutlass.range(0, curr_full_block_cnt):
-            full_m_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+            full_m_block = curr_full_block_idx[curr_full_block_offset + i]
             (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_step_fn(
                 m_block=full_m_block,
                 dQ_consumer_state=dQ_consumer_state,
