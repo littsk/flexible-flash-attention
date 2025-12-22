@@ -253,6 +253,17 @@ def _run_mask_test(
     print(f"dQ max diff: {(dq - dq_ref_fp32).abs().max().item()}")
     print(f"dQ Pytorch max diff: {(dq_ref - dq_ref_fp32).abs().max().item()}")
 
+    # diff = (dq - dq_ref).abs()
+    # print(f"shape diff: {diff.shape}")  # b s h d
+    # for bs in range(batch_size):
+    #     for h in range(nheads):
+    #         for s in range(seqlen_q):
+    #             diff_i = diff[bs, s, h, 0] #只取当前dim的第一个值
+    #             if diff_i.abs().max().item() > 1e-2:
+    #                 out_i = dq[bs, s, h, 0]
+    #                 out_ref_i = dq_ref[bs, s, h, 0]
+    #                 print(f"=== out[bs, s, h, 0] = {out_i}, out_ref[bs, s, h, 0] = {out_ref_i}, diff[bs, s, h, 0] = {diff_i}, bs = {bs}, s = {s}, h = {h}")
+    
     assert (dv - dv_ref_fp32).abs().max().item() <= 5 * (dv_ref - dv_ref_fp32).abs().max().item()
     assert (dk - dk_ref_fp32).abs().max().item() <= 5 * (dk_ref - dk_ref_fp32).abs().max().item()
     assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
@@ -281,8 +292,8 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=128,
-        seqlen_k=128,
+        seqlen_q=513,
+        seqlen_k=513,
         nheads=1,
         kv_mode="mha",
         headdim=64,

@@ -811,7 +811,7 @@ def load_block_list_bwd_sm100(
 
         # Remaining blocks
         for offset in cutlass.range(0, block_count):
-            m_block = block_indices[block_offset + offset]
+            m_block = block_indices[block_offset + offset + (1 if load_kv_with_first else 0)]
             # Q
             pipeline_Q.producer_acquire(producer_state_Q_LSE)
             load_Q(m_block, producer_state=producer_state_Q_LSE)

@@ -1905,7 +1905,8 @@ class FlashAttentionBackwardSm100:
                     n_block,
                     compute_step_fn,
                     mask_fn,
-                    mask_fn_seqlen,
+                    # mask_fn_seqlen, # for arbitrary, by pass None, mask has done in mask block, full block no need to check boundary.
+                    None,
                     consumer_state_LSE,
                     consumer_state_S_P_dP,
                     consumer_state_dPsum,

@@ -616,6 +616,10 @@ class AttentionMask:
                     if col >= arbitrary_func[0, 0, 2 * j + 1, row] and col < arbitrary_func[0, 0, 2 * j + 2, row]:
                         value_valid = True
                 acc_S[i] = -cutlass.Float32.inf if not value_valid else acc_S[i]
+                # Fow bwd dKV compute, we need mask seq_q, while it can not mask in arbitrary func, thus we need add mask_seqlen to check boundary.
+                if const_expr(mask_seqlen):
+                    out_of_bounds = (row >= self.seqlen_q)
+                    acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
 
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
