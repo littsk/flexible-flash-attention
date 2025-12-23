@@ -1159,7 +1159,7 @@ def compute_block_sparse_bwd_sm100(
     n_block,
     compute_step_fn: Callable,
     mask_fn: Callable,
-    mask_fn_seqlen: Callable,
+    mask_fn_none: Callable,
     consumer_state_LSE,
     consumer_state_S_P_dP,
     consumer_state_dPsum,
@@ -1199,7 +1199,7 @@ def compute_block_sparse_bwd_sm100(
             full_m_block = curr_full_block_idx[curr_full_block_offset + i]
             (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
                 m_block=full_m_block,
-                mask_fn=mask_fn_seqlen,
+                mask_fn=mask_fn_none,
                 consumer_state_LSE=consumer_state_LSE,
                 consumer_state_S_P_dP=consumer_state_S_P_dP,
                 consumer_state_dPsum=consumer_state_dPsum,

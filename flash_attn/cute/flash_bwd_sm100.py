@@ -1909,13 +1909,12 @@ class FlashAttentionBackwardSm100:
                     blocksparse_tensors,
                     n_block,
                     compute_step_fn,
-                    mask_fn,
-                    mask_fn_seqlen, # for arbitrary, by pass None, mask has done in mask block, full block no need to check boundary.
-                    # None,
-                    consumer_state_LSE,
-                    consumer_state_S_P_dP,
-                    consumer_state_dPsum,
-                    producer_state_dS,
+                    mask_fn=mask_fn,
+                    mask_fn_none=None,
+                    consumer_state_LSE=consumer_state_LSE,
+                    consumer_state_S_P_dP=consumer_state_S_P_dP,
+                    consumer_state_dPsum=consumer_state_dPsum,
+                    producer_state_dS=producer_state_dS,
                 )
             else:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
@@ -1929,42 +1928,45 @@ class FlashAttentionBackwardSm100:
                     )
             if const_expr(self.use_block_sparsity) and m_block_min >= m_block_max:
                 thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
-                # a = 1
-                consumer_state_dKV = self.epilogue_dKV_clear(
-                        dp_idx,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        thr_mma_dV,
-                        tdVtdV,
-                        mdV_tma_tensor,
-                        sdV,
-                        tma_atom_dV,
-                        thr_copy_r2s_dKV,
-                        pipeline_dKV,
-                        consumer_state_dKV,
-                        None,  # Don't scale
-                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                        mdV_semaphore,
-                    )
-                # #### STORE dK
-                consumer_state_dKV = self.epilogue_dKV_clear(
-                        dp_idx,
-                        batch_idx,
-                        head_idx,
-                        n_block,
-                        thr_mma_dK,
-                        tdKtdK,
-                        mdK_tma_tensor,
-                        sdK,
-                        tma_atom_dK,
-                        thr_copy_r2s_dKV,
-                        pipeline_dKV,
-                        consumer_state_dKV,
-                        softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
-                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                        mdK_semaphore,
-                    )
+                 #### STORE dV
+                if const_expr(not self.use_tma_store):
+                     assert False, "Not implemented for epi clear for no tma store"
+                else:
+                    consumer_state_dKV = self.epilogue_dKV_clear(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dV,
+                            tdVtdV,
+                            mdV_tma_tensor,
+                            sdV,
+                            tma_atom_dV,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            None,  # Don't scale
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdV_semaphore,
+                        )
+                    # #### STORE dK
+                    consumer_state_dKV = self.epilogue_dKV_clear(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dK,
+                            tdKtdK,
+                            mdK_tma_tensor,
+                            sdK,
+                            tma_atom_dK,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdK_semaphore,
+                        )
             else:
                 if const_expr(not self.use_tma_store):
                     consumer_state_dKV = self.epilogue_dKV(
@@ -2040,7 +2042,6 @@ class FlashAttentionBackwardSm100:
         tRS_sdS,
         thr_copy_t2r,
         thr_copy_r2t,
-        mask_fn,
         pipeline_LSE,
         pipeline_S_P,
         pipeline_dPsum,
@@ -2052,6 +2053,7 @@ class FlashAttentionBackwardSm100:
         consumer_state_dPsum,
         producer_state_dS,
         prefetch_LSE,
+        mask_fn: Optional[Callable] = None,
     ):
         # Prefetch 1 stage of LSE
         pipeline_LSE.consumer_wait(consumer_state_LSE)
@@ -2066,7 +2068,8 @@ class FlashAttentionBackwardSm100:
         cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
         #### APPLY MASK
-        mask_fn(tSrS_t2r, m_block=m_block)
+        if const_expr(mask_fn is not None):
+            mask_fn(tSrS_t2r, m_block=m_block)
 
         num_stages = cute.size(tScS_t2r, mode=[1])
 
@@ -2537,7 +2540,7 @@ class FlashAttentionBackwardSm100:
         consumer_state_dKV.advance()
         return consumer_state_dKV
 
-     @cute.jit
+    @cute.jit
     def epilogue_dKV_clear(
         self,
         tidx: Int32,
@@ -2627,47 +2630,9 @@ class FlashAttentionBackwardSm100:
             )
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
-        for epi_stage in cutlass.range_constexpr(num_epi_stages):
-            # TMEM -> RMEM -- setup
-            thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV).get_slice(tidx)
-            tdKVtdKV_t2r_p = thr_copy_t2r.partition_S(tdKVtdKV)
-            tdKVtdKV_t2r = self.split_wg(tdKVtdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
-            if const_expr(num_epi_stages > 1):
-                tdKVtdKV_t2r = tdKVtdKV_t2r[None, epi_stage]
-
-            cdKV = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
-            tdKVcdKV = thr_mma.partition_C(cdKV)
-            tdKVcdKV_t2r_p = thr_copy_t2r.partition_D(tdKVcdKV)
-            tdKVcdKV_t2r = self.split_wg(tdKVcdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
-            if const_expr(num_epi_stages > 1):
-                tdKVcdKV_t2r = tdKVcdKV_t2r[None, epi_stage]
-
-            tdKVrdKV_t2r = cute.make_fragment(tdKVcdKV_t2r.shape, Float32)
-
-            assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, (
-                "RMEM<->TMEM fragment size mismatch"
-            )
-
-            # TMEM -> RMEM -- copy and fence
-            # cute.copy(thr_copy_t2r, tdKVtdKV_t2r, tdKVrdKV_t2r)
-            # cute.arch.fence_view_async_tmem_load()
-
-            for i in cutlass.range(cute.size(tdKVrdKV_t2r)):
-                tdKVrdKV_t2r[i] = Float32(0.0)
-
-            # RMEM -- scale and convert
-            # if const_expr(scale is not None):
-            #     for i in cutlass.range(cute.size(tdKVrdKV_t2r.shape) // 2, unroll_full=True):
-            #         tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = utils.mul_packed_f32x2(
-            #             (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
-            #         )
-            tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, self.dv_dtype)  # (32 columns)
-            tdKVrdKV.store(tdKVrdKV_t2r.load().to(self.dv_dtype))
-
-            # RMEM -> SMEM -- copy, fence and barrier
-            tdKVrdKV_r2s = cute.make_tensor(tdKVrdKV.iterator, tdKVsdKV_r2s.shape)
-            
-
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+            tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
+            tdKVrdKV_r2s.fill(0)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
             cute.arch.fence_proxy(
                 cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
