@@ -105,6 +105,10 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
         v,
     )
 
+    is_all_zero = torch.count_nonzero(arbitrary_func) == 0
+    if is_all_zero:
+        out[:] = 0.0
+
     return out
 
 def _run_mask_test(

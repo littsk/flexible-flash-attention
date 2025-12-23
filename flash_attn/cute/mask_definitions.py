@@ -272,8 +272,8 @@ def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, devi
     for i in range(len(lengths)):
         if i == 0:
             for j in range(lengths[i]):
-                arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
-                # arbitrary_func_tensor[:, :, 0, offset + j] = 0
+                # arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
+                arbitrary_func_tensor[:, :, 0, offset + j] = 0
                 # arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
                 # arbitrary_func_tensor[:, :, 2, offset + j] = j + 2
         else:
