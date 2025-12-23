@@ -2621,8 +2621,6 @@ class FlashAttentionBackwardSm100:
 
         read_flag = const_expr(not deterministic_KV)
 
-        # pipeline_dKV.consumer_wait(consumer_state_dKV)
-
         # semaphore acquire
         if const_expr(deterministic_KV):
             barrier.wait_eq(
