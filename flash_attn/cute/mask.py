@@ -257,8 +257,6 @@ class AttentionMask:
                     for i in cutlass.range_constexpr(func_num // 2, unroll_full=True):
                         if col_for_mod >= col_min[i] and col_for_mod < col_max[i + 1]:
                             value_valid = True
-                    if cute.arch.thread_idx()[0] == 128:
-                        cute.printf("row_for_mod = %d, col_for_mod = %d, value_valid = %d", row_for_mod, col_for_mod, value_valid)
                     if const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (
                             global_col_idx >= self.seqlen_k

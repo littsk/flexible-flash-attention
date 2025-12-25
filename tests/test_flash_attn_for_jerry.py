@@ -191,7 +191,9 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     has_nan = torch.isnan(qk_attn).any()
     print("=== after qk_attn  mask is {}".format(has_nan))
 
+    all_inf_mask = torch.all(qk_attn == float('-inf'), dim=-1, keepdim=True)  # [B, H, seqlen_q, 1]
     softmax_attn = F.softmax(qk_attn, dim=-1)
+    softmax_attn = torch.where(all_inf_mask, torch.zeros_like(softmax_attn), softmax_attn)
 
     has_nan = torch.isnan(softmax_attn).any()
     print("=== after softmax is {}".format(has_nan))
@@ -244,9 +246,9 @@ def _run_mask_test(
     arbitrary_func = random_arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda")
 
 
-    # if load_tensor:
-    #     func_path = "jerry_func.pt"
-    #     arbitrary_func = torch.load(func_path, map_location="cpu").cuda()
+    if load_tensor:
+        func_path = "jerry_func.pt"
+        arbitrary_func = torch.load(func_path, map_location="cpu").cuda()
 
 
     original_flex_mask = mask_mod_flex
@@ -257,14 +259,14 @@ def _run_mask_test(
         batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
     )
 
-    # if load_tensor:
-    #     q_path = "jerry_q.pt"
-    #     k_path = "jerry_k.pt"
-    #     v_path = "jerry_v.pt"
+    if load_tensor:
+        q_path = "jerry_q.pt"
+        k_path = "jerry_k.pt"
+        v_path = "jerry_v.pt"
 
-    #     tensors["q"] = torch.load(q_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
-    #     tensors["k"] = torch.load(k_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
-    #     tensors["v"] = torch.load(v_path, map_location="cpu").cuda().requires_grad_()   # 建议先都加载到 CPU
+        tensors["q"] = torch.load(q_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
+        tensors["k"] = torch.load(k_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
+        tensors["v"] = torch.load(v_path, map_location="cpu").cuda().requires_grad_()   # 建议先都加载到 CPU
     
     aux_tensors_arg = [arbitrary_func]
 
@@ -292,6 +294,7 @@ def _run_mask_test(
         _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
     else:
         k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    headdim = tensors["q"].shape[3]
     softmax_scale = 1.0 / math.sqrt(headdim)
 
     k_block_sparse_mask = BlockSparseTensorsTorch(
