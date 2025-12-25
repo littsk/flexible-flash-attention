@@ -112,7 +112,7 @@ __global__ void magi_to_hstu_kernel(
         func_out[q_idx] = 0;
         func_out[seqlen_q + q_idx] = intervals[0].start;
         func_out[2 * seqlen_q + q_idx] = intervals[0].end;
-        func_idx = 2;
+        func_idx = 3;
     }
     // process remaining intervals
     for (int i = 1; i < num_merged_intervals; i++) {
