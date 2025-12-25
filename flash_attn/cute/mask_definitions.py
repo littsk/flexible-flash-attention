@@ -266,11 +266,12 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
 def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu"):
     arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
     # lengths = [315, 1021, 2201, 199, 1266, 494, 1204, 2669, 555, 6, 1217, 1351, 1136, 281, 2475]
-    lengths = [128]
+    lengths = [12288]
     offset = 0
     for i in range(len(lengths)):
         if i == 0:
             for j in range(lengths[i]):
+                # arbitrary_func_tensor[:, :, 0, offset + j] = 0
                 arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
                 # arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
                 # arbitrary_func_tensor[:, :, 2, offset + j] = j + 2

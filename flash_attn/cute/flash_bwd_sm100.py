@@ -1221,6 +1221,8 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
+        tidx = cute.arch.thread_idx()[0]
+
         # Compute multicast mask for Q & dO buffer full
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
@@ -1397,6 +1399,9 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+        # if tidx % 32 == 0:
+        #     cute.printf("=== enter load end ====")
+                
 
     @cute.jit
     def mma(
@@ -1437,6 +1442,7 @@ class FlashAttentionBackwardSm100:
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
         # Partition smem / tmem tensors
+        tidx = cute.arch.thread_idx()[0]
         # S = K @ Q.T
         tSrK = tiled_mma_S.make_fragment_A(sK)
         tSrQ = tiled_mma_S.make_fragment_B(sQ)
@@ -1528,131 +1534,136 @@ class FlashAttentionBackwardSm100:
                 )
 
             accumulate_dK = False
-            # -----------------------------------------------------------
-            ###### Prologue
-            # -----------------------------------------------------------
-            # 1. S  = Q0 @ K.T
-            # 2. dP = V @ dO.T
-            # 3. dV = P @ dO
+            if m_block_min < m_block_max:
+                # -----------------------------------------------------------
+                ###### Prologue
+                # -----------------------------------------------------------
+                # 1. S  = Q0 @ K.T
+                # 2. dP = V @ dO.T
+                # 3. dV = P @ dO
 
-            # 1) S  = Q0 @ K.T
-            handle_Q = pipeline_Q_consumer.wait_and_advance()
-            pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-            mma_qk_fn(B_idx=handle_Q.index)
-            # Don't release Q yet
-            pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-
-            # 2) dP = V @ dO.T
-            pipeline_dO.consumer_wait(consumer_state_dO)
-            pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-            # dQ uses the same tmem as dP
-            pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
-            mma_dov_fn(B_idx=consumer_state_dO.index)
-            # Don't release dO yet
-            pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
-
-            producer_phase_acc ^= 1
-            # 3) dV = P.T @ dO
-            # wait for P to be ready, which uses the same tmem as S
-            pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-            mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
-            pipeline_dO.consumer_release(consumer_state_dO)
-            consumer_state_dO.advance()
-            # -----------------------------------------------------------
-            ###### MAIN LOOP
-            # -----------------------------------------------------------
-            # 1. S  = K    @ Q.T
-            # 2. dQ = dS   @ K
-            # 3. dK = dS.T @ Q
-            # 4. dP = V    @ dO.T
-            # 5. dV = P.T  @ dO
-
-            for _ in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
-                # 1) S = K @ Q_i
-                handle_Q_next = pipeline_Q_consumer.wait_and_advance()
-                # Don't need to wait for S, as P must have been ready ealier, i.e., S is ready
-                mma_qk_fn(B_idx=handle_Q_next.index)
+                # 1) S  = Q0 @ K.T
+                handle_Q = pipeline_Q_consumer.wait_and_advance()
+                pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                mma_qk_fn(B_idx=handle_Q.index)
+                # Don't release Q yet
                 pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
-                # 2-3)
-                # Do dK = dS.T @ Q, then dQ = dS @ K if dS in tmem for first mma
-                # Otherwise, reverse order
-                pipeline_dS.consumer_wait(consumer_state_dS)
-
-                if const_expr(self.use_smem_dS_for_mma_dK):
-                    mma_dsk_fn()
-                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                    accumulate_dK = True
-                    handle_Q.release()
-                else:
-                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                    accumulate_dK = True
-                    handle_Q.release()
-                    mma_dsk_fn()
-                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-
-                # dP uses the same tmem as dQ
-                # However, if dS is ready, then dP must have been ready,
-                # so we don't need this wait before mma_dsk_fn()
-                # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-
-                pipeline_dS.consumer_release(consumer_state_dS)
-                consumer_state_dS.advance()
-
-                # 4) dP = V @ dO.T
+                # 2) dP = V @ dO.T
                 pipeline_dO.consumer_wait(consumer_state_dO)
+                pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                 # dQ uses the same tmem as dP
                 pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dov_fn(B_idx=consumer_state_dO.index)
+                # Don't release dO yet
                 pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                 producer_phase_acc ^= 1
-                # 5) dV += P @ dO
+                # 3) dV = P.T @ dO
                 # wait for P to be ready, which uses the same tmem as S
                 pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-                mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
                 pipeline_dO.consumer_release(consumer_state_dO)
                 consumer_state_dO.advance()
+                # -----------------------------------------------------------
+                ###### MAIN LOOP
+                # -----------------------------------------------------------
+                # 1. S  = K    @ Q.T
+                # 2. dQ = dS   @ K
+                # 3. dK = dS.T @ Q
+                # 4. dP = V    @ dO.T
+                # 5. dV = P.T  @ dO
 
-                handle_Q = handle_Q_next
+                for _ in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
+                    # 1) S = K @ Q_i
+                    handle_Q_next = pipeline_Q_consumer.wait_and_advance()
+                    # Don't need to wait for S, as P must have been ready ealier, i.e., S is ready
+                    mma_qk_fn(B_idx=handle_Q_next.index)
+                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
-            pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                    # 2-3)
+                    # Do dK = dS.T @ Q, then dQ = dS @ K if dS in tmem for first mma
+                    # Otherwise, reverse order
+                    pipeline_dS.consumer_wait(consumer_state_dS)
 
-            # signal to the epilogue that dV is ready
-            # pipeline_dKV.producer_acquire(producer_state_dKV)
-            pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
-            # pipeline_dKV.producer_commit(producer_state_dKV)
-            pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
-            # producer_state_dKV.advance()
-            # pipeline_dKV.producer_acquire(producer_state_dKV)
-            pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+                    if const_expr(self.use_smem_dS_for_mma_dK):
+                        mma_dsk_fn()
+                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                        accumulate_dK = True
+                        handle_Q.release()
+                    else:
+                        mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                        accumulate_dK = True
+                        handle_Q.release()
+                        mma_dsk_fn()
+                        pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
 
-            # -----------------------------------------------------------
-            ###### Remaining 2
-            # -----------------------------------------------------------
-            # 1) dK += dS.T @ Q
-            pipeline_dS.consumer_wait(consumer_state_dS)
-            mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-            # signal to the epilogue that dK is ready
-            # pipeline_dKV.producer_commit(producer_state_dKV)
-            pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
-            # producer_state_dKV.advance()
-            producer_phase_dKV ^= 1
+                    # dP uses the same tmem as dQ
+                    # However, if dS is ready, then dP must have been ready,
+                    # so we don't need this wait before mma_dsk_fn()
+                    # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
 
-            # 2) dQ = dS @ K
-            # dS is done, so dP must have been ready, we don't need to wait
-            mma_dsk_fn()
-            pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-            # Wait until dQ is done before releasing Q, since K and Q0 uses the same mbarrier
-            handle_Q.release()
-            pipeline_dS.consumer_release(consumer_state_dS)
-            consumer_state_dS.advance()
+                    pipeline_dS.consumer_release(consumer_state_dS)
+                    consumer_state_dS.advance()
 
-            producer_phase_acc ^= 1
+                    # 4) dP = V @ dO.T
+                    pipeline_dO.consumer_wait(consumer_state_dO)
+                    # dQ uses the same tmem as dP
+                    pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
+                    mma_dov_fn(B_idx=consumer_state_dO.index)
+                    pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+
+                    producer_phase_acc ^= 1
+                    # 5) dV += P @ dO
+                    # wait for P to be ready, which uses the same tmem as S
+                    pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                    mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                    pipeline_dO.consumer_release(consumer_state_dO)
+                    consumer_state_dO.advance()
+
+                    handle_Q = handle_Q_next
+
+                pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+
+                # signal to the epilogue that dV is ready
+                # pipeline_dKV.producer_acquire(producer_state_dKV)
+                pipeline_dKV.sync_object_empty.wait(0, producer_phase_dKV)
+                # pipeline_dKV.producer_commit(producer_state_dKV)
+                pipeline_dKV.sync_object_full.arrive(0, pipeline_dKV.producer_mask, cta_group)
+                # producer_state_dKV.advance()
+                # pipeline_dKV.producer_acquire(producer_state_dKV)
+                pipeline_dKV.sync_object_empty.wait(1, producer_phase_dKV)
+
+                # -----------------------------------------------------------
+                ###### Remaining 2
+                # -----------------------------------------------------------
+                # 1) dK += dS.T @ Q
+                pipeline_dS.consumer_wait(consumer_state_dS)
+                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                # signal to the epilogue that dK is ready
+                # pipeline_dKV.producer_commit(producer_state_dKV)
+                pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
+                # producer_state_dKV.advance()
+                producer_phase_dKV ^= 1
+
+                # 2) dQ = dS @ K
+                # dS is done, so dP must have been ready, we don't need to wait
+                mma_dsk_fn()
+                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                # Wait until dQ is done before releasing Q, since K and Q0 uses the same mbarrier
+                handle_Q.release()
+                pipeline_dS.consumer_release(consumer_state_dS)
+                consumer_state_dS.advance()
+
+                producer_phase_acc ^= 1
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+        
+        # if tidx % 32 == 0:
+        #     cute.printf("==== enter mma ====")
+
 
         # Currently it hangs if we have this S_P.producer_tail, will need to understand why
         # pipeline_S_P.producer_tail(producer_state_S_P)
@@ -1847,6 +1858,11 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
+
+            if const_expr(self.use_block_sparsity):
+                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, n_block)
+                m_block_min, m_block_max = 0, block_iter_count
+
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             # TODO: condition mask_seqlen
             mask_fn = partial(
@@ -1904,12 +1920,12 @@ class FlashAttentionBackwardSm100:
                     blocksparse_tensors,
                     n_block,
                     compute_step_fn,
-                    mask_fn,
-                    mask_fn_seqlen,
-                    consumer_state_LSE,
-                    consumer_state_S_P_dP,
-                    consumer_state_dPsum,
-                    producer_state_dS,
+                    mask_fn=mask_fn,
+                    mask_fn_none=None,
+                    consumer_state_LSE=consumer_state_LSE,
+                    consumer_state_S_P_dP=consumer_state_S_P_dP,
+                    consumer_state_dPsum=consumer_state_dPsum,
+                    producer_state_dS=producer_state_dS,
                 )
             else:
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
@@ -1921,65 +1937,248 @@ class FlashAttentionBackwardSm100:
                         consumer_state_dPsum=consumer_state_dPsum,
                         producer_state_dS=producer_state_dS
                     )
-
-            if const_expr(not self.use_tma_store):
-                consumer_state_dKV = self.epilogue_dKV(
-                    dp_idx,
-                    warp_idx,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    thr_mma_dV,
-                    thr_mma_dK,
-                    tdVtdV,
-                    tdKtdK,
-                    mdV,
-                    mdK,
-                    pipeline_dKV,
-                    consumer_state_dKV,
-                    softmax_scale,
-                )
-            else:
+            if const_expr(self.use_block_sparsity) and m_block_min >= m_block_max:
                 thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
-                #### STORE dV
-                consumer_state_dKV = self.epilogue_dK_or_dV_tma(
-                    dp_idx,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    thr_mma_dV,
-                    tdVtdV,
-                    mdV_tma_tensor,
-                    sdV,
-                    tma_atom_dV,
-                    thr_copy_r2s_dKV,
-                    pipeline_dKV,
-                    consumer_state_dKV,
-                    None,  # Don't scale
-                    int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                    mdV_semaphore,
-                )
-                #### STORE dK
-                consumer_state_dKV = self.epilogue_dK_or_dV_tma(
-                    dp_idx,
-                    batch_idx,
-                    head_idx,
-                    n_block,
-                    thr_mma_dK,
-                    tdKtdK,
-                    mdK_tma_tensor,
-                    sdK,
-                    tma_atom_dK,
-                    thr_copy_r2s_dKV,
-                    pipeline_dKV,
-                    consumer_state_dKV,
-                    softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
-                    int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
-                    mdK_semaphore,
-                )
+                if const_expr(not self.use_tma_store):
+                        assert False, "Not implemented for epi clear for no tma store"
+                else:
+                    consumer_state_dKV = self.epilogue_dKV_clear(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dV,
+                            tdVtdV,
+                            mdV_tma_tensor,
+                            sdV,
+                            tma_atom_dV,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            None,  # Don't scale
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdV_semaphore,
+                        )
+                    # #### STORE dK
+                    consumer_state_dKV = self.epilogue_dKV_clear(
+                            dp_idx,
+                            batch_idx,
+                            head_idx,
+                            n_block,
+                            thr_mma_dK,
+                            tdKtdK,
+                            mdK_tma_tensor,
+                            sdK,
+                            tma_atom_dK,
+                            thr_copy_r2s_dKV,
+                            pipeline_dKV,
+                            consumer_state_dKV,
+                            softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
+                            int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                            mdK_semaphore,
+                        )
+            else:
+                if const_expr(not self.use_tma_store):
+                    consumer_state_dKV = self.epilogue_dKV(
+                        dp_idx,
+                        warp_idx,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        thr_mma_dV,
+                        thr_mma_dK,
+                        tdVtdV,
+                        tdKtdK,
+                        mdV,
+                        mdK,
+                        pipeline_dKV,
+                        consumer_state_dKV,
+                        softmax_scale,
+                    )
+                else:
+                    thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
+                    #### STORE dV
+                    consumer_state_dKV = self.epilogue_dK_or_dV_tma(
+                        dp_idx,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        thr_mma_dV,
+                        tdVtdV,
+                        mdV_tma_tensor,
+                        sdV,
+                        tma_atom_dV,
+                        thr_copy_r2s_dKV,
+                        pipeline_dKV,
+                        consumer_state_dKV,
+                        None,  # Don't scale
+                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                        mdV_semaphore,
+                    )
+                    #### STORE dK
+                    consumer_state_dKV = self.epilogue_dK_or_dV_tma(
+                        dp_idx,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        thr_mma_dK,
+                        tdKtdK,
+                        mdK_tma_tensor,
+                        sdK,
+                        tma_atom_dK,
+                        thr_copy_r2s_dKV,
+                        pipeline_dKV,
+                        consumer_state_dKV,
+                        softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
+                        int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                        mdK_semaphore,
+                    )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        # if tidx == 0:
+        #     cute.printf("=== enter compute ")
+
+    @cute.jit
+    def epilogue_dKV_clear(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        thr_mma: cute.core.ThrMma,
+        tdKVtdKV: cute.Tensor,
+        mdKV: cute.Tensor,
+        sdKV: cute.Tensor,
+        tma_atom_dKV: cute.CopyAtom,
+        thr_copy_r2s_dKV: cute.TiledCopy,
+        pipeline_dKV: PipelineAsync,
+        consumer_state_dKV: cutlass.pipeline.PipelineState,
+        scale: Optional[Float32],
+        barrier_id: Int32,
+        mdKV_semaphore: Optional[cute.Tensor],
+    ):
+        # assumes mma_tiler_pdo = mma_tiler_dsq = (tile_n, head_dim)
+        # head_dim = head_dim_v, dk_dtype = dv_dtype
+        num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+        wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
+        num_wg = num_compute_threads // 128
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+
+        if const_expr(self.qhead_per_kvhead == 1):
+            sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
+        else:
+            sdKV = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
+
+        # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
+        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
+
+        head_idx_kv = head_idx // self.qhead_per_kvhead
+        if const_expr(self.qhead_per_kvhead == 1):
+            mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
+            gdKV_p = cute.local_tile(
+                mdKV_cur, (self.tile_n, self.tile_hdim), (n_block, 0)
+            )  # (tile_n, hdim)
+            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
+            gdKV_epi = cute.local_tile(
+                gdKV, self.sdKV_epi_tile, (0, None)
+            )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
+        else:
+            mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
+            gdKV_p = cute.local_tile(
+                mdKV_cur, (self.tile_n * self.tile_hdim,), (n_block,)
+            )  # (tile_n * hdim)
+            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * self.tile_hdim // num_wg,))[
+                ((None, wg_idx),)
+            ]  # (tile_n * hdim / 2)
+            gdKV_epi = cute.flat_divide(
+                gdKV, (self.sdKV_flat_epi_tile,)
+            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+
+        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
+        if const_expr(deterministic_KV):
+            mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
+
+        if const_expr(self.qhead_per_kvhead == 1):
+            tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
+                tma_atom_dKV,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sdKV, 0, 2),
+                cute.group_modes(gdKV_epi, 0, 2),
+            )  # (TMA) and (TMA, EPI_STAGE)
+            assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
+            assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
+            num_epi_stages = cute.size(tdKVgdKV.shape[1])
+            assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
+        else:
+            num_epi_stages = self.num_epi_stages
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+
+        read_flag = const_expr(not deterministic_KV)
+
+        # pipeline_dKV.consumer_wait(consumer_state_dKV)
+
+        # semaphore acquire
+        if const_expr(deterministic_KV):
+            barrier.wait_eq(
+                mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
+            )
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+            tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
+            tdKVrdKV_r2s.fill(0)
+            cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+
+            # SMEM -> GMEM
+            if leader_warp:
+                if const_expr(self.qhead_per_kvhead == 1):
+                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                else:
+                    with cute.arch.elect_one():
+                        copy_utils.cpasync_reduce_bulk_add_f32(
+                            sdKV.iterator,
+                            gdKV_epi[None, epi_stage].iterator,
+                            self.tma_copy_bytes["dKacc"],
+                        )
+                if const_expr(epi_stage < num_epi_stages - 1):
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                cute.arch.barrier_arrive(
+                    barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+                )
+
+            # Barrier since all warps need to wait for SMEM to be freed
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            cute.arch.barrier(
+                barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+            )
+
+        # semaphore release
+        # NOTE: arrive_inc calls red_release which issues membar
+        if const_expr(deterministic_KV):
+            if leader_warp:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+            barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
+
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            pipeline_dKV.consumer_release(consumer_state_dKV)
+        consumer_state_dKV.advance()
+        return consumer_state_dKV
 
     @cute.jit
     def compute_step(
@@ -1996,7 +2195,6 @@ class FlashAttentionBackwardSm100:
         tRS_sdS,
         thr_copy_t2r,
         thr_copy_r2t,
-        mask_fn,
         pipeline_LSE,
         pipeline_S_P,
         pipeline_dPsum,
@@ -2008,6 +2206,7 @@ class FlashAttentionBackwardSm100:
         consumer_state_dPsum,
         producer_state_dS,
         prefetch_LSE,
+        mask_fn: Optional[Callable] = None,
     ):
         # Prefetch 1 stage of LSE
         pipeline_LSE.consumer_wait(consumer_state_LSE)
@@ -2022,7 +2221,8 @@ class FlashAttentionBackwardSm100:
         cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
         #### APPLY MASK
-        mask_fn(tSrS_t2r, m_block=m_block)
+        if const_expr(mask_fn is not None):
+            mask_fn(tSrS_t2r, m_block=m_block)
 
         num_stages = cute.size(tScS_t2r, mode=[1])
 
@@ -2253,6 +2453,9 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        # if tidx == 0:
+        #     cute.printf("==== enter reduce_dq =====")
 
     @cute.jit
     def reduce_dQaccum_step(
