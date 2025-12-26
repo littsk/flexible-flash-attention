@@ -154,10 +154,6 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     headdim = q.shape[3]
     scale = 1.0 / math.sqrt(headdim)
 
-    print("torch tensors[q] ptr is {}".format(tensors["q"].data_ptr()))
-    print("torch tensors[k] ptr is {}".format(tensors["k"].data_ptr()))
-    print("torch tensors[v] ptr is {}".format(tensors["v"].data_ptr()))
-    print("torch aux_tensors_arg ptr is {}".format(arbitrary_func.data_ptr()))
 
     if nheads_kv == nheads:
         qk_attn = torch.einsum(
@@ -175,7 +171,6 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
         )
     
     has_nan = torch.isnan(qk_attn).any()
-    print("=== after qk_attn is {}".format(has_nan))
 
     # func_num = arbitrary_func.shape[2]
     # for i in range(seqlen_q):
@@ -188,23 +183,17 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
 
     qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
 
-    has_nan = torch.isnan(qk_attn).any()
-    print("=== after qk_attn  mask is {}".format(has_nan))
 
     all_inf_mask = torch.all(qk_attn == float('-inf'), dim=-1, keepdim=True)  # [B, H, seqlen_q, 1]
     softmax_attn = F.softmax(qk_attn, dim=-1)
     softmax_attn = torch.where(all_inf_mask, torch.zeros_like(softmax_attn), softmax_attn)
 
-    has_nan = torch.isnan(softmax_attn).any()
-    print("=== after softmax is {}".format(has_nan))
     out = torch.einsum(
         "bhnm,bmhd->bnhd",
         softmax_attn,
         v,
     )
 
-    has_nan = torch.isnan(out).any()
-    print("=== after out is {}".format(has_nan))
 
     is_all_zero = torch.count_nonzero(arbitrary_func) == 0
     if is_all_zero:
@@ -243,13 +232,14 @@ def _run_mask_test(
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = random_arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda")
+
+    if not load_tensor:
+        arbitrary_func = random_arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda")
 
 
     if load_tensor:
-        func_path = "jerry_func.pt"
+        func_path = "jerry_func_true.pt"
         arbitrary_func = torch.load(func_path, map_location="cpu").cuda()
-
 
     original_flex_mask = mask_mod_flex
 
@@ -260,14 +250,16 @@ def _run_mask_test(
     )
 
     if load_tensor:
-        q_path = "jerry_q.pt"
-        k_path = "jerry_k.pt"
-        v_path = "jerry_v.pt"
+        q_path = "jerry_q_true.pt"
+        k_path = "jerry_k_true.pt"
+        v_path = "jerry_v_true.pt"
 
         tensors["q"] = torch.load(q_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
         tensors["k"] = torch.load(k_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
         tensors["v"] = torch.load(v_path, map_location="cpu").cuda().requires_grad_()   # 建议先都加载到 CPU
-    
+        seqlen_q = tensors["q"].shape[1]
+        seqlen_k = tensors["k"].shape[1]
+
     aux_tensors_arg = [arbitrary_func]
 
     frozen_af = arbitrary_func  # freeze
@@ -327,34 +319,6 @@ def _run_mask_test(
     )
     linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
     
-    print("kernel tensors[q] ptr is {}".format(tensors["q"].data_ptr()))
-    print("kernel tensors[k] ptr is {}".format(tensors["k"].data_ptr()))
-    print("kenrel tensors[v] ptr is {}".format(tensors["v"].data_ptr()))
-    print("kernel aux_tensors_arg ptr is {}".format(aux_tensors_arg[0].data_ptr()))
-    
-
-
-
-    print("kernel tensors[q] data is {}".format(tensors["q"]))
-    print("kernel tensors[k] data is {}".format(tensors["k"]))
-    print("kenrel tensors[v] data is {}".format(tensors["v"]))
-    print("kernel aux_tensors_arg data is {}".format(aux_tensors_arg[0]))
-
-    '''
-    tensors[q] shape is torch.Size([1, 12288, 1, 128])
-    tensors[k] shape is torch.Size([1, 12288, 1, 128])
-    tensors[v] shape is torch.Size([1, 12288, 1, 128])
-
-    tensors[q] stride is (1572864, 128, 128, 1)
-    tensors[k] stride is (1572864, 128, 128, 1)
-    tensors[v] stride is (1572864, 128, 128, 1)
-    '''
-    print("tensors[q] shape is {}".format(tensors["q"].shape))    
-    print("tensors[k] shape is {}".format(tensors["k"].shape))    
-    print("tensors[v] shape is {}".format(tensors["v"].shape))    
-    print("tensors[q] stride is {}".format(tensors["q"].stride()))    
-    print("tensors[k] stride is {}".format(tensors["k"].stride()))    
-    print("tensors[v] stride is {}".format(tensors["v"].stride()))    
 
     out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
