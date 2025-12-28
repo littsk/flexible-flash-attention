@@ -1244,17 +1244,6 @@ def flash_attn_func(
     linear_q_block_sparse_tensors: Optional[LinearBlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
 ):
-    print("---- q is {}".format(q))
-    print("---- k is {}".format(k))
-    print("---- v is {}".format(v))
-    print("---- aux_tensors is {}".format(aux_tensors))
-
-    print("q shape is {}".format(q.shape))    
-    print("k shape is {}".format(k.shape))    
-    print("v shape is {}".format(v.shape))    
-    print("q stride is {}".format(q.stride()))    
-    print("k stride is {}".format(k.stride()))    
-    print("v stride is {}".format(v.stride()))    
     return FlashAttnFunc.apply(
         q,
         k,

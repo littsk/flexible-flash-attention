@@ -1399,8 +1399,6 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-        # if tidx % 32 == 0:
-        #     cute.printf("=== enter load end ====")
                 
 
     @cute.jit
@@ -1660,9 +1658,6 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-        
-        # if tidx % 32 == 0:
-        #     cute.printf("==== enter mma ====")
 
 
         # Currently it hangs if we have this S_P.producer_tail, will need to understand why
@@ -2036,9 +2031,6 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
-        # if tidx == 0:
-        #     cute.printf("=== enter compute ")
 
     @cute.jit
     def epilogue_dKV_clear(
@@ -2453,9 +2445,6 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
-        # if tidx == 0:
-        #     cute.printf("==== enter reduce_dq =====")
 
     @cute.jit
     def reduce_dQaccum_step(
