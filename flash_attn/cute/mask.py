@@ -67,6 +67,46 @@ def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> N
             #     cute.printf("tidx = {}, s = {}, i = {}, row_limit_top = {}, row_limit_top_s = {}, mask = {}, out_bound = {}", tidx, s, i, row_limit_top, row_limit_top_s, mask, out_bound)
 
 
+@cute.jit
+def mask_r2p_intervals(
+    X: cute.Tensor,
+    col_limits: cute.Tensor,
+    num_intervals: int,
+) -> None:
+    """
+    use R2P instruction to optimize multi-interval mask comparison.
+    
+    interval: [0, col_max[0]) ∪ [col_min[0], col_max[1]) ∪ [col_min[1], col_max[2]) ...
+    col_limits format: [col_max[0], col_min[0], col_max[1], col_min[1], col_max[2], ...]
+                     aka. [col_limits[0], col_limits[1], col_limits[2], ...]
+    e.g.
+    - interval [0, b): mask = (1 << b) - 1
+    - interval [a, b): mask = ((1 << b) - 1) ^ ((1 << a) - 1)
+    - multiple intervals by OR: combined_mask = mask_0 | mask_1 | ...
+    """
+    ncol = const_expr(cute.size(X.shape))
+    # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
+    for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
+        # first interval [0, col_max[0])
+        col_max_0_s = max(col_limits[0] - s * 24, 0)
+        combined_mask = (1 << col_max_0_s) - 1
+        
+        # subsequent intervals [col_min[j], col_max[j+1])
+        # in col_limits: col_min[j] = col_limits[2*j + 1], col_max[j+1] = col_limits[2*j + 2]
+        for j in cutlass.range_constexpr(num_intervals):
+            col_min_s = max(col_limits[2 * j + 1] - s * 24, 0)
+            col_max_s = max(col_limits[2 * j + 2] - s * 24, 0)
+            # XOR to generate mask for interval [col_min, col_max)
+            interval_mask = ((1 << col_max_s) - 1) ^ ((1 << col_min_s) - 1)
+            combined_mask = combined_mask | interval_mask
+        
+        # R2P to batch set predicate
+        for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
+            in_bound = cutlass.Boolean(combined_mask & (1 << i))
+            c = s * 24 + i
+            X[c] = X[c] if in_bound else -Float32.inf
+
+
 @dataclass(frozen=True)
 class AttentionMask:
     tile_m: cutlass.Constexpr[int]
@@ -496,26 +536,43 @@ class AttentionMask:
                 _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
 
             arbitrary_func = aux_tensors[0]
-            col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
-            col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
-            col_max[0] = arbitrary_func[batch_idx, 0, 0, mask_row_for_mod]
-            for i in cutlass.range_constexpr(func_num // 2):
-                col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, mask_row_for_mod]
-                col_max[i + 1] = arbitrary_func[batch_idx, 0, 2 * i + 2, mask_row_for_mod]
-
+            n_block_offset = n_block * self.tile_n
             ncol = const_expr(cute.size(tScS_t2r.shape))
-            for i in cutlass.range_constexpr(ncol):
-                col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
-                global_col = col_coord + n_block * self.tile_n
-                global_col_for_mod = global_col
-                if const_expr(wrap_aux_indices):
-                    _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
 
-                value_valid = global_col_for_mod < col_max[0]
-                for j in cutlass.range_constexpr(func_num // 2, unroll_full=True):
-                    if global_col_for_mod >= col_min[j] and global_col_for_mod < col_max[j + 1]:
-                        value_valid = True
-                acc_S[i] = acc_S[i] if value_valid else -Float32.inf
+            # R2P optimization: use bit mask to represent intervals and R2P instruction to batch set predicate
+            r2p_arbitrary = True  # Toggle for arbitrary mask R2P optimization
+            if const_expr(not wrap_aux_indices and not self.swap_AB and r2p_arbitrary):
+                # col_limits format: [col_max[0], col_min[0], col_max[1], col_min[1], ...]
+                # interval: [0, col_max[0]) ∪ [col_min[0], col_max[1]) ∪ ...
+                num_limits = const_expr(func_num + 1)  # func_num // 2 * 2 + 1
+                col_limits = cute.make_fragment((num_limits,), Int32)
+                # load and convert to local coordinates relative to current n_block
+                col_limits[0] = max(arbitrary_func[batch_idx, 0, 0, mask_row_for_mod] - n_block_offset, 0)
+                for j in cutlass.range_constexpr(func_num // 2):
+                    col_limits[2 * j + 1] = max(arbitrary_func[batch_idx, 0, 2 * j + 1, mask_row_for_mod] - n_block_offset, 0)
+                    col_limits[2 * j + 2] = max(arbitrary_func[batch_idx, 0, 2 * j + 2, mask_row_for_mod] - n_block_offset, 0)
+                mask_r2p_intervals(acc_S, col_limits, func_num // 2)
+            else:
+                # fallback to naive method
+                col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
+                col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
+                col_max[0] = arbitrary_func[batch_idx, 0, 0, mask_row_for_mod]
+                for i in cutlass.range_constexpr(func_num // 2):
+                    col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, mask_row_for_mod]
+                    col_max[i + 1] = arbitrary_func[batch_idx, 0, 2 * i + 2, mask_row_for_mod]
+
+                for i in cutlass.range_constexpr(ncol):
+                    col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
+                    global_col = col_coord + n_block_offset
+                    global_col_for_mod = global_col
+                    if const_expr(wrap_aux_indices):
+                        _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
+
+                    value_valid = global_col_for_mod < col_max[0]
+                    for j in cutlass.range_constexpr(func_num // 2, unroll_full=True):
+                        if global_col_for_mod >= col_min[j] and global_col_for_mod < col_max[j + 1]:
+                            value_valid = True
+                    acc_S[i] = acc_S[i] if value_valid else -Float32.inf
                 # if const_expr(mask_seqlen):  # for arbitrary mask, we do not need this to check boundary, casuse the boundary information is in func and for fwd, we do not write the output that exceeds the seqlen_q
                 #     out_of_bounds = (global_row >= self.seqlen_q) or (global_col >= self.seqlen_k)
                 #     acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
