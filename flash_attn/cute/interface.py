@@ -251,13 +251,13 @@ def _flash_attn_fwd(
         seqused_k_tensor,
         learnable_sink_tensor,
     ) = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
         if t is not None
         else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
     ]
     page_table_tensor = (
-        from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+        from_dlpack(page_table.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=1)
         if page_table is not None
         else None
     )
@@ -350,13 +350,13 @@ def _flash_attn_fwd(
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out if not is_split_kv else out_partial)
     ]
     if is_split_kv:
-        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
+        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
     elif lse is not None:
-        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
+        lse_tensor = from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
         lse_tensor = None
 
@@ -406,7 +406,7 @@ def _flash_attn_fwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     compile_key = (
         dtype,
@@ -513,6 +513,10 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            options="--enable-tvm-ffi"  
+            # please install tvm see link: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html
+            # pip install apache-tvm-ffi 
+            # pip install torch-c-dlpack-ext
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -756,23 +760,23 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (q, k, v, out, dout, dq, dk, dv)
     ]
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=lse.ndim - 1
     )
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
             for t in (dk_accum, dv_accum)
         ]
     cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
         if t is not None
         else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -802,7 +806,7 @@ def _flash_attn_bwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
@@ -825,6 +829,7 @@ def _flash_attn_bwd(
             cu_seqlens_q_tensor,
             seqused_q_tensor,
             current_stream,
+            options="--enable-tvm-ffi"
         )
     _flash_attn_bwd.compile_cache_pre[compile_key_pre](
         o_tensor,
@@ -966,6 +971,7 @@ def _flash_attn_bwd(
             mdQ_semaphore=dQ_semaphore_tensor,
             mdK_semaphore=dK_semaphore_tensor,
             mdV_semaphore=dV_semaphore_tensor,
+            options="--enable-tvm-ffi"
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor,
@@ -1008,6 +1014,7 @@ def _flash_attn_bwd(
             cu_seqlens_q_tensor,
             seqused_q_tensor,
             current_stream,
+            options="--enable-tvm-ffi"
         )
     _flash_attn_bwd.compile_cache_post[compile_key_post](
         dq_accum_tensor,
@@ -1034,6 +1041,7 @@ def _flash_attn_bwd(
                 cu_seqlens_k_tensor,
                 seqused_k_tensor,
                 current_stream,
+                options="--enable-tvm-ffi"
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
             dk_accum_tensor,
@@ -1064,6 +1072,7 @@ def _flash_attn_bwd(
                 cu_seqlens_k_tensor,
                 seqused_k_tensor,
                 current_stream,
+                options="--enable-tvm-ffi"
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
             dv_accum_tensor,
@@ -1381,21 +1390,21 @@ def _flash_attn_fwd_combine(
         log_max_splits = max(log_max_splits, 5)
 
     # Convert to cute tensors (using kernel-formatted tensors)
-    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(
+    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=4 if not is_varlen else 3
     )
-    lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
+    lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=lse_partial.ndim - 2
     )
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
+    out_tensor = from_dlpack(out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
     lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2)
+        from_dlpack(lse.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=lse.ndim - 2)
         if lse is not None
         else None
     )
 
     optional_tensors = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        from_dlpack(t.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
         if t is not None
         else None
         for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)
@@ -1457,6 +1466,7 @@ def _flash_attn_fwd_combine(
             num_splits_dynamic_tensor,
             semaphore_tensor,
             current_stream,
+            options="--enable-tvm-ffi"
         )
 
     _flash_attn_fwd_combine.compile_cache[compile_key](
