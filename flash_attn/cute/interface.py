@@ -1015,7 +1015,6 @@ def _flash_attn_bwd(
     num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
-    torch.cuda.synchronize()
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         # Only create from_dlpack tensors when compilation is needed
         dq_accum_tensor = from_dlpack(dq_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq_accum.ndim - 1)
