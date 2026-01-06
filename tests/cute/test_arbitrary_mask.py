@@ -154,11 +154,6 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     headdim = q.shape[3]
     scale = 1.0 / math.sqrt(headdim)
 
-    print("torch tensors[q] ptr is {}".format(tensors["q"].data_ptr()))
-    print("torch tensors[k] ptr is {}".format(tensors["k"].data_ptr()))
-    print("torch tensors[v] ptr is {}".format(tensors["v"].data_ptr()))
-    print("torch aux_tensors_arg ptr is {}".format(arbitrary_func.data_ptr()))
-
     if nheads_kv == nheads:
         qk_attn = torch.einsum(
             "bnhd,bmhd->bhnm",
@@ -173,9 +168,6 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
             q * scale,
             k,
         )
-    
-    has_nan = torch.isnan(qk_attn).any()
-    print("=== after qk_attn is {}".format(has_nan))
 
     # func_num = arbitrary_func.shape[2]
     # for i in range(seqlen_q):
@@ -185,42 +177,16 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     #             if j >= arbitrary_func[0, 0, 2 * k + 1, i] and j < arbitrary_func[0, 0, 2 * k + 2, i]:
     #                 value_valid = True
     #         qk_attn[:, :, i, j] = -float("inf") if not value_valid else qk_attn[:, :, i, j]
-
     qk_attn = apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k)
-
-    has_nan = torch.isnan(qk_attn).any()
-    print("=== after qk_attn  mask is {}".format(has_nan))
 
     all_inf_mask = torch.all(qk_attn == float('-inf'), dim=-1, keepdim=True)  # [B, H, seqlen_q, 1]
     softmax_attn = F.softmax(qk_attn, dim=-1)
     softmax_attn = torch.where(all_inf_mask, torch.zeros_like(softmax_attn), softmax_attn)
-
-    nan_mask = torch.isnan(softmax_attn)
-    print("nan_mask shape is {}".format(nan_mask.shape))
-
-    has_nan = torch.isnan(softmax_attn).any()
-
-    # 每一行是否全是 NaN（沿着最后一维 N 做 all）
-    row_all_nan = nan_mask.all(dim=-1)     # (1, 1, M)
-
-    # 去掉前两维，得到按行的布尔标记
-    row_all_nan = row_all_nan.squeeze(0).squeeze(0)  # (M,)
-
-    # 全是 NaN 的行索引
-    all_nan_rows = torch.nonzero(row_all_nan, as_tuple=True)[0]  # e.g. tensor([1, 5, 7])
-
-    print("==== all_nan_rows is {}".format(all_nan_rows))
-    
-
-    print("=== after softmax is {}".format(has_nan))
     out = torch.einsum(
         "bhnm,bmhd->bnhd",
         softmax_attn,
         v,
     )
-
-    has_nan = torch.isnan(out).any()
-    print("=== after out is {}".format(has_nan))
 
     is_all_zero = torch.count_nonzero(arbitrary_func) == 0
     if is_all_zero:
@@ -280,9 +246,9 @@ def _run_mask_test(
         k_path = "jerry_k_2.pt"
         v_path = "jerry_v_2.pt"
 
-        tensors["q"] = torch.load(q_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
-        tensors["k"] = torch.load(k_path, map_location="cpu").cuda().requires_grad_()  # 建议先都加载到 CPU
-        tensors["v"] = torch.load(v_path, map_location="cpu").cuda().requires_grad_()   # 建议先都加载到 CPU
+        tensors["q"] = torch.load(q_path, map_location="cpu").cuda().requires_grad_()  
+        tensors["k"] = torch.load(k_path, map_location="cpu").cuda().requires_grad_() 
+        tensors["v"] = torch.load(v_path, map_location="cpu").cuda().requires_grad_()   
     
     
     aux_tensors_arg = [arbitrary_func]
@@ -345,35 +311,6 @@ def _run_mask_test(
     )
     linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
     
-    print("kernel tensors[q] ptr is {}".format(tensors["q"].data_ptr()))
-    print("kernel tensors[k] ptr is {}".format(tensors["k"].data_ptr()))
-    print("kenrel tensors[v] ptr is {}".format(tensors["v"].data_ptr()))
-    print("kernel aux_tensors_arg ptr is {}".format(aux_tensors_arg[0].data_ptr()))
-    
-
-
-
-    print("kernel tensors[q] data is {}".format(tensors["q"]))
-    print("kernel tensors[k] data is {}".format(tensors["k"]))
-    print("kenrel tensors[v] data is {}".format(tensors["v"]))
-    print("kernel aux_tensors_arg data is {}".format(aux_tensors_arg[0]))
-
-    '''
-    tensors[q] shape is torch.Size([1, 12288, 1, 128])
-    tensors[k] shape is torch.Size([1, 12288, 1, 128])
-    tensors[v] shape is torch.Size([1, 12288, 1, 128])
-
-    tensors[q] stride is (1572864, 128, 128, 1)
-    tensors[k] stride is (1572864, 128, 128, 1)
-    tensors[v] stride is (1572864, 128, 128, 1)
-    '''
-    print("tensors[q] shape is {}".format(tensors["q"].shape))    
-    print("tensors[k] shape is {}".format(tensors["k"].shape))    
-    print("tensors[v] shape is {}".format(tensors["v"].shape))    
-    print("tensors[q] stride is {}".format(tensors["q"].stride()))    
-    print("tensors[k] stride is {}".format(tensors["k"].stride()))    
-    print("tensors[v] stride is {}".format(tensors["v"].stride()))    
-
     out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
         k=tensors["k"],
@@ -399,10 +336,7 @@ def _run_mask_test(
     print(f"Output max diff: {(out_cute - out_ref_fp32).abs().max().item()}")
     print(f"Pytorch max diff: {(out_ref - out_ref_fp32).abs().max().item()}")
 
-    # Check for invalid values
-    print("out_cute is {}".format(out_cute))
-    print("out_ref_fp16 is {}".format(out_ref))
-    print("out_ref_fp32 is {}".format(out_ref_fp32))
+    # # Check for invalid values
     assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
     assert not torch.isnan(out_cute).any()
     assert not torch.isnan(out_ref_fp32).any()
@@ -425,15 +359,6 @@ def _run_mask_test(
     (dq_ref, dk_ref, dv_ref) = torch.autograd.grad(
         out_ref, (tensors["q"], tensors["k"], tensors["v"]), dout
     )
-
-    print("dq is {}".format(dq))
-    print("dq_ref_fp32 is {}".format(dq_ref_fp32))
-
-    print("dk is {}".format(dk))
-    print("dk_ref_fp32 is {}".format(dk_ref_fp32))
-
-    print("dv is {}".format(dv))
-    print("dv_ref_fp32 is {}".format(dv_ref_fp32))
 
     print(f"dV max diff: {(dv - dv_ref_fp32).abs().max().item()}")
     print(f"dV Pytorch max diff: {(dv_ref - dv_ref_fp32).abs().max().item()}")
@@ -482,14 +407,14 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=12288,
-        seqlen_k=12288,
-        nheads=1,
+        seqlen_q=1024,
+        seqlen_k=1024,
+        nheads=4,
         kv_mode="mha",
-        headdim=64,
+        headdim=128,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,
         tile_n=128,
-        load_tensor=True
+        load_tensor=False
     )

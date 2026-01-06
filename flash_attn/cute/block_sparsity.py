@@ -200,6 +200,19 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
         full_block_idx_tensor,
     )
 
+def to_torch_linear_block_sparse_tensors(tensors: LinearBlockSparseTensors) -> Optional[LinearBlockSparseTensorsTorch]:
+    if not is_block_sparsity_enabled(tensors):
+        return None
+
+    return LinearBlockSparseTensorsTorch(
+        mask_block_cnt=tensors.mask_block_cnt,
+        mask_block_offset=tensors.mask_block_offset,
+        mask_block_idx=tensors.mask_block_idx,
+        full_block_cnt=tensors.full_block_cnt,
+        full_block_offset=tensors.full_block_offset,
+        full_block_idx=tensors.full_block_idx,
+    )
+
 
 def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) -> Optional[LinearBlockSparseTensors]:
     if not is_block_sparsity_enabled(tensors):
