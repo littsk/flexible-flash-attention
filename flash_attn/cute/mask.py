@@ -142,9 +142,6 @@ class AttentionMask:
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=self.swap_AB)
         tScS_mn_2 = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=False)
-        if cute.arch.thread_idx()[0] == 128:
-            cute.print_tensor(tScS_mn)
-            cute.print_tensor(tScS_mn_2)
         # We use t0ScS as these indices are known at compile time. We then must subtract the
         # column limit by the thread column offset.
         t0ScS_mn = utils.make_acc_tensor_mn_view(
@@ -297,8 +294,6 @@ class AttentionMask:
                     for i in cutlass.range_constexpr(func_num // 2, unroll_full=True):
                         if col_for_mod >= col_min[i] and col_for_mod < col_max[i + 1]:
                             value_valid = True
-                    if cute.arch.thread_idx()[0] == 128:
-                        cute.printf("row_for_mod = %d, col_for_mod = %d, value_valid = %d", row_for_mod, col_for_mod, value_valid)
                     if const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (
                             global_col_idx >= self.seqlen_k
@@ -407,8 +402,6 @@ class AttentionMask:
                                 if t0ScS_mn[r, 0][ROW] < row_limit_top
                                 else acc_S_mn[r, c]
                             )
-                            if cute.arch.thread_idx()[0] == 128:
-                                cute.printf("row_limit_top = %d, t0ScS_mn[r, 0][ROW] = %d, col0 = %d, r = %d, c = %d, acc_S_mn[r, c] = %f", row_limit_top, t0ScS_mn[r, 0][ROW], col0, r, c, acc_S_mn[r, c])
                 else:
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col0 = t0ScS_mn[0, c][COL]

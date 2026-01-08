@@ -21,7 +21,40 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
 from flash_attn.cute.interface import flash_attn_func
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_linear_sparse_tensors, LinearBlockSparseTensorsTorch
+
+# Import CUDA kernel for create_block_mask
+try:
+    import create_block_mask_cuda
+    HAS_CREATE_BLOCK_MASK_CUDA = True
+except ImportError:
+    # Try to build and install create_block_mask_cuda
+    import subprocess
+    import os
+    print("create_block_mask_cuda not found. Attempting to build and install...")
+    utils_dir = os.path.join(os.path.dirname(__file__), "../../csrc/utils")
+    utils_dir = os.path.abspath(utils_dir)
+    try:
+        # Run make to build the module
+        result = subprocess.run(
+            ["make", "create_block_mask"],
+            cwd=utils_dir,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print("Build successful. Importing create_block_mask_cuda...")
+            import create_block_mask_cuda
+            HAS_CREATE_BLOCK_MASK_CUDA = True
+        else:
+            print(f"Build failed: {result.stderr}")
+            create_block_mask_cuda = None
+            HAS_CREATE_BLOCK_MASK_CUDA = False
+    except Exception as e:
+        print(f"Failed to build create_block_mask_cuda: {e}")
+        create_block_mask_cuda = None
+        HAS_CREATE_BLOCK_MASK_CUDA = False
+        print("Warning: create_block_mask_cuda not found. Using PyTorch reference implementation.")
 from flash_attn.cute.mask_definitions import (
     get_mask_pair,
     STATIC_MASKS,
@@ -257,12 +290,18 @@ def _run_mask_test(
     def mask_mod_flex_new(b, h, q_idx, kv_idx, arbitrary_func_func=frozen_af):
         return original_flex_mask(b, h, q_idx, kv_idx, arbitrary_func_func)
 
+    headdim = tensors["q"].shape[3]
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
     # Compute block sparsity for mask_mod
     if COMPUTE_CAPABILITY == 10:
         sparse_tile_m = 2 * tile_m
     else:
         sparse_tile_m = tile_m
-    # convert to q2k/k2q kernel
+
+    # =========================================================================
+    # Method 1: Use PyTorch's create_block_mask (reference)
+    # =========================================================================
     bm = create_block_mask(
         mask_mod_flex_new,
         1,
@@ -272,15 +311,10 @@ def _run_mask_test(
         device="cuda",
         BLOCK_SIZE=(sparse_tile_m, tile_n),
     )
-    k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx = None, None, None, None
-    if COMPUTE_CAPABILITY == 10:
-        _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
-    else:
-        k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
+    # bm.as_tuple() format: (Q_LEN, KV_LEN, kv_num_blocks, kv_indices, full_kv_num_blocks, full_kv_indices,
+    #                        q_num_blocks, q_indices, full_q_num_blocks, full_q_indices, Q_BLOCK_SIZE, KV_BLOCK_SIZE, mask_mod)
+    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm.as_tuple()
     
-    headdim = tensors["q"].shape[3]
-    softmax_scale = 1.0 / math.sqrt(headdim)
-
     k_block_sparse_mask = BlockSparseTensorsTorch(
         mask_block_cnt=k_mask_cnt,
         mask_block_idx=k_mask_idx,
@@ -288,7 +322,7 @@ def _run_mask_test(
         full_block_idx=k_full_idx,
     )
     # convert to linear sparse tensors kernel
-    linear_k_block_sparse_mask = bhqk_to_linear_sparse_tensors(k_block_sparse_mask)
+    ref_linear_k_block_sparse_mask = bhqk_to_linear_sparse_tensors(k_block_sparse_mask)
 
     bm_bwd = create_block_mask(
         mask_mod_flex_new,
@@ -299,18 +333,140 @@ def _run_mask_test(
         device="cuda",
         BLOCK_SIZE=(tile_m, tile_n),
     )
-    q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx = None, None, None, None
-    if COMPUTE_CAPABILITY == 10:
-        _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
-    else:
-        _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+    # bm_bwd.as_tuple() format: same as above, but we need q_* (indices 6-9)
+    _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
     q_block_sparse_mask = BlockSparseTensorsTorch(
         mask_block_cnt=q_mask_cnt,
         mask_block_idx=q_mask_idx,
         full_block_cnt=q_full_cnt,
         full_block_idx=q_full_idx,
     )
-    linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
+    ref_linear_q_block_sparse_mask = bhqk_to_linear_sparse_tensors(q_block_sparse_mask)
+
+    # =========================================================================
+    # Method 2: Use CUDA kernel (create_block_mask_cuda)
+    # =========================================================================
+    if HAS_CREATE_BLOCK_MASK_CUDA:
+        # nvtx tag
+        with torch.cuda.nvtx.range("create_q2k_csr_sparse_from_func"):
+            # Q2K (Forward): fix q_block, loop kv_blocks
+            (cuda_k_mask_cnt, cuda_k_mask_offset, cuda_k_mask_idx,
+            cuda_k_full_cnt, cuda_k_full_offset, cuda_k_full_idx) = \
+                create_block_mask_cuda.create_q2k_csr_sparse_from_func(
+                    arbitrary_func,
+                    seqlen_q,
+                    seqlen_k,
+                    Q_BLOCK_SIZE=sparse_tile_m,
+                    KV_BLOCK_SIZE=tile_n,
+                    check_q_boundary=True  # FlexAttention mode
+                )
+            
+            # Convert to LinearBlockSparseTensorsTorch format
+            # Note: CUDA kernel returns cnt with shape [B, H, num_blocks+1] (CSR format with leading 0)
+            # We need to flatten and skip the leading 0 to match bhqk_to_linear_sparse_tensors output
+            cuda_linear_k_block_sparse_mask = LinearBlockSparseTensorsTorch(
+                mask_block_cnt=cuda_k_mask_cnt[:, :, 1:].flatten(),  # Skip leading 0
+                mask_block_offset=cuda_k_mask_offset.flatten(),
+                mask_block_idx=cuda_k_mask_idx,
+                full_block_cnt=cuda_k_full_cnt[:, :, 1:].flatten(),  # Skip leading 0
+                full_block_offset=cuda_k_full_offset.flatten(),
+                full_block_idx=cuda_k_full_idx,
+            )
+        with torch.cuda.nvtx.range("create_k2q_csr_sparse_from_func"):
+            # K2Q (Backward): fix kv_block, loop q_blocks
+            (cuda_q_mask_cnt, cuda_q_mask_offset, cuda_q_mask_idx,
+            cuda_q_full_cnt, cuda_q_full_offset, cuda_q_full_idx) = \
+                create_block_mask_cuda.create_k2q_csr_sparse_from_func(
+                    arbitrary_func,
+                    seqlen_q,
+                    seqlen_k,
+                    Q_BLOCK_SIZE=tile_m,
+                    KV_BLOCK_SIZE=tile_n
+                )
+            
+            cuda_linear_q_block_sparse_mask = LinearBlockSparseTensorsTorch(
+                mask_block_cnt=cuda_q_mask_cnt[:, :, 1:].flatten(),  # Skip leading 0
+                mask_block_offset=cuda_q_mask_offset.flatten(),
+                mask_block_idx=cuda_q_mask_idx,
+                full_block_cnt=cuda_q_full_cnt[:, :, 1:].flatten(),  # Skip leading 0
+                full_block_offset=cuda_q_full_offset.flatten(),
+                full_block_idx=cuda_q_full_idx,
+            )
+
+        # =====================================================================
+        # Verify CUDA kernel output matches PyTorch reference
+        # =====================================================================
+        def compare_linear_sparse_tensors(cuda_tensors, ref_tensors, name):
+            """Compare CUDA kernel output with PyTorch reference."""
+            all_match = True
+            
+            # Compare mask_block_cnt
+            if not torch.equal(cuda_tensors.mask_block_cnt, ref_tensors.mask_block_cnt):
+                print(f"  {name} mask_block_cnt MISMATCH!")
+                print(f"    CUDA shape: {cuda_tensors.mask_block_cnt.shape}, ref shape: {ref_tensors.mask_block_cnt.shape}")
+                print(f"    CUDA sum: {cuda_tensors.mask_block_cnt.sum().item()}, ref sum: {ref_tensors.mask_block_cnt.sum().item()}")
+                all_match = False
+            
+            # Compare mask_block_offset
+            if not torch.equal(cuda_tensors.mask_block_offset, ref_tensors.mask_block_offset):
+                print(f"  {name} mask_block_offset MISMATCH!")
+                print(f"    CUDA shape: {cuda_tensors.mask_block_offset.shape}, ref shape: {ref_tensors.mask_block_offset.shape}")
+                all_match = False
+            
+            # Compare mask_block_idx (values should match, order may differ within each block)
+            if cuda_tensors.mask_block_idx.shape != ref_tensors.mask_block_idx.shape:
+                print(f"  {name} mask_block_idx shape MISMATCH!")
+                print(f"    CUDA: {cuda_tensors.mask_block_idx.shape}, ref: {ref_tensors.mask_block_idx.shape}")
+                all_match = False
+            elif not torch.equal(cuda_tensors.mask_block_idx, ref_tensors.mask_block_idx):
+                # Check if values are the same but in different order
+                if set(cuda_tensors.mask_block_idx.tolist()) != set(ref_tensors.mask_block_idx.tolist()):
+                    print(f"  {name} mask_block_idx values MISMATCH!")
+                    all_match = False
+            
+            # Compare full_block_cnt
+            if cuda_tensors.full_block_cnt is not None and ref_tensors.full_block_cnt is not None:
+                if not torch.equal(cuda_tensors.full_block_cnt, ref_tensors.full_block_cnt):
+                    print(f"  {name} full_block_cnt MISMATCH!")
+                    all_match = False
+            
+            # Compare full_block_offset
+            if cuda_tensors.full_block_offset is not None and ref_tensors.full_block_offset is not None:
+                if not torch.equal(cuda_tensors.full_block_offset, ref_tensors.full_block_offset):
+                    print(f"  {name} full_block_offset MISMATCH!")
+                    all_match = False
+            
+            # Compare full_block_idx
+            if cuda_tensors.full_block_idx is not None and ref_tensors.full_block_idx is not None:
+                if cuda_tensors.full_block_idx.shape != ref_tensors.full_block_idx.shape:
+                    print(f"  {name} full_block_idx shape MISMATCH!")
+                    all_match = False
+                elif not torch.equal(cuda_tensors.full_block_idx, ref_tensors.full_block_idx):
+                    if set(cuda_tensors.full_block_idx.tolist()) != set(ref_tensors.full_block_idx.tolist()):
+                        print(f"  {name} full_block_idx values MISMATCH!")
+                        all_match = False
+            
+            return all_match
+
+        print("\n" + "=" * 60)
+        print("Comparing CUDA kernel vs PyTorch reference:")
+        print("=" * 60)
+        
+        k_match = compare_linear_sparse_tensors(cuda_linear_k_block_sparse_mask, ref_linear_k_block_sparse_mask, "Q2K")
+        q_match = compare_linear_sparse_tensors(cuda_linear_q_block_sparse_mask, ref_linear_q_block_sparse_mask, "K2Q")
+        
+        if k_match and q_match:
+            print("✓ All CUDA kernel outputs match PyTorch reference!")
+        else:
+            print("✗ Some outputs do not match!")
+            
+        # Use CUDA kernel output for the attention computation
+        linear_k_block_sparse_mask = cuda_linear_k_block_sparse_mask
+        linear_q_block_sparse_mask = cuda_linear_q_block_sparse_mask
+    else:
+        # Fallback to PyTorch reference
+        linear_k_block_sparse_mask = ref_linear_k_block_sparse_mask
+        linear_q_block_sparse_mask = ref_linear_q_block_sparse_mask
     
     out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
@@ -408,9 +564,9 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=1024,
-        seqlen_k=1024,
-        nheads=4,
+        seqlen_q=20000,
+        seqlen_k=20000,
+        nheads=2,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,

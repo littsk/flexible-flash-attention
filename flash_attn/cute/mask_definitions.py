@@ -263,26 +263,43 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
-def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu"):
+def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu", pattern="causal"):
+    """
+    Generate arbitrary function tensor for mask computation.
+    
+    Args:
+        nheads: Number of attention heads
+        batch: Batch size
+        n_func: Number of functions (intervals)
+        seqlen_q: Query sequence length
+        seqlen_k: Key sequence length
+        device: Device to create tensor on
+        pattern: Pattern type - "random" or "causal"
+    
+    Returns:
+        arbitrary_func_tensor: [batch, nheads, n_func, seqlen_q + 256]
+    """
     arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
-    # lengths = [seqlen_q]
-    # offset = 0
-    # for i in range(len(lengths)):
-    #     if i == 0:
-    #         for j in range(lengths[i]):
-    #             # arbitrary_func_tensor[:, :, 0, offset + j] = 0
-    #             arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
-    #             # arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
-    #             # arbitrary_func_tensor[:, :, 2, offset + j] = j + 2
-    #     else:
-    #         for j in range(lengths[i]):
-    #             arbitrary_func_tensor[:, :, 0, offset + j] = 0
-    #             # arbitrary_func_tensor[:, :, 1, offset + j] = offset
-    #             # arbitrary_func_tensor[:, :, 2, offset + j] = offset + j + 1
-    #     offset += lengths[i]
-    coef = 1 / n_func
-    for i in range(n_func):
-        arbitrary_func_tensor[:, :, i, :] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)
+    
+    if pattern == "random":
+        # Random pattern: each function defines a random interval
+        coef = 1 / n_func
+        for i in range(n_func):
+            low = int(i * coef * seqlen_k)
+            high = int((i + 1) * coef * seqlen_k)
+            if high <= low:
+                high = low + 1
+            arbitrary_func_tensor[:, :, i, :seqlen_q] = torch.randint(low, high, size=(batch, nheads, seqlen_q), device=device)
+    elif pattern == "causal":
+        # Causal mask pattern: each q_idx can only attend to kv_idx < q_idx + 1
+        # Only use the first function (n_func=1 is expected for causal)
+        q_indices = torch.arange(seqlen_q, device=device, dtype=torch.int32)
+        causal_values = torch.minimum(q_indices + 1, torch.tensor(seqlen_k, device=device, dtype=torch.int32))
+        # Broadcast to all batch and heads
+        arbitrary_func_tensor[:, :, 0, :seqlen_q] = causal_values.unsqueeze(0).unsqueeze(0).expand(batch, nheads, -1)
+    else:
+        raise ValueError(f"Unknown pattern: {pattern}. Supported patterns: 'random', 'causal'")
+    
     return arbitrary_func_tensor
 
 STATIC_MASKS = {

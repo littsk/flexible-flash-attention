@@ -1,5 +1,6 @@
 #include "create_block_mask.h"
 #include <cassert>
+#include <cub/cub.cuh>
 
 #define DIVUP(x, y) (((x) + (y) - 1) / (y))
 
@@ -215,6 +216,10 @@ __device__ __forceinline__ int reduce_block_state(
  *    b. Block-level reduction to get the kv_block's final state
  *    c. Thread 0 records the result
  * 
+ * Output layout for block_idx:
+ * - Full blocks written left-to-right: block_idx[0], block_idx[1], ...
+ * - Mask blocks written right-to-left: block_idx[num_kv_blocks-1], block_idx[num_kv_blocks-2], ...
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], with strides (stride_b, stride_h, stride_f, stride_q)
  */
 __global__ void create_q2k_block_sparse_from_func_kernel(
@@ -225,9 +230,10 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     int num_q_blocks, int num_kv_blocks,
     bool check_q_boundary,  // If true, partial q_blocks cannot have FULL kv_blocks
     int* __restrict__ mask_block_cnt,     // [B, H, num_q_blocks]
-    int* __restrict__ mask_block_idx,     // [B, H, num_q_blocks, num_kv_blocks]
     int* __restrict__ full_block_cnt,     // [B, H, num_q_blocks]
-    int* __restrict__ full_block_idx      // [B, H, num_q_blocks, num_kv_blocks]
+    int* __restrict__ block_idx,          // [B, H, num_q_blocks, num_kv_blocks]
+    int* __restrict__ total_mask_blocks,  // Global accumulator for total mask blocks
+    int* __restrict__ total_full_blocks   // Global accumulator for total full blocks
 ) {
     // Shared memory for warp-level reduction results
     __shared__ int warp_results[MAX_NUM_WARPS];
@@ -255,14 +261,16 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     const int* my_func_ptr = func_tensor + b * stride_b + h * stride_h + q_idx * stride_q;
     
     // Output tensor strides (contiguous layout)
-    int out_cnt_stride_b = H * num_q_blocks;
-    int out_cnt_stride_h = num_q_blocks;
+    // cnt tensor has shape [B, H, num_q_blocks + 1] for CSR offset format
+    int out_cnt_stride_b = H * (num_q_blocks + 1);
+    int out_cnt_stride_h = (num_q_blocks + 1);
     int out_idx_stride_b = H * num_q_blocks * num_kv_blocks;
     int out_idx_stride_h = num_q_blocks * num_kv_blocks;
     int out_idx_stride_q = num_kv_blocks;
     
     // Output offsets
-    int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + q_block;
+    // cnt is written at offset+1 (offset 0 is reserved for the leading 0 in CSR format)
+    int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + q_block + 1;
     int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + q_block * out_idx_stride_q;
     
     // Counters
@@ -288,10 +296,12 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
             bool can_be_full = !check_q_boundary || is_q_block_full;
             
             if (kv_block_state == STATE_FULL && can_be_full) {
-                full_block_idx[idx_base + full_count] = kv_block;
+                // Full blocks: write left-to-right
+                block_idx[idx_base + full_count] = kv_block;
                 full_count++;
             } else if (kv_block_state == STATE_FULL || kv_block_state == STATE_MASK) {
-                mask_block_idx[idx_base + mask_count] = kv_block;
+                // Mask blocks: write right-to-left
+                block_idx[idx_base + (num_kv_blocks - 1 - mask_count)] = kv_block;
                 mask_count++;
             }
         }
@@ -299,10 +309,23 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
         __syncthreads();
     }
     
-    // Write final counts
+    // Write final counts and atomically accumulate totals
     if (tid == 0) {
+        // Write leading 0 for CSR format (first CTA of each (b,h) pair)
+        if (q_block == 0) {
+            int zero_offset = b * out_cnt_stride_b + h * out_cnt_stride_h;
+            mask_block_cnt[zero_offset] = 0;
+            full_block_cnt[zero_offset] = 0;
+        }
+        
         mask_block_cnt[cnt_offset] = mask_count;
         full_block_cnt[cnt_offset] = full_count;
+        if (total_mask_blocks != nullptr) {
+            atomicAdd(total_mask_blocks, mask_count);
+        }
+        if (total_full_blocks != nullptr) {
+            atomicAdd(total_full_blocks, full_count);
+        }
     }
 }
 
@@ -325,6 +348,10 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
  *    c. Block-level reduction to get the q_block's final state
  *    d. Thread 0 records the result
  * 
+ * Output layout for block_idx:
+ * - Full blocks written left-to-right: block_idx[0], block_idx[1], ...
+ * - Mask blocks written right-to-left: block_idx[num_q_blocks-1], block_idx[num_q_blocks-2], ...
+ * 
  * Note: Always performs boundary checking (partial q_blocks cannot have FULL status).
  * 
  * @param func_tensor: [B, H, n_func, func_q_len], with strides (stride_b, stride_h, stride_f, stride_q)
@@ -336,9 +363,10 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     int num_q_blocks, int num_kv_blocks,
     int* __restrict__ mask_block_cnt,     // [B, H, num_kv_blocks]
-    int* __restrict__ mask_block_idx,     // [B, H, num_kv_blocks, num_q_blocks]
     int* __restrict__ full_block_cnt,     // [B, H, num_kv_blocks]
-    int* __restrict__ full_block_idx      // [B, H, num_kv_blocks, num_q_blocks]
+    int* __restrict__ block_idx,          // [B, H, num_kv_blocks, num_q_blocks]
+    int* __restrict__ total_mask_blocks,  // Global accumulator for total mask blocks
+    int* __restrict__ total_full_blocks   // Global accumulator for total full blocks
 ) {
     // Shared memory for warp-level reduction results
     __shared__ int warp_results[MAX_NUM_WARPS];
@@ -359,14 +387,16 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     
     // Output tensor strides (contiguous layout)
     // For K2Q: output is [B, H, num_kv_blocks, num_q_blocks]
-    int out_cnt_stride_b = H * num_kv_blocks;
-    int out_cnt_stride_h = num_kv_blocks;
+    // cnt tensor has shape [B, H, num_kv_blocks + 1] for CSR offset format
+    int out_cnt_stride_b = H * (num_kv_blocks + 1);
+    int out_cnt_stride_h = (num_kv_blocks + 1);
     int out_idx_stride_b = H * num_kv_blocks * num_q_blocks;
     int out_idx_stride_h = num_kv_blocks * num_q_blocks;
     int out_idx_stride_kv = num_q_blocks;
     
     // Output offsets
-    int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + kv_block;
+    // cnt is written at offset+1 (offset 0 is reserved for the leading 0 in CSR format)
+    int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + kv_block + 1;
     int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + kv_block * out_idx_stride_kv;
     
     // Counters
@@ -403,10 +433,12 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
         // For backward, always check q_boundary: partial q_blocks cannot have FULL status
         if (tid == 0) {
             if (q_block_state == STATE_FULL && is_q_block_full) {
-                full_block_idx[idx_base + full_count] = q_block;
+                // Full blocks: write left-to-right
+                block_idx[idx_base + full_count] = q_block;
                 full_count++;
             } else if (q_block_state == STATE_FULL || q_block_state == STATE_MASK) {
-                mask_block_idx[idx_base + mask_count] = q_block;
+                // Mask blocks: write right-to-left
+                block_idx[idx_base + (num_q_blocks - 1 - mask_count)] = q_block;
                 mask_count++;
             }
         }
@@ -414,10 +446,23 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
         __syncthreads();
     }
     
-    // Write final counts
+    // Write final counts and atomically accumulate totals
     if (tid == 0) {
+        // Write leading 0 for CSR format (first CTA of each (b,h) pair)
+        if (kv_block == 0) {
+            int zero_offset = b * out_cnt_stride_b + h * out_cnt_stride_h;
+            mask_block_cnt[zero_offset] = 0;
+            full_block_cnt[zero_offset] = 0;
+        }
+        
         mask_block_cnt[cnt_offset] = mask_count;
         full_block_cnt[cnt_offset] = full_count;
+        if (total_mask_blocks != nullptr) {
+            atomicAdd(total_mask_blocks, mask_count);
+        }
+        if (total_full_blocks != nullptr) {
+            atomicAdd(total_full_blocks, full_count);
+        }
     }
 }
 
@@ -432,9 +477,10 @@ void launch_create_q2k_block_sparse_from_func(
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     bool check_q_boundary,
     int* d_mask_block_cnt,
-    int* d_mask_block_idx,
     int* d_full_block_cnt,
-    int* d_full_block_idx,
+    int* d_block_idx,
+    int* d_total_mask_blocks,
+    int* d_total_full_blocks,
     cudaStream_t stream
 ) {
     int num_q_blocks = DIVUP(Q_LEN, Q_BLOCK_SIZE);
@@ -451,8 +497,9 @@ void launch_create_q2k_block_sparse_from_func(
         Q_BLOCK_SIZE, KV_BLOCK_SIZE,
         num_q_blocks, num_kv_blocks,
         check_q_boundary,
-        d_mask_block_cnt, d_mask_block_idx,
-        d_full_block_cnt, d_full_block_idx
+        d_mask_block_cnt, d_full_block_cnt,
+        d_block_idx,
+        d_total_mask_blocks, d_total_full_blocks
     );
 }
 
@@ -462,9 +509,10 @@ void launch_create_k2q_block_sparse_from_func(
     int B, int H, int Q_LEN, int KV_LEN, int n_func,
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     int* d_mask_block_cnt,
-    int* d_mask_block_idx,
     int* d_full_block_cnt,
-    int* d_full_block_idx,
+    int* d_block_idx,
+    int* d_total_mask_blocks,
+    int* d_total_full_blocks,
     cudaStream_t stream
 ) {
     int num_q_blocks = DIVUP(Q_LEN, Q_BLOCK_SIZE);
@@ -480,7 +528,163 @@ void launch_create_k2q_block_sparse_from_func(
         Q_LEN, KV_LEN, n_func,
         Q_BLOCK_SIZE, KV_BLOCK_SIZE,
         num_q_blocks, num_kv_blocks,
-        d_mask_block_cnt, d_mask_block_idx,
-        d_full_block_cnt, d_full_block_idx
+        d_mask_block_cnt, d_full_block_cnt,
+        d_block_idx,
+        d_total_mask_blocks, d_total_full_blocks
+    );
+}
+
+// =============================================================================
+// Compact Block Idx Kernels
+// =============================================================================
+
+/**
+ * Kernel to extract compact indices from block_idx.
+ * 
+ * Each block handles one row of block_idx.
+ * - Full indices: stored left-to-right at block_idx[row, 0:full_cnt]
+ * - Mask indices: stored right-to-left at block_idx[row, max_blocks-mask_cnt:max_blocks]
+ *   Need to reverse when extracting.
+ */
+__global__ void extract_compact_indices_kernel(
+    const int* __restrict__ block_idx,        // [n_blocks, max_blocks]
+    const int* __restrict__ mask_cnt,         // [n_blocks]
+    const int* __restrict__ full_cnt,         // [n_blocks]
+    const int* __restrict__ mask_offset,      // [n_blocks + 1]
+    const int* __restrict__ full_offset,      // [n_blocks + 1]
+    int n_blocks,
+    int max_blocks,
+    int* __restrict__ mask_idx_compact,       // [total_mask_blocks]
+    int* __restrict__ full_idx_compact        // [total_full_blocks]
+) {
+    int row = blockIdx.x;
+    if (row >= n_blocks) return;
+    
+    int tid = threadIdx.x;
+    
+    int fcnt = full_cnt[row];
+    int mcnt = mask_cnt[row];
+    int foff = full_offset[row];
+    int moff = mask_offset[row];
+    
+    const int* row_ptr = block_idx + row * max_blocks;
+    
+    // Extract full indices (left-to-right, no reversal needed)
+    for (int i = tid; i < fcnt; i += blockDim.x) {
+        full_idx_compact[foff + i] = row_ptr[i];
+    }
+    
+    // Extract mask indices (right-to-left, need to reverse)
+    // Original: row_ptr[max_blocks - mcnt + i] for i in [0, mcnt)
+    // Reversed: row_ptr[max_blocks - 1 - i] for i in [0, mcnt)
+    for (int i = tid; i < mcnt; i += blockDim.x) {
+        mask_idx_compact[moff + i] = row_ptr[max_blocks - 1 - i];
+    }
+}
+
+void launch_extract_compact_indices(
+    const int* d_block_idx,
+    const int* d_mask_block_cnt,
+    const int* d_full_block_cnt,
+    const int* d_mask_block_offset,
+    const int* d_full_block_offset,
+    int n_blocks,
+    int max_blocks,
+    int* d_mask_block_idx,
+    int* d_full_block_idx,
+    cudaStream_t stream
+) {
+    int threads_per_block = 256;
+    extract_compact_indices_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+        d_block_idx,
+        d_mask_block_cnt, d_full_block_cnt,
+        d_mask_block_offset, d_full_block_offset,
+        n_blocks, max_blocks,
+        d_mask_block_idx, d_full_block_idx
+    );
+}
+
+// ============================================================================
+// Dual Inclusive Sum - Single CTA scan using CUB BlockScan
+// One CTA processes all B*H*num_blocks_plus_one elements
+// ============================================================================
+
+// Block size for scan kernel (must be power of 2 for CUB BlockScan)
+#define SCAN_BLOCK_SIZE 256
+
+// Custom int2 addition operator for CUB
+struct Int2Sum {
+    __device__ __forceinline__ int2 operator()(const int2& a, const int2& b) const {
+        return make_int2(a.x + b.x, a.y + b.y);
+    }
+};
+
+__global__ void dual_inclusive_sum_kernel(
+    const int* __restrict__ mask_cnt,      // [total_elements]
+    const int* __restrict__ full_cnt,      // [total_elements]
+    int* __restrict__ mask_offset,         // [total_elements]
+    int* __restrict__ full_offset,         // [total_elements]
+    int total_elements                     // B * H * num_blocks_plus_one
+) {
+    // CUB BlockScan type
+    typedef cub::BlockScan<int2, SCAN_BLOCK_SIZE> BlockScan;
+    __shared__ typename BlockScan::TempStorage temp_storage;
+    __shared__ int2 shared_prefix;
+    
+    int tid = threadIdx.x;
+    
+    // Process all elements in tiles using a single CTA
+    int2 running_prefix = make_int2(0, 0);
+    
+    for (int tile_start = 0; tile_start < total_elements; tile_start += SCAN_BLOCK_SIZE) {
+        int idx = tile_start + tid;
+        
+        // Load data (use 0 for out-of-bounds)
+        int2 thread_data;
+        if (idx < total_elements) {
+            thread_data = make_int2(mask_cnt[idx], full_cnt[idx]);
+        } else {
+            thread_data = make_int2(0, 0);
+        }
+        
+        // Perform block-level inclusive scan
+        int2 thread_result;
+        BlockScan(temp_storage).InclusiveScan(thread_data, thread_result, Int2Sum());
+        __syncthreads();
+        
+        // Add running prefix from previous tiles
+        thread_result.x += running_prefix.x;
+        thread_result.y += running_prefix.y;
+        
+        // Write result
+        if (idx < total_elements) {
+            mask_offset[idx] = thread_result.x;
+            full_offset[idx] = thread_result.y;
+        }
+        
+        // Broadcast running_prefix to all threads for next tile
+        // The last valid thread in this tile writes to shared memory
+        int last_tid_in_tile = min(SCAN_BLOCK_SIZE - 1, total_elements - 1 - tile_start);
+        if (tid == last_tid_in_tile) {
+            shared_prefix = thread_result;
+        }
+        __syncthreads();
+        running_prefix = shared_prefix;
+    }
+}
+
+void launch_dual_inclusive_sum(
+    const int* d_mask_cnt,
+    const int* d_full_cnt,
+    int* d_mask_offset,
+    int* d_full_offset,
+    int total_elements,         // B * H * num_blocks_plus_one (total elements to scan)
+    cudaStream_t stream
+) {
+    // Launch single CTA to process all elements
+    dual_inclusive_sum_kernel<<<1, SCAN_BLOCK_SIZE, 0, stream>>>(
+        d_mask_cnt, d_full_cnt,
+        d_mask_offset, d_full_offset,
+        total_elements
     );
 }
