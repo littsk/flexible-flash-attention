@@ -282,6 +282,10 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
         int kv_start = kv_block * KV_BLOCK_SIZE;
         int kv_end = min(kv_start + KV_BLOCK_SIZE, KV_LEN);
         
+        // Check if this is a partial kv_block (last block with KV_LEN % KV_BLOCK_SIZE != 0)
+        // Partial kv_blocks can NEVER be FULL because positions beyond KV_LEN are invalid
+        bool is_kv_block_full = (kv_end == kv_start + KV_BLOCK_SIZE);
+        
         // Each thread determines its state for this kv_block
         int thread_state = STATE_EMPTY;
         if (is_active) {
@@ -293,7 +297,11 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
         
         // Thread 0 records the result
         if (tid == 0) {
-            bool can_be_full = !check_q_boundary || is_q_block_full;
+            // A block can only be FULL if:
+            // 1. All q_tokens in q_block have FULL state for this kv_block
+            // 2. q_block itself is full (if check_q_boundary is true)
+            // 3. kv_block itself is full (not a partial block at the boundary)
+            bool can_be_full = (!check_q_boundary || is_q_block_full) && is_kv_block_full;
             
             if (kv_block_state == STATE_FULL && can_be_full) {
                 // Full blocks: write left-to-right
@@ -382,6 +390,10 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     int kv_start = kv_block * KV_BLOCK_SIZE;
     int kv_end = min(kv_start + KV_BLOCK_SIZE, KV_LEN);
     
+    // Check if this is a partial kv_block (last block with KV_LEN % KV_BLOCK_SIZE != 0)
+    // Partial kv_blocks can NEVER have FULL q_blocks because positions beyond KV_LEN are invalid
+    bool is_kv_block_full = (kv_end == kv_start + KV_BLOCK_SIZE);
+    
     // Base pointer for func_tensor at [b, h, 0, 0]
     const int* base_func_ptr = func_tensor + b * stride_b + h * stride_h;
     
@@ -431,8 +443,15 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
         
         // Thread 0 records the result
         // For backward, always check q_boundary: partial q_blocks cannot have FULL status
+        // Also, partial kv_blocks can NEVER have FULL q_blocks
         if (tid == 0) {
-            if (q_block_state == STATE_FULL && is_q_block_full) {
+            // A q_block can only be FULL if:
+            // 1. All q_tokens have FULL state for this kv_block
+            // 2. q_block itself is full (not partial)
+            // 3. kv_block itself is full (not a partial block at the boundary)
+            bool can_be_full = is_q_block_full && is_kv_block_full;
+            
+            if (q_block_state == STATE_FULL && can_be_full) {
                 // Full blocks: write left-to-right
                 block_idx[idx_base + full_count] = q_block;
                 full_count++;
