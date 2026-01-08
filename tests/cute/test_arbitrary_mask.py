@@ -262,7 +262,7 @@ def _run_mask_test(
         sparse_tile_m = 2 * tile_m
     else:
         sparse_tile_m = tile_m
-
+    # convert to q2k/k2q kernel
     bm = create_block_mask(
         mask_mod_flex_new,
         1,
@@ -287,6 +287,7 @@ def _run_mask_test(
         full_block_cnt=k_full_cnt,
         full_block_idx=k_full_idx,
     )
+    # convert to linear sparse tensors kernel
     linear_k_block_sparse_mask = bhqk_to_linear_sparse_tensors(k_block_sparse_mask)
 
     bm_bwd = create_block_mask(

@@ -4,6 +4,9 @@
 
 #include "magi_to_hstu.h"
 
+// TODO: Combining the full and mask tensors into one full_mask tensor can reduce the temporary memory overhead by half.
+// TODO: Count the num in kernel with persistent mode to avoid d2h copy.
+
 /**
  * Convert MagiAttention mask format to HSTU function encoding format.
  * 
@@ -95,3 +98,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("seqlen_k"),
           py::arg("n_max_func") = 5);
 }
+

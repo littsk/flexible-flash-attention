@@ -144,3 +144,4 @@ void launch_magi_to_hstu(
         d_func_out, n_func
     );
 }
+
