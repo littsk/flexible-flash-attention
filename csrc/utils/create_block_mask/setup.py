@@ -8,7 +8,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 setup(
     name="create_block_mask_cuda",
     version="0.1",
-    description="CUDA kernels for creating block masks (FlexAttention style)",
+    description="CUDA kernels for creating block masks (arbitrary function encoding)",
     ext_modules=[
         CUDAExtension(
             name="create_block_mask_cuda",

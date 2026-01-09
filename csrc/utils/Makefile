@@ -14,7 +14,7 @@
 #   make clean_block_mask   - Clean create_block_mask build artifacts
 #   make clean_magi_to_hstu - Clean magi_to_hstu build artifacts
 
-.PHONY: all block_mask magi_to_hstu test test_block_mask test_magi_to_hstu pytest pytest_block_mask clean clean_block_mask clean_magi_to_hstu
+.PHONY: all block_mask magi_to_hstu test test_block_mask test_magi_to_hstu pytest pytest_block_mask bench bench_block_mask clean clean_block_mask clean_magi_to_hstu
 
 # Default target: build all
 all: block_mask magi_to_hstu
@@ -47,6 +47,8 @@ test_block_mask:
 	cd create_block_mask && python test_create_block_mask.py
 	@echo ""
 
+
+pytest: pytest_block_mask
 # Run create_block_mask pytest (full test suite)
 pytest_block_mask:
 	@echo "=============================================="
@@ -65,6 +67,17 @@ test_magi_to_hstu:
 
 # Run all pytest tests
 pytest: pytest_block_mask
+	@echo ""
+
+# Run all benchmarks
+bench: bench_block_mask
+
+# Run create_block_mask benchmark
+bench_block_mask:
+	@echo "=============================================="
+	@echo "Benchmarking create_block_mask..."
+	@echo "=============================================="
+	cd create_block_mask && python benchmark_create_block_mask.py
 	@echo ""
 
 # Clean all build artifacts
@@ -102,6 +115,8 @@ help:
 	@echo "  test_magi_to_hstu - Run magi_to_hstu tests"
 	@echo "  pytest            - Run all pytest tests"
 	@echo "  pytest_block_mask - Run create_block_mask pytest (full test suite)"
+	@echo "  bench             - Run all benchmarks"
+	@echo "  bench_block_mask  - Run create_block_mask benchmark"
 	@echo "  clean             - Clean all build artifacts"
 	@echo "  clean_block_mask  - Clean create_block_mask artifacts"
 	@echo "  clean_magi_to_hstu- Clean magi_to_hstu artifacts"
