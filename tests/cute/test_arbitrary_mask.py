@@ -358,18 +358,20 @@ def _run_mask_test(
                     seqlen_k,
                     Q_BLOCK_SIZE=sparse_tile_m,
                     KV_BLOCK_SIZE=tile_n,
-                    check_q_boundary=True  # FlexAttention mode
+                    check_q_boundary=True  # True just to align to flex attention, change to False for performance
                 )
             
             # Convert to LinearBlockSparseTensorsTorch format
-            # Note: CUDA kernel returns cnt with shape [B, H, num_blocks+1] (CSR format with leading 0)
-            # We need to flatten and skip the leading 0 to match bhqk_to_linear_sparse_tensors output
+            # CUDA kernel returns:
+            #   - cnt: [B, H, num_blocks] - directly the counts
+            #   - offset: [B * H * num_blocks + 1] - flattened exclusive prefix sum (starts with 0)
+            #   - idx: [total_blocks] - compact indices
             cuda_linear_k_block_sparse_mask = LinearBlockSparseTensorsTorch(
-                mask_block_cnt=cuda_k_mask_cnt[:, :, 1:].flatten(),  # Skip leading 0
-                mask_block_offset=cuda_k_mask_offset.flatten(),
+                mask_block_cnt=cuda_k_mask_cnt.flatten(),
+                mask_block_offset=cuda_k_mask_offset,
                 mask_block_idx=cuda_k_mask_idx,
-                full_block_cnt=cuda_k_full_cnt[:, :, 1:].flatten(),  # Skip leading 0
-                full_block_offset=cuda_k_full_offset.flatten(),
+                full_block_cnt=cuda_k_full_cnt.flatten(),
+                full_block_offset=cuda_k_full_offset,
                 full_block_idx=cuda_k_full_idx,
             )
         with torch.cuda.nvtx.range("create_k2q_csr_sparse_from_func"):
@@ -385,11 +387,11 @@ def _run_mask_test(
                 )
             
             cuda_linear_q_block_sparse_mask = LinearBlockSparseTensorsTorch(
-                mask_block_cnt=cuda_q_mask_cnt[:, :, 1:].flatten(),  # Skip leading 0
-                mask_block_offset=cuda_q_mask_offset.flatten(),
+                mask_block_cnt=cuda_q_mask_cnt.flatten(),
+                mask_block_offset=cuda_q_mask_offset,
                 mask_block_idx=cuda_q_mask_idx,
-                full_block_cnt=cuda_q_full_cnt[:, :, 1:].flatten(),  # Skip leading 0
-                full_block_offset=cuda_q_full_offset.flatten(),
+                full_block_cnt=cuda_q_full_cnt.flatten(),
+                full_block_offset=cuda_q_full_offset,
                 full_block_idx=cuda_q_full_idx,
             )
 

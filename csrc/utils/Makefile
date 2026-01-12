@@ -77,7 +77,7 @@ bench_block_mask:
 	@echo "=============================================="
 	@echo "Benchmarking create_block_mask..."
 	@echo "=============================================="
-	cd create_block_mask && python benchmark_create_block_mask.py
+	cd create_block_mask && python benchmark_create_block_mask.py --seqlen 220000 --pattern diagonal 
 	@echo ""
 
 # Clean all build artifacts

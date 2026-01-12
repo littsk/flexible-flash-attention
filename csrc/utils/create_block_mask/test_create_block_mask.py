@@ -141,8 +141,8 @@ def extract_indices_from_combined(mask_cnt, full_cnt, block_idx):
     - mask blocks: stored right-to-left at indices max_blocks-1, max_blocks-2, ...
     
     Args:
-        mask_cnt: [B, H, num_blocks+1], count of mask blocks per row (CSR format, first elem is 0)
-        full_cnt: [B, H, num_blocks+1], count of full blocks per row (CSR format, first elem is 0)
+        mask_cnt: [B, H, num_blocks], count of mask blocks per row
+        full_cnt: [B, H, num_blocks], count of full blocks per row
         block_idx: [B, H, num_blocks, max_blocks], combined indices
     
     Returns:
@@ -151,10 +151,6 @@ def extract_indices_from_combined(mask_cnt, full_cnt, block_idx):
     """
     B, H, num_blocks, max_blocks = block_idx.shape
     
-    # Skip the leading 0 in CSR format (use cnt[:, :, 1:])
-    mask_cnt_actual = mask_cnt[:, :, 1:]
-    full_cnt_actual = full_cnt[:, :, 1:]
-    
     # Create output tensors initialized to -1
     mask_idx = torch.full_like(block_idx, -1)
     full_idx = torch.full_like(block_idx, -1)
@@ -162,8 +158,8 @@ def extract_indices_from_combined(mask_cnt, full_cnt, block_idx):
     for b in range(B):
         for h in range(H):
             for blk in range(num_blocks):
-                fcnt = full_cnt_actual[b, h, blk].item()
-                mcnt = mask_cnt_actual[b, h, blk].item()
+                fcnt = full_cnt[b, h, blk].item()
+                mcnt = mask_cnt[b, h, blk].item()
                 
                 # Extract full indices (left-to-right)
                 if fcnt > 0:
@@ -192,12 +188,11 @@ def create_q2k_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, 
         check_q_boundary: if True (FlexAttention mode), partial q_blocks cannot have FULL kv_blocks
     
     Returns:
-        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx, total_mask_blocks, total_full_blocks
+        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx
         Output shapes: [B, H, num_q_blocks, ...] for idx tensors
-        Note: mask_block_cnt and full_block_cnt are returned WITHOUT leading 0 for comparison
     """
     with torch.cuda.nvtx.range("create_q2k_kernel_block_mask"):
-        mask_block_cnt_csr, full_block_cnt_csr, block_idx, total_mask_blocks, total_full_blocks = \
+        mask_block_cnt, full_block_cnt, block_idx = \
             create_block_mask_cuda.create_q2k_block_sparse_from_func(
                 func_tensor,
                 seqlen_q,
@@ -210,14 +205,10 @@ def create_q2k_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, 
     
     # Extract mask and full indices from combined tensor
     mask_block_idx, full_block_idx = extract_indices_from_combined(
-        mask_block_cnt_csr, full_block_cnt_csr, block_idx
+        mask_block_cnt, full_block_cnt, block_idx
     )
     
-    # Return cnt without leading 0 (skip CSR format's first element) for comparison
-    mask_block_cnt = mask_block_cnt_csr[:, :, 1:]
-    full_block_cnt = full_block_cnt_csr[:, :, 1:]
-    
-    return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx, total_mask_blocks, total_full_blocks
+    return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx
 
 
 def create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE):
@@ -232,11 +223,10 @@ def create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, 
         KV_BLOCK_SIZE: block size for key dimension
     
     Returns:
-        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx, total_mask_blocks, total_full_blocks
+        mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx
         Output shapes: [B, H, num_kv_blocks, ...] for idx tensors
-        Note: mask_block_cnt and full_block_cnt are returned WITHOUT leading 0 for comparison
     """
-    mask_block_cnt_csr, full_block_cnt_csr, block_idx, total_mask_blocks, total_full_blocks = \
+    mask_block_cnt, full_block_cnt, block_idx = \
         create_block_mask_cuda.create_k2q_block_sparse_from_func(
             func_tensor,
             seqlen_q,
@@ -248,14 +238,10 @@ def create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, 
     
     # Extract mask and full indices from combined tensor
     mask_block_idx, full_block_idx = extract_indices_from_combined(
-        mask_block_cnt_csr, full_block_cnt_csr, block_idx
+        mask_block_cnt, full_block_cnt, block_idx
     )
     
-    # Return cnt without leading 0 (skip CSR format's first element) for comparison
-    mask_block_cnt = mask_block_cnt_csr[:, :, 1:]
-    full_block_cnt = full_block_cnt_csr[:, :, 1:]
-    
-    return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx, total_mask_blocks, total_full_blocks
+    return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, block_idx
 
 
 def compare_block_masks(ref_cnt, ref_idx, kernel_cnt, kernel_idx, name=""):
@@ -346,7 +332,7 @@ def test_q2k_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
         create_reference_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
     
     # Kernel (Q2K)
-    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _, _, _ = \
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
         create_q2k_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary=True)
     
     # Compare
@@ -386,7 +372,7 @@ def test_k2q_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
         create_reference_k2q_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
     
     # Kernel (K2Q)
-    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _, _, _ = \
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
         create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
     
     # Compare
@@ -398,6 +384,344 @@ def test_k2q_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
     print("  PASSED!")
 
 
+# =============================================================================
+# Special Pattern Tests
+# =============================================================================
+
+def generate_special_func_tensor(seqlen_q, seqlen_k, pattern, n_func=3, block_size=128, device="cuda"):
+    """
+    Generate func_tensor for special attention patterns.
+    
+    Args:
+        seqlen_q: query sequence length
+        seqlen_k: key sequence length
+        pattern: one of "empty", "full", "causal", "diagonal", "sliding_window"
+        n_func: number of function values (must be odd: 1, 3, 5, ...)
+        block_size: block size for diagonal pattern
+        device: cuda device
+    
+    Returns:
+        func_tensor: [1, 1, n_func, seqlen_q + 256]
+    """
+    B, H = 1, 1
+    func_tensor = torch.zeros(B, H, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
+    q_indices = torch.arange(seqlen_q, dtype=torch.int32, device=device)
+    
+    if pattern == "empty":
+        # All positions invalid: [0, 0) for all q_idx
+        # F0 = 0 means first interval [0, 0) is empty
+        func_tensor[:, :, 0, :seqlen_q] = 0
+        
+    elif pattern == "full":
+        # All positions valid: [0, seqlen_k) for all q_idx
+        func_tensor[:, :, 0, :seqlen_q] = seqlen_k
+        
+    elif pattern == "causal":
+        # Causal mask: [0, q_idx + 1) for each q_idx
+        func_tensor[:, :, 0, :seqlen_q] = torch.minimum(
+            q_indices + 1,
+            torch.full_like(q_indices, seqlen_k)
+        )
+        
+    elif pattern == "anti_causal":
+        # Anti-causal mask: [q_idx, seqlen_k) for each q_idx
+        # Using n_func=3: F0=0 (first interval empty), F1=q_idx, F2=seqlen_k
+        func_tensor[:, :, 0, :seqlen_q] = 0  # First interval [0, 0) is empty
+        func_tensor[:, :, 1, :seqlen_q] = torch.minimum(q_indices, torch.full_like(q_indices, seqlen_k))
+        func_tensor[:, :, 2, :seqlen_q] = seqlen_k
+        
+    elif pattern == "diagonal":
+        # Block-level diagonal: each q_block only attends to corresponding kv_block
+        # For q_idx in [block_start, block_end), valid kv range is [block_start, block_end)
+        block_start = (q_indices // block_size) * block_size
+        block_end = torch.minimum(
+            block_start + block_size,
+            torch.full_like(block_start, seqlen_k)
+        )
+        # Using n_func=3: F0=0 (first interval empty), F1=block_start, F2=block_end
+        func_tensor[:, :, 0, :seqlen_q] = 0
+        func_tensor[:, :, 1, :seqlen_q] = block_start
+        func_tensor[:, :, 2, :seqlen_q] = block_end
+        
+    elif pattern == "sliding_window":
+        # Sliding window with window_size = 2 * block_size
+        window_size = 2 * block_size
+        window_start = torch.maximum(
+            q_indices - window_size // 2,
+            torch.zeros_like(q_indices)
+        )
+        window_end = torch.minimum(
+            q_indices + window_size // 2,
+            torch.full_like(q_indices, seqlen_k)
+        )
+        # Using n_func=3: F0=0, F1=window_start, F2=window_end
+        func_tensor[:, :, 0, :seqlen_q] = 0
+        func_tensor[:, :, 1, :seqlen_q] = window_start
+        func_tensor[:, :, 2, :seqlen_q] = window_end
+        
+    elif pattern == "checkerboard":
+        # Checkerboard pattern: alternating blocks
+        block_idx_q = q_indices // block_size
+        for q_idx in range(seqlen_q):
+            blk_q = q_idx // block_size
+            # Even q_blocks attend to even kv_blocks, odd to odd
+            if blk_q % 2 == 0:
+                # Attend to even kv_blocks
+                func_tensor[0, 0, 0, q_idx] = min(block_size, seqlen_k)  # First block
+                if n_func >= 3:
+                    func_tensor[0, 0, 1, q_idx] = min(2 * block_size, seqlen_k)
+                    func_tensor[0, 0, 2, q_idx] = min(3 * block_size, seqlen_k)
+            else:
+                # Attend to odd kv_blocks
+                func_tensor[0, 0, 0, q_idx] = 0  # First interval empty
+                if n_func >= 3:
+                    func_tensor[0, 0, 1, q_idx] = min(block_size, seqlen_k)
+                    func_tensor[0, 0, 2, q_idx] = min(2 * block_size, seqlen_k)
+    else:
+        raise ValueError(f"Unknown pattern: {pattern}")
+    
+    return func_tensor.contiguous()
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("pattern", ["empty", "full", "causal", "anti_causal", "diagonal", "sliding_window"])
+@pytest.mark.parametrize("seqlen", [128, 256, 512, 1024, 4096, 4111])
+def test_special_patterns_q2k(pattern, seqlen):
+    """Test Q2K kernel with special attention patterns."""
+    print(f"\nTesting Q2K special pattern: {pattern}, seqlen={seqlen}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 3 if pattern in ["anti_causal", "diagonal", "sliding_window", "checkerboard"] else 1
+    
+    func_tensor = generate_special_func_tensor(seqlen, seqlen, pattern, n_func=n_func, block_size=KV_BLOCK_SIZE)
+    
+    # Reference
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (Q2K)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_q2k_kernel_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary=True)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    # Print statistics
+    num_blocks = (seqlen + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE
+    total_mask = kernel_mask_cnt.sum().item()
+    total_full = kernel_full_cnt.sum().item()
+    total_blocks = num_blocks * num_blocks
+    print(f"  Pattern: {pattern}, mask={total_mask}, full={total_full}, empty={total_blocks - total_mask - total_full}")
+    
+    assert mask_ok, f"Mask block mismatch for pattern={pattern}"
+    assert full_ok, f"Full block mismatch for pattern={pattern}"
+    print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("pattern", ["empty", "full", "causal", "anti_causal", "diagonal", "sliding_window"])
+@pytest.mark.parametrize("seqlen", [128, 256, 512, 1024, 4096, 4111])
+def test_special_patterns_k2q(pattern, seqlen):
+    """Test K2Q kernel with special attention patterns."""
+    print(f"\nTesting K2Q special pattern: {pattern}, seqlen={seqlen}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 3 if pattern in ["anti_causal", "diagonal", "sliding_window", "checkerboard"] else 1
+    
+    func_tensor = generate_special_func_tensor(seqlen, seqlen, pattern, n_func=n_func, block_size=KV_BLOCK_SIZE)
+    
+    # Reference (K2Q)
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_k2q_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (K2Q)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_k2q_kernel_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for pattern={pattern}"
+    assert full_ok, f"Full block mismatch for pattern={pattern}"
+    print("  PASSED!")
+
+
+# =============================================================================
+# Boundary Condition Tests
+# =============================================================================
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("seqlen", [1, 2, 7, 15, 31, 63, 64, 65, 127, 128, 129, 255, 256, 257])
+def test_small_seqlen_q2k(seqlen):
+    """Test Q2K kernel with small sequence lengths (boundary conditions)."""
+    print(f"\nTesting Q2K small seqlen: {seqlen}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 1
+    
+    # Use causal pattern for meaningful test
+    func_tensor = generate_special_func_tensor(seqlen, seqlen, "causal", n_func=n_func)
+    
+    # Reference
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (Q2K)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_q2k_kernel_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary=True)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for seqlen={seqlen}"
+    assert full_ok, f"Full block mismatch for seqlen={seqlen}"
+    print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("seqlen", [1, 2, 7, 15, 31, 63, 64, 65, 127, 128, 129, 255, 256, 257])
+def test_small_seqlen_k2q(seqlen):
+    """Test K2Q kernel with small sequence lengths (boundary conditions)."""
+    print(f"\nTesting K2Q small seqlen: {seqlen}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 1
+    
+    # Use causal pattern for meaningful test
+    func_tensor = generate_special_func_tensor(seqlen, seqlen, "causal", n_func=n_func)
+    
+    # Reference (K2Q)
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_k2q_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (K2Q)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_k2q_kernel_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for seqlen={seqlen}"
+    assert full_ok, f"Full block mismatch for seqlen={seqlen}"
+    print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [
+    (128, 256),   # Q shorter than K
+    (256, 128),   # Q longer than K
+    (100, 300),   # Non-aligned, Q < K
+    (300, 100),   # Non-aligned, Q > K
+    (1, 1000),    # Single Q token
+    (1000, 1),    # Single K token
+    (127, 129),   # Just under/over block boundary
+    (129, 127),   # Swapped
+    (255, 257),   # 2x block boundary
+    (257, 255),   # Swapped
+])
+def test_asymmetric_seqlen_q2k(seqlen_q, seqlen_k):
+    """Test Q2K kernel with asymmetric Q/K lengths."""
+    print(f"\nTesting Q2K asymmetric: seqlen_q={seqlen_q}, seqlen_k={seqlen_k}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 1
+    
+    # Use full pattern to cover all cases
+    func_tensor = generate_special_func_tensor(seqlen_q, seqlen_k, "full", n_func=n_func)
+    
+    # Reference
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (Q2K)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_q2k_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary=True)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
+    assert full_ok, f"Full block mismatch for seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
+    print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [
+    (128, 256),   # Q shorter than K
+    (256, 128),   # Q longer than K
+    (100, 300),   # Non-aligned, Q < K
+    (300, 100),   # Non-aligned, Q > K
+    (1, 1000),    # Single Q token
+    (1000, 1),    # Single K token
+    (127, 129),   # Just under/over block boundary
+    (129, 127),   # Swapped
+])
+def test_asymmetric_seqlen_k2q(seqlen_q, seqlen_k):
+    """Test K2Q kernel with asymmetric Q/K lengths."""
+    print(f"\nTesting K2Q asymmetric: seqlen_q={seqlen_q}, seqlen_k={seqlen_k}")
+    
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = 128, 128
+    n_func = 1
+    
+    # Use full pattern
+    func_tensor = generate_special_func_tensor(seqlen_q, seqlen_k, "full", n_func=n_func)
+    
+    # Reference (K2Q)
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_k2q_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (K2Q)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
+    assert full_ok, f"Full block mismatch for seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
+    print("  PASSED!")
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.parametrize("Q_BLOCK_SIZE,KV_BLOCK_SIZE", [
+    (64, 64),
+    (64, 128),
+    (128, 64),
+    (128, 256),
+    (256, 128),
+    (256, 256),
+])
+def test_different_block_sizes(Q_BLOCK_SIZE, KV_BLOCK_SIZE):
+    """Test with different Q and KV block sizes."""
+    seqlen = 1024
+    n_func = 1
+    print(f"\nTesting block sizes: Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}")
+    
+    func_tensor = generate_special_func_tensor(seqlen, seqlen, "causal", n_func=n_func)
+    
+    # Reference
+    ref_mask_cnt, ref_mask_idx, ref_full_cnt, ref_full_idx = \
+        create_reference_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    # Kernel (Q2K)
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, _ = \
+        create_q2k_kernel_block_mask(func_tensor, seqlen, seqlen, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary=True)
+    
+    # Compare
+    mask_ok = compare_block_masks(ref_mask_cnt, ref_mask_idx, kernel_mask_cnt, kernel_mask_idx, "mask_block")
+    full_ok = compare_block_masks(ref_full_cnt, ref_full_idx, kernel_full_cnt, kernel_full_idx, "full_block")
+    
+    assert mask_ok, f"Mask block mismatch for Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}"
+    assert full_ok, f"Full block mismatch for Q_BLOCK_SIZE={Q_BLOCK_SIZE}, KV_BLOCK_SIZE={KV_BLOCK_SIZE}"
+    print("  PASSED!")
+
+
 def create_reference_compact_block_idx(mask_block_cnt, full_block_cnt, block_idx):
     """
     Reference implementation of compact_block_idx using PyTorch.
@@ -405,44 +729,41 @@ def create_reference_compact_block_idx(mask_block_cnt, full_block_cnt, block_idx
     Converts BHQK format to linear sparse format (CSR-like).
     
     Args:
-        mask_block_cnt: [B, H, num_blocks+1] (CSR format, first elem is 0)
-        full_block_cnt: [B, H, num_blocks+1] (CSR format, first elem is 0)
+        mask_block_cnt: [B, H, num_blocks]
+        full_block_cnt: [B, H, num_blocks]
         block_idx: [B, H, num_blocks, max_blocks]
     
     Returns:
-        mask_block_cnt, mask_block_offset, mask_block_idx_compact,  (all shapes: [B, H, num_blocks+1])
-        full_block_cnt, full_block_offset, full_block_idx_compact
+        mask_block_cnt: [B, H, num_blocks] (unchanged)
+        mask_block_offset: [B * H * num_blocks + 1] (exclusive prefix sum, starts with 0)
+        mask_block_idx_compact: [total_mask]
+        full_block_cnt: [B, H, num_blocks] (unchanged)
+        full_block_offset: [B * H * num_blocks + 1]
+        full_block_idx_compact: [total_full]
     """
     B, H, num_blocks, max_blocks = block_idx.shape
-    num_blocks_plus_one = num_blocks + 1
     n_blocks_flat = B * H * num_blocks
+    offset_size = n_blocks_flat + 1
     
-    # Flatten counts for cumsum (CSR format: [0, c0, c1, ...])
+    # Flatten counts for cumsum
     mask_cnt_flat = mask_block_cnt.flatten()
     full_cnt_flat = full_block_cnt.flatten()
     
-    # Compute offsets (cumsum of CSR format directly gives offset)
-    # Then reshape to (B, H, num_blocks+1)
-    mask_block_offset = torch.cumsum(mask_cnt_flat, dim=0).to(torch.int32).view(B, H, num_blocks_plus_one)
-    full_block_offset = torch.cumsum(full_cnt_flat, dim=0).to(torch.int32).view(B, H, num_blocks_plus_one)
+    # Compute offsets (exclusive prefix sum: [0, c0, c0+c1, ..., total])
+    mask_block_offset = torch.zeros(offset_size, dtype=torch.int32, device=mask_block_cnt.device)
+    full_block_offset = torch.zeros(offset_size, dtype=torch.int32, device=full_block_cnt.device)
+    mask_block_offset[1:] = torch.cumsum(mask_cnt_flat, dim=0).to(torch.int32)
+    full_block_offset[1:] = torch.cumsum(full_cnt_flat, dim=0).to(torch.int32)
     
-    # Extract compact indices (skip leading 0 in cnt)
+    # Extract compact indices
     block_idx_flat = block_idx.view(n_blocks_flat, max_blocks)
     
     mask_block_idx_list = []
     full_block_idx_list = []
     
     for i in range(n_blocks_flat):
-        # cnt is stored at positions 1:n+1 for each (b,h), so we need to adjust index
-        # i is the block index (0 to n-1), cnt[i] is at position i+1 in each (b,h) row
-        b = i // (H * num_blocks)
-        remainder = i % (H * num_blocks)
-        h = remainder // num_blocks
-        blk = remainder % num_blocks
-        cnt_idx = b * (H * num_blocks_plus_one) + h * num_blocks_plus_one + blk + 1
-        
-        fcnt = full_cnt_flat[cnt_idx].item()
-        mcnt = mask_cnt_flat[cnt_idx].item()
+        fcnt = full_cnt_flat[i].item()
+        mcnt = mask_cnt_flat[i].item()
         
         # Full indices: left-to-right
         if fcnt > 0:
@@ -456,7 +777,6 @@ def create_reference_compact_block_idx(mask_block_cnt, full_block_cnt, block_idx
     mask_block_idx_compact = torch.cat(mask_block_idx_list, dim=0) if mask_block_idx_list else torch.empty(0, dtype=torch.int32, device=mask_block_cnt.device)
     full_block_idx_compact = torch.cat(full_block_idx_list, dim=0) if full_block_idx_list else torch.empty(0, dtype=torch.int32, device=full_block_cnt.device)
     
-    # Return cnt and offset with shape (B, H, num_blocks+1)
     return (mask_block_cnt, mask_block_offset, mask_block_idx_compact,
             full_block_cnt, full_block_offset, full_block_idx_compact)
 
@@ -484,19 +804,18 @@ def test_compact_block_idx(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SI
     
     func_tensor = generate_func_tensor(seqlen_q, seqlen_k, n_func)
     
-    # Get kernel output (now returns 5 tensors including total counts from atomicAdd)
-    mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks = \
+    # Get kernel output (returns 3 tensors)
+    mask_block_cnt, full_block_cnt, block_idx = \
         create_block_mask_cuda.create_q2k_block_sparse_from_func(
             func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
             check_q_boundary=True, debug=True
         )
     
-    # Compact using our function (now requires total counts)
+    # Compact using our function
     (kernel_mask_cnt, kernel_mask_offset, kernel_mask_idx,
     kernel_full_cnt, kernel_full_offset, kernel_full_idx) = \
         create_block_mask_cuda.compact_block_idx(
-            mask_block_cnt, full_block_cnt, block_idx,
-            total_mask_blocks, total_full_blocks
+            mask_block_cnt, full_block_cnt, block_idx
         )
     
     
@@ -555,7 +874,7 @@ def test_q2k_csr_sparse_from_func(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_B
         )
     
     # Method 2: Use separate calls
-    mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks = \
+    mask_block_cnt, full_block_cnt, block_idx = \
         create_block_mask_cuda.create_q2k_block_sparse_from_func(
             func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
             check_q_boundary=True, debug=False
@@ -564,8 +883,7 @@ def test_q2k_csr_sparse_from_func(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_B
     (sep_mask_cnt, sep_mask_offset, sep_mask_idx,
      sep_full_cnt, sep_full_offset, sep_full_idx) = \
         create_block_mask_cuda.compact_block_idx(
-            mask_block_cnt, full_block_cnt, block_idx,
-            total_mask_blocks, total_full_blocks
+            mask_block_cnt, full_block_cnt, block_idx
         )
     
     # Compare results
@@ -618,7 +936,7 @@ def test_k2q_csr_sparse_from_func(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_B
         )
     
     # Method 2: Use separate calls
-    mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks = \
+    mask_block_cnt, full_block_cnt, block_idx = \
         create_block_mask_cuda.create_k2q_block_sparse_from_func(
             func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
             debug=False
@@ -627,8 +945,7 @@ def test_k2q_csr_sparse_from_func(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_B
     (sep_mask_cnt, sep_mask_offset, sep_mask_idx,
      sep_full_cnt, sep_full_offset, sep_full_idx) = \
         create_block_mask_cuda.compact_block_idx(
-            mask_block_cnt, full_block_cnt, block_idx,
-            total_mask_blocks, total_full_blocks
+            mask_block_cnt, full_block_cnt, block_idx
         )
     
     # Compare results
@@ -688,13 +1005,13 @@ def test_csr_sparse_asymmetric_seqlen(seqlen_q, seqlen_k, n_func):
     num_q_blocks = (seqlen_q + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE
     num_kv_blocks = (seqlen_k + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
     
-    # Q2K: cnt shape is [B, H, num_q_blocks+1]
-    assert q2k_mask_cnt.shape == (1, 1, num_q_blocks + 1), f"Q2K mask_cnt shape mismatch: {q2k_mask_cnt.shape}"
-    assert q2k_full_cnt.shape == (1, 1, num_q_blocks + 1), f"Q2K full_cnt shape mismatch: {q2k_full_cnt.shape}"
+    # Q2K: cnt shape is [B, H, num_q_blocks]
+    assert q2k_mask_cnt.shape == (1, 1, num_q_blocks), f"Q2K mask_cnt shape mismatch: {q2k_mask_cnt.shape}"
+    assert q2k_full_cnt.shape == (1, 1, num_q_blocks), f"Q2K full_cnt shape mismatch: {q2k_full_cnt.shape}"
     
-    # K2Q: cnt shape is [B, H, num_kv_blocks+1]
-    assert k2q_mask_cnt.shape == (1, 1, num_kv_blocks + 1), f"K2Q mask_cnt shape mismatch: {k2q_mask_cnt.shape}"
-    assert k2q_full_cnt.shape == (1, 1, num_kv_blocks + 1), f"K2Q full_cnt shape mismatch: {k2q_full_cnt.shape}"
+    # K2Q: cnt shape is [B, H, num_kv_blocks]
+    assert k2q_mask_cnt.shape == (1, 1, num_kv_blocks), f"K2Q mask_cnt shape mismatch: {k2q_mask_cnt.shape}"
+    assert k2q_full_cnt.shape == (1, 1, num_kv_blocks), f"K2Q full_cnt shape mismatch: {k2q_full_cnt.shape}"
     
     print(f"  Q2K: {len(q2k_mask_idx)} mask + {len(q2k_full_idx)} full blocks")
     print(f"  K2Q: {len(k2q_mask_idx)} mask + {len(k2q_full_idx)} full blocks")
@@ -810,7 +1127,7 @@ def run_q2k_test(seqlen_q=1024, seqlen_k=1024, n_func=1, Q_BLOCK_SIZE=128, KV_BL
     
     # Kernel
     print("\nComputing Q2K kernel...")
-    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, block_idx, total_mask_tensor, total_full_tensor = \
+    kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, block_idx = \
         create_q2k_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary)
     
     if check_q_boundary:
@@ -870,13 +1187,11 @@ def run_k2q_test(seqlen_q=1024, seqlen_k=1024, n_func=1, Q_BLOCK_SIZE=128, KV_BL
     # Kernel    
     print("\nComputing K2Q kernel...")
     with torch.cuda.nvtx.range("create_k2q_kernel_block_mask"):
-        kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, block_idx, total_mask_tensor, total_full_tensor = \
+        kernel_mask_cnt, kernel_mask_idx, kernel_full_cnt, kernel_full_idx, block_idx = \
             create_k2q_kernel_block_mask(func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE)
     
     print(f"K2Q mask_block_cnt shape: {kernel_mask_cnt.shape}")
     print(f"K2Q full_block_cnt shape: {kernel_full_cnt.shape}")
-    print(f"K2Q total_mask_blocks (atomicAdd): {total_mask_tensor.item()}")
-    print(f"K2Q total_full_blocks (atomicAdd): {total_full_tensor.item()}")
     
     # Print some statistics
     num_q_blocks = (seqlen_q + Q_BLOCK_SIZE - 1) // Q_BLOCK_SIZE
@@ -912,8 +1227,8 @@ def run_compact_test(seqlen_q=1024, seqlen_k=1024, n_func=1, Q_BLOCK_SIZE=128, K
     # Generate random func_tensor
     func_tensor = generate_func_tensor(seqlen_q, seqlen_k, n_func)
     
-    # Get kernel output (now returns 5 tensors including total counts from atomicAdd)
-    mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks = \
+    # Get kernel output (returns 3 tensors)
+    mask_block_cnt, full_block_cnt, block_idx = \
         create_block_mask_cuda.create_q2k_block_sparse_from_func(
             func_tensor, seqlen_q, seqlen_k, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
             check_q_boundary=True, debug=True
@@ -923,16 +1238,13 @@ def run_compact_test(seqlen_q=1024, seqlen_k=1024, n_func=1, Q_BLOCK_SIZE=128, K
     print(f"  mask_block_cnt shape: {mask_block_cnt.shape}")
     print(f"  full_block_cnt shape: {full_block_cnt.shape}")
     print(f"  block_idx shape: {block_idx.shape}")
-    print(f"  total_mask_blocks (atomicAdd): {total_mask_blocks.item()}")
-    print(f"  total_full_blocks (atomicAdd): {total_full_blocks.item()}")
     
-    # Compact using our function (now requires total counts)
+    # Compact using our function
     with torch.cuda.nvtx.range("compact_block_idx"):
         (kernel_mask_cnt, kernel_mask_offset, kernel_mask_idx,
         kernel_full_cnt, kernel_full_offset, kernel_full_idx) = \
             create_block_mask_cuda.compact_block_idx(
-                mask_block_cnt, full_block_cnt, block_idx,
-                total_mask_blocks, total_full_blocks
+                mask_block_cnt, full_block_cnt, block_idx
             )
     
     print(f"\nCompact tensors:")

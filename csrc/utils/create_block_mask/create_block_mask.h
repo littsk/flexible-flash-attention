@@ -61,8 +61,46 @@ void launch_create_q2k_block_sparse_from_func(
     int* d_mask_block_cnt,
     int* d_full_block_cnt,
     int* d_block_idx,
-    int* d_total_mask_blocks = nullptr,  // Optional: atomically accumulate total mask blocks
-    int* d_total_full_blocks = nullptr,  // Optional: atomically accumulate total full blocks
+    cudaStream_t stream = nullptr
+);
+
+/**
+ * Precompute kv range for each q_block (K2Q optimization).
+ * 
+ * This kernel precomputes the min/max kv positions that each q_block can access.
+ * The results are used by K2Q kernel to skip q_blocks that don't overlap with
+ * the current kv_block, significantly reducing computation for sparse patterns.
+ * 
+ * Output tensors:
+ * - d_q_block_kv_min: [B, H, num_q_blocks], minimum kv position for each q_block
+ * - d_q_block_kv_max: [B, H, num_q_blocks], maximum kv position for each q_block (exclusive)
+ * 
+ * If a q_block has no valid intervals, min=INT_MAX and max=0.
+ * 
+ * @param d_func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
+ * @param stride_b: stride for batch dimension
+ * @param stride_h: stride for head dimension
+ * @param stride_f: stride for n_func dimension
+ * @param stride_q: stride for query dimension
+ * @param B: batch size
+ * @param H: number of heads
+ * @param Q_LEN: query sequence length
+ * @param n_func: number of function values per query (must be odd)
+ * @param Q_BLOCK_SIZE: block size for query dimension
+ * @param d_q_block_kv_min: [B, H, num_q_blocks], output
+ * @param d_q_block_kv_max: [B, H, num_q_blocks], output
+ * @param stream: CUDA stream
+ */
+void launch_compute_q_block_kv_range(
+    const int* d_func_tensor,
+    int stride_b, int stride_h, int stride_f, int stride_q,
+    int B,
+    int H,
+    int Q_LEN,
+    int n_func,
+    int Q_BLOCK_SIZE,
+    int* d_q_block_kv_min,
+    int* d_q_block_kv_max,
     cudaStream_t stream = nullptr
 );
 
@@ -71,6 +109,9 @@ void launch_create_q2k_block_sparse_from_func(
  * 
  * Backward pass: fix kv_block, loop q_blocks.
  * Always performs boundary checking (partial q_blocks cannot have FULL status).
+ * 
+ * Optimization: If precomputed q_block kv ranges are provided, the kernel will
+ * skip q_blocks whose kv range doesn't overlap with the current kv_block.
  * 
  * Output tensors:
  * - mask_block_cnt: [B, H, num_kv_blocks], number of partial q_blocks per kv_block
@@ -91,6 +132,8 @@ void launch_create_q2k_block_sparse_from_func(
  * @param n_func: number of function values per query (must be odd)
  * @param Q_BLOCK_SIZE: block size for query dimension
  * @param KV_BLOCK_SIZE: block size for key/value dimension
+ * @param d_q_block_kv_min: [B, H, num_q_blocks], precomputed min kv (can be nullptr to disable optimization)
+ * @param d_q_block_kv_max: [B, H, num_q_blocks], precomputed max kv (can be nullptr to disable optimization)
  * @param d_mask_block_cnt: [B, H, num_kv_blocks], output
  * @param d_full_block_cnt: [B, H, num_kv_blocks], output
  * @param d_block_idx: [B, H, num_kv_blocks, num_q_blocks], output (combined full + mask indices)
@@ -106,11 +149,11 @@ void launch_create_k2q_block_sparse_from_func(
     int n_func,
     int Q_BLOCK_SIZE,
     int KV_BLOCK_SIZE,
+    const int* d_q_block_kv_min,  // precomputed, can be nullptr
+    const int* d_q_block_kv_max,  // precomputed, can be nullptr
     int* d_mask_block_cnt,
     int* d_full_block_cnt,
     int* d_block_idx,
-    int* d_total_mask_blocks = nullptr,  // Optional: atomically accumulate total mask blocks
-    int* d_total_full_blocks = nullptr,  // Optional: atomically accumulate total full blocks
     cudaStream_t stream = nullptr
 );
 
@@ -162,15 +205,20 @@ void launch_extract_compact_indices(
 );
 
 /**
- * Dual inclusive sum - single CTA implementation.
- * One CTA processes all B*H*num_blocks_plus_one elements.
+ * Dual inclusive sum - single CTA implementation with exclusive prefix sum output.
+ * One CTA processes all B*H*num_blocks elements.
  * No temporary buffer needed.
  * 
- * @param d_mask_cnt: [total_elements], int32 input - mask block counts (flattened)
- * @param d_full_cnt: [total_elements], int32 input - full block counts (flattened)
- * @param d_mask_offset: [total_elements], int32 output - inclusive prefix sum of mask_cnt
- * @param d_full_offset: [total_elements], int32 output - inclusive prefix sum of full_cnt
- * @param total_elements: B * H * num_blocks_plus_one (total elements to scan)
+ * Input:  cnt[0..n-1]
+ * Output: offset[0..n] where offset[0]=0, offset[i+1]=sum(cnt[0..i])
+ * 
+ * This produces exclusive prefix sum format: [0, c0, c0+c1, ..., total]
+ * 
+ * @param d_mask_cnt: [n_elements], int32 input - mask block counts (flattened)
+ * @param d_full_cnt: [n_elements], int32 input - full block counts (flattened)
+ * @param d_mask_offset: [n_elements + 1], int32 output - exclusive prefix sum of mask_cnt
+ * @param d_full_offset: [n_elements + 1], int32 output - exclusive prefix sum of full_cnt
+ * @param n_elements: Number of count elements (B * H * num_blocks)
  * @param stream: CUDA stream
  */
 void launch_dual_inclusive_sum(
@@ -178,6 +226,7 @@ void launch_dual_inclusive_sum(
     const int* d_full_cnt,
     int* d_mask_offset,
     int* d_full_offset,
-    int total_elements,
+    int n_elements,
     cudaStream_t stream = nullptr
 );
+

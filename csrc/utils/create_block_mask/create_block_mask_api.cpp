@@ -31,16 +31,14 @@
  *                          if false, partial q_blocks can have FULL kv_blocks (default: false)
  * @param debug: if true, initialize output tensors to -1 for debugging; if false, use uninitialized memory (default: false)
  * 
- * @return tuple of (mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks)
- *         mask_block_cnt: [B, H, num_q_blocks], int32 - number of partial kv_blocks
- *         full_block_cnt: [B, H, num_q_blocks], int32 - number of full kv_blocks
+ * @return tuple of (mask_block_cnt, full_block_cnt, block_idx)
+ *         mask_block_cnt: [B, H, num_q_blocks], int32 - number of partial kv_blocks per q_block
+ *         full_block_cnt: [B, H, num_q_blocks], int32 - number of full kv_blocks per q_block
  *         block_idx: [B, H, num_q_blocks, num_kv_blocks], int32 - combined block indices
  *                    full blocks stored left-to-right (0, 1, 2, ...)
  *                    mask blocks stored right-to-left (num_kv_blocks-1, num_kv_blocks-2, ...)
- *         total_mask_blocks: [1], int32 - total number of mask blocks (computed via atomicAdd)
- *         total_full_blocks: [1], int32 - total number of full blocks (computed via atomicAdd)
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_q2k_block_sparse_from_func(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> create_q2k_block_sparse_from_func(
     const at::Tensor& func_tensor,
     int Q_LEN,
     int KV_LEN,
@@ -82,30 +80,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_q2
     at::cuda::CUDAGuard device_guard(func_tensor.device());
 
     // Allocate output tensors (always contiguous)
-    // cnt tensors have size num_q_blocks + 1 for CSR offset format (last element = 0 for cumsum)
     auto opts = func_tensor.options().dtype(torch::kInt32);
     at::Tensor mask_block_cnt, full_block_cnt, block_idx;
     if (debug) {
         // Initialize to -1 for debugging (helps detect unexecuted kernels)
-        mask_block_cnt = torch::full({B, H, num_q_blocks + 1}, -1, opts);
-        full_block_cnt = torch::full({B, H, num_q_blocks + 1}, -1, opts);
+        mask_block_cnt = torch::full({B, H, num_q_blocks}, -1, opts);
+        full_block_cnt = torch::full({B, H, num_q_blocks}, -1, opts);
         block_idx = torch::full({B, H, num_q_blocks, num_kv_blocks}, -1, opts);
     } else {
         // Use uninitialized memory for performance
-        mask_block_cnt = torch::empty({B, H, num_q_blocks + 1}, opts);
-        full_block_cnt = torch::empty({B, H, num_q_blocks + 1}, opts);
+        mask_block_cnt = torch::empty({B, H, num_q_blocks}, opts);
+        full_block_cnt = torch::empty({B, H, num_q_blocks}, opts);
         block_idx = torch::empty({B, H, num_q_blocks, num_kv_blocks}, opts);
     }
-    
-    // Allocate pinned CPU tensors for atomicAdd (GPU can directly access via zero-copy)
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
-    at::Tensor total_mask_blocks = torch::zeros({1}, cpu_opts);
-    at::Tensor total_full_blocks = torch::zeros({1}, cpu_opts);
 
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Launch kernel (atomicAdd writes directly to pinned memory via zero-copy)
+    // Launch kernel
     launch_create_q2k_block_sparse_from_func(
         func_tensor.data_ptr<int>(),
         stride_b, stride_h, stride_f, stride_q,
@@ -115,12 +107,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_q2
         mask_block_cnt.data_ptr<int>(),
         full_block_cnt.data_ptr<int>(),
         block_idx.data_ptr<int>(),
-        total_mask_blocks.data_ptr<int>(),
-        total_full_blocks.data_ptr<int>(),
         stream
     );
 
-    return std::make_tuple(mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks);
+    return std::make_tuple(mask_block_cnt, full_block_cnt, block_idx);
 }
 
 /**
@@ -136,16 +126,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_q2
  * @param KV_BLOCK_SIZE: block size for key/value dimension (default: 128)
  * @param debug: if true, initialize output tensors to -1 for debugging; if false, use uninitialized memory (default: false)
  * 
- * @return tuple of (mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks)
- *         mask_block_cnt: [B, H, num_kv_blocks], int32 - number of partial q_blocks
- *         full_block_cnt: [B, H, num_kv_blocks], int32 - number of full q_blocks
+ * @return tuple of (mask_block_cnt, full_block_cnt, block_idx)
+ *         mask_block_cnt: [B, H, num_kv_blocks], int32 - number of partial q_blocks per kv_block
+ *         full_block_cnt: [B, H, num_kv_blocks], int32 - number of full q_blocks per kv_block
  *         block_idx: [B, H, num_kv_blocks, num_q_blocks], int32 - combined block indices
  *                    full blocks stored left-to-right (0, 1, 2, ...)
  *                    mask blocks stored right-to-left (num_q_blocks-1, num_q_blocks-2, ...)
- *         total_mask_blocks: [1], int32 - total number of mask blocks (computed via atomicAdd)
- *         total_full_blocks: [1], int32 - total number of full blocks (computed via atomicAdd)
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func(
     const at::Tensor& func_tensor,
     int Q_LEN,
     int KV_LEN,
@@ -187,44 +175,65 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_k2
 
     // Allocate output tensors (always contiguous)
     // Note: For K2Q, output shape is [B, H, num_kv_blocks, num_q_blocks]
-    // cnt tensors have size num_kv_blocks + 1 for CSR offset format (last element = 0 for cumsum)
     auto opts = func_tensor.options().dtype(torch::kInt32);
     at::Tensor mask_block_cnt, full_block_cnt, block_idx;
     if (debug) {
         // Initialize to -1 for debugging (helps detect unexecuted kernels)
-        mask_block_cnt = torch::full({B, H, num_kv_blocks + 1}, -1, opts);
-        full_block_cnt = torch::full({B, H, num_kv_blocks + 1}, -1, opts);
+        mask_block_cnt = torch::full({B, H, num_kv_blocks}, -1, opts);
+        full_block_cnt = torch::full({B, H, num_kv_blocks}, -1, opts);
         block_idx = torch::full({B, H, num_kv_blocks, num_q_blocks}, -1, opts);
     } else {
         // Use uninitialized memory for performance
-        mask_block_cnt = torch::empty({B, H, num_kv_blocks + 1}, opts);
-        full_block_cnt = torch::empty({B, H, num_kv_blocks + 1}, opts);
+        mask_block_cnt = torch::empty({B, H, num_kv_blocks}, opts);
+        full_block_cnt = torch::empty({B, H, num_kv_blocks}, opts);
         block_idx = torch::empty({B, H, num_kv_blocks, num_q_blocks}, opts);
     }
-    
-    // Allocate pinned CPU tensors for atomicAdd (GPU can directly access via zero-copy)
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).pinned_memory(true);
-    at::Tensor total_mask_blocks = torch::zeros({1}, cpu_opts);
-    at::Tensor total_full_blocks = torch::zeros({1}, cpu_opts);
 
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    // Launch kernel (atomicAdd writes directly to pinned memory via zero-copy)
+    int* d_q_block_kv_min = nullptr;
+    int* d_q_block_kv_max = nullptr;
+    at::Tensor q_block_kv_min, q_block_kv_max;
+    
+#ifndef DISABLE_KV_RANGE_OPT
+    // Default (optimization enabled):
+    // - Q2K kernel uses inline kv_range computation
+    // - K2Q kernel uses precompute optimization:
+    //   First launch a kernel to compute q_block kv ranges,
+    //   then K2Q kernel can skip q_blocks that don't overlap with the current kv_block
+    q_block_kv_min = torch::empty({B, H, num_q_blocks}, opts);
+    q_block_kv_max = torch::empty({B, H, num_q_blocks}, opts);
+    
+    launch_compute_q_block_kv_range(
+        func_tensor.data_ptr<int>(),
+        stride_b, stride_h, stride_f, stride_q,
+        B, H, Q_LEN, n_func,
+        Q_BLOCK_SIZE,
+        q_block_kv_min.data_ptr<int>(),
+        q_block_kv_max.data_ptr<int>(),
+        stream
+    );
+    
+    d_q_block_kv_min = q_block_kv_min.data_ptr<int>();
+    d_q_block_kv_max = q_block_kv_max.data_ptr<int>();
+#endif  // DISABLE_KV_RANGE_OPT
+
+    // Step 2: Launch K2Q kernel (with or without precomputed q_block kv ranges)
     launch_create_k2q_block_sparse_from_func(
         func_tensor.data_ptr<int>(),
         stride_b, stride_h, stride_f, stride_q,
         B, H, Q_LEN, KV_LEN, n_func,
         Q_BLOCK_SIZE, KV_BLOCK_SIZE,
+        d_q_block_kv_min,
+        d_q_block_kv_max,
         mask_block_cnt.data_ptr<int>(),
         full_block_cnt.data_ptr<int>(),
         block_idx.data_ptr<int>(),
-        total_mask_blocks.data_ptr<int>(),
-        total_full_blocks.data_ptr<int>(),
         stream
     );
 
-    return std::make_tuple(mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks);
+    return std::make_tuple(mask_block_cnt, full_block_cnt, block_idx);
 }
 
 /**
@@ -239,15 +248,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_k2
  *   - block_idx: [B, H, num_blocks, max_blocks], combined indices
  *       - full blocks stored left-to-right: block_idx[..., 0:full_cnt]
  *       - mask blocks stored right-to-left: block_idx[..., max_blocks-mask_cnt:max_blocks]
- *   - total_mask_blocks: [1], total mask blocks from kernel's atomicAdd
- *   - total_full_blocks: [1], total full blocks from kernel's atomicAdd
  * 
  * Output format (LinearBlockSparseTensorsTorch compatible):
- *   - mask_block_cnt: [n_blocks] (flattened)
- *   - mask_block_offset: [n_blocks + 1], prefix sum of mask_block_cnt
+ *   - mask_block_cnt: [B, H, num_blocks] (unchanged)
+ *   - mask_block_offset: [B * H * num_blocks + 1], exclusive prefix sum (flattened, starts with 0)
  *   - mask_block_idx: [total_mask_blocks], compact indices
- *   - full_block_cnt: [n_blocks] (flattened)
- *   - full_block_offset: [n_blocks + 1], prefix sum of full_block_cnt
+ *   - full_block_cnt: [B, H, num_blocks] (unchanged)
+ *   - full_block_offset: [B * H * num_blocks + 1], exclusive prefix sum (flattened, starts with 0)
  *   - full_block_idx: [total_full_blocks], compact indices
  * 
  * Memory savings: O(num_blocks * max_blocks) -> O(total_mask_blocks + total_full_blocks)
@@ -255,36 +262,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> create_k2
  * @param mask_block_cnt: [B, H, num_blocks], int32
  * @param full_block_cnt: [B, H, num_blocks], int32
  * @param block_idx: [B, H, num_blocks, max_blocks], int32
- * @param total_mask_blocks: [1], int32 - total mask blocks from atomicAdd
- * @param total_full_blocks: [1], int32 - total full blocks from atomicAdd
  * 
- * @return tuple of (mask_block_cnt_flat, mask_block_offset, mask_block_idx_compact,
- *                   full_block_cnt_flat, full_block_offset, full_block_idx_compact)
+ * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx_compact,
+ *                   full_block_cnt, full_block_offset, full_block_idx_compact)
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> 
 compact_block_idx(
     const at::Tensor& mask_block_cnt,
     const at::Tensor& full_block_cnt,
-    const at::Tensor& block_idx,
-    const at::Tensor& total_mask_blocks,
-    const at::Tensor& total_full_blocks
+    const at::Tensor& block_idx
 ) {
     // Input validation
     TORCH_CHECK(mask_block_cnt.is_cuda(), "mask_block_cnt must be a CUDA tensor");
     TORCH_CHECK(full_block_cnt.is_cuda(), "full_block_cnt must be a CUDA tensor");
     TORCH_CHECK(block_idx.is_cuda(), "block_idx must be a CUDA tensor");
-    // total_mask_blocks and total_full_blocks are pinned CPU tensors (from async D2H)
-    TORCH_CHECK(!total_mask_blocks.is_cuda() && total_mask_blocks.is_pinned(), 
-                "total_mask_blocks must be a CPU tensor");
-    TORCH_CHECK(!total_full_blocks.is_cuda() && total_full_blocks.is_pinned(), 
-                "total_full_blocks must be a CPU tensor");
     TORCH_CHECK(mask_block_cnt.dtype() == torch::kInt32, "mask_block_cnt must be int32");
     TORCH_CHECK(full_block_cnt.dtype() == torch::kInt32, "full_block_cnt must be int32");
     TORCH_CHECK(block_idx.dtype() == torch::kInt32, "block_idx must be int32");
-    TORCH_CHECK(total_mask_blocks.dtype() == torch::kInt32, "total_mask_blocks must be int32");
-    TORCH_CHECK(total_full_blocks.dtype() == torch::kInt32, "total_full_blocks must be int32");
-    TORCH_CHECK(mask_block_cnt.dim() == 3, "mask_block_cnt must be 3D [B, H, num_blocks+1]");
-    TORCH_CHECK(full_block_cnt.dim() == 3, "full_block_cnt must be 3D [B, H, num_blocks+1]");
+    TORCH_CHECK(mask_block_cnt.dim() == 3, "mask_block_cnt must be 3D [B, H, num_blocks]");
+    TORCH_CHECK(full_block_cnt.dim() == 3, "full_block_cnt must be 3D [B, H, num_blocks]");
     TORCH_CHECK(block_idx.dim() == 4, "block_idx must be 4D [B, H, num_blocks, max_blocks]");
     
     // Ensure same device
@@ -292,59 +288,58 @@ compact_block_idx(
     
     int64_t B = mask_block_cnt.size(0);
     int64_t H = mask_block_cnt.size(1);
-    int64_t num_blocks_plus_one = mask_block_cnt.size(2);  // num_blocks + 1 for CSR format
-    int64_t num_blocks = block_idx.size(2);
+    int64_t num_blocks = mask_block_cnt.size(2);
     int64_t max_blocks = block_idx.size(3);
-    int64_t n_blocks_flat = B * H * num_blocks_plus_one;
     
     auto opts = mask_block_cnt.options();
     
-    // Ensure contiguous (no flatten needed, data_ptr accesses underlying memory directly)
+    // Ensure contiguous
     at::Tensor mask_cnt = mask_block_cnt.contiguous();
     at::Tensor full_cnt = full_block_cnt.contiguous();
     at::Tensor block_idx_cont = block_idx.contiguous();
     
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    // Synchronize stream to ensure atomicAdd to pinned memory is complete
-    cudaStreamSynchronize(stream);
-
-    // Read total counts directly from CPU memory (no .item() overhead)
-    int total_mask = static_cast<int>(*total_mask_blocks.data_ptr<int>());
-    int total_full = static_cast<int>(*total_full_blocks.data_ptr<int>());
-
-    // Allocate compact idx tensors (empty if total is 0)
-    at::Tensor mask_block_idx_compact = torch::empty({total_mask}, opts);
-    at::Tensor full_block_idx_compact = torch::empty({total_full}, opts);
     
-    // Step 1: Compute inclusive prefix sums (offset format)
-    // cnt = [0, c0, c1, ..., cn-1], cumsum = [0, c0, c0+c1, ..., sum] which is the offset
-    // Use simple single-CTA per (b,h) scan - no temp buffer needed
-    // Output shape: (B, H, num_blocks_plus_one) to match input cnt shape
-    at::Tensor mask_block_offset = torch::empty({B, H, num_blocks_plus_one}, opts);
-    at::Tensor full_block_offset = torch::empty({B, H, num_blocks_plus_one}, opts);
+    // Step 1: Create offset arrays with leading 0 for exclusive prefix sum
+    // offset shape: [B * H * num_blocks + 1], format: [0, c0, c0+c1, ..., total]
+    int64_t n_blocks_flat = B * H * num_blocks;
+    int64_t offset_size = n_blocks_flat + 1;
     
+    // Allocate offset tensors (uninitialized, kernel sets offset[0]=0)
+    at::Tensor mask_block_offset = torch::empty({offset_size}, opts);
+    at::Tensor full_block_offset = torch::empty({offset_size}, opts);
+    
+    // Compute exclusive prefix sum: offset[0]=0, offset[i+1]=sum(cnt[0..i])
     launch_dual_inclusive_sum(
         mask_cnt.data_ptr<int>(),
         full_cnt.data_ptr<int>(),
         mask_block_offset.data_ptr<int>(),
         full_block_offset.data_ptr<int>(),
-        B * H * num_blocks_plus_one,  // total elements to scan
+        n_blocks_flat,  // number of count elements
         stream
     );
+    
+    // Synchronize to read total counts from the last element of offset arrays
+    cudaStreamSynchronize(stream);
+    
+    // Read total counts from the last element of offset arrays
+    int total_mask = mask_block_offset[-1].item<int>();
+    int total_full = full_block_offset[-1].item<int>();
+
+    // Allocate compact idx tensors (empty if total is 0)
+    at::Tensor mask_block_idx_compact = torch::empty({total_mask}, opts);
+    at::Tensor full_block_idx_compact = torch::empty({total_full}, opts);
         
     // Step 2: Extract indices using CUDA kernel
-    // Note: n_blocks is B*H*num_blocks (not including +1), offset is indexed 1:n+1
-    int64_t n_blocks = B * H * num_blocks;
     if (total_mask > 0 || total_full > 0) {
         launch_extract_compact_indices(
             block_idx_cont.data_ptr<int>(),
-            mask_cnt.data_ptr<int>() + 1,  // Skip leading 0, start from actual counts
-            full_cnt.data_ptr<int>() + 1,  // Skip leading 0, start from actual counts
-            mask_block_offset.data_ptr<int>(),  // offset[0]=0, offset[i+1]=sum(cnt[0:i])
+            mask_cnt.data_ptr<int>(),
+            full_cnt.data_ptr<int>(),
+            mask_block_offset.data_ptr<int>(),
             full_block_offset.data_ptr<int>(),
-            n_blocks,
+            n_blocks_flat,
             max_blocks,
             mask_block_idx_compact.data_ptr<int>(),
             full_block_idx_compact.data_ptr<int>(),
@@ -352,7 +347,10 @@ compact_block_idx(
         );
     }
     
-    // Return tensors with shape (B, H, num_blocks_plus_one)
+    // Return tensors:
+    // - mask_cnt, full_cnt: [B, H, num_blocks] (unchanged)
+    // - mask_block_offset, full_block_offset: [B * H * num_blocks + 1] (flattened, starts with 0)
+    // - mask_block_idx_compact, full_block_idx_compact: [total_mask], [total_full]
     return std::make_tuple(
         mask_cnt, mask_block_offset, mask_block_idx_compact,
         full_cnt, full_block_offset, full_block_idx_compact
@@ -373,7 +371,12 @@ compact_block_idx(
  * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx)
- *         All tensors in CSR format for efficient sparse operations.
+ *         - mask_block_cnt: [B, H, num_q_blocks + 1], int32
+ *         - mask_block_offset: [B * H * (num_q_blocks + 1)], int32 (flattened prefix sum)
+ *         - mask_block_idx: [total_mask_blocks], int32
+ *         - full_block_cnt: [B, H, num_q_blocks + 1], int32
+ *         - full_block_offset: [B * H * (num_q_blocks + 1)], int32 (flattened prefix sum)
+ *         - full_block_idx: [total_full_blocks], int32
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 create_q2k_csr_sparse_from_func(
@@ -385,17 +388,14 @@ create_q2k_csr_sparse_from_func(
     bool check_q_boundary = false
 ) {
     // Step 1: Create block sparse tensors
-    auto [mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks] = 
+    auto [mask_block_cnt, full_block_cnt, block_idx] = 
         create_q2k_block_sparse_from_func(
             func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, 
             check_q_boundary, false  // debug=false for performance
         );
     
     // Step 2: Compact to CSR format
-    return compact_block_idx(
-        mask_block_cnt, full_block_cnt, block_idx,
-        total_mask_blocks, total_full_blocks
-    );
+    return compact_block_idx(mask_block_cnt, full_block_cnt, block_idx);
 }
 
 /**
@@ -411,7 +411,12 @@ create_q2k_csr_sparse_from_func(
  * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx)
- *         All tensors in CSR format for efficient sparse operations.
+ *         - mask_block_cnt: [B, H, num_kv_blocks + 1], int32
+ *         - mask_block_offset: [B * H * (num_kv_blocks + 1)], int32 (flattened prefix sum)
+ *         - mask_block_idx: [total_mask_blocks], int32
+ *         - full_block_cnt: [B, H, num_kv_blocks + 1], int32
+ *         - full_block_offset: [B * H * (num_kv_blocks + 1)], int32 (flattened prefix sum)
+ *         - full_block_idx: [total_full_blocks], int32
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 create_k2q_csr_sparse_from_func(
@@ -422,17 +427,14 @@ create_k2q_csr_sparse_from_func(
     int KV_BLOCK_SIZE = 128
 ) {
     // Step 1: Create block sparse tensors
-    auto [mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks] = 
+    auto [mask_block_cnt, full_block_cnt, block_idx] = 
         create_k2q_block_sparse_from_func(
             func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, 
             false  // debug=false for performance
         );
     
     // Step 2: Compact to CSR format
-    return compact_block_idx(
-        mask_block_cnt, full_block_cnt, block_idx,
-        total_mask_blocks, total_full_blocks
-    );
+    return compact_block_idx(mask_block_cnt, full_block_cnt, block_idx);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -441,9 +443,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("create_q2k_block_sparse_from_func", &create_q2k_block_sparse_from_func,
           "Q2K (Forward): Convert function encoding tensor to block sparse tensors. "
           "Fix q_block, loop kv_blocks. "
-          "Returns (mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks) "
-          "where block_idx contains full blocks left-to-right and mask blocks right-to-left. "
-          "total counts are computed via atomicAdd in kernel.",
+          "Returns (mask_block_cnt, full_block_cnt, block_idx) "
+          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
@@ -455,9 +456,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("create_k2q_block_sparse_from_func", &create_k2q_block_sparse_from_func,
           "K2Q (Backward): Convert function encoding tensor to block sparse tensors. "
           "Fix kv_block, loop q_blocks. Always checks boundary. "
-          "Returns (mask_block_cnt, full_block_cnt, block_idx, total_mask_blocks, total_full_blocks) "
-          "where block_idx contains full blocks left-to-right and mask blocks right-to-left. "
-          "total counts are computed via atomicAdd in kernel.",
+          "Returns (mask_block_cnt, full_block_cnt, block_idx) "
+          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
@@ -468,14 +468,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compact_block_idx", &compact_block_idx,
           "Compact block indices from BHQK format to linear sparse format (CSR-like). "
           "Converts combined block_idx tensor to compact mask_block_idx and full_block_idx. "
-          "Uses total counts from kernel's atomicAdd to avoid CPU-GPU sync. "
+          "Total counts are obtained from the last element of offset arrays after scan. "
           "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
           "full_block_cnt, full_block_offset, full_block_idx).",
           py::arg("mask_block_cnt"),
           py::arg("full_block_cnt"),
-          py::arg("block_idx"),
-          py::arg("total_mask_blocks"),
-          py::arg("total_full_blocks"));
+          py::arg("block_idx"));
     
     m.def("create_q2k_csr_sparse_from_func", &create_q2k_csr_sparse_from_func,
           "Q2K CSR (Forward): Convert function encoding tensor directly to CSR sparse format. "
