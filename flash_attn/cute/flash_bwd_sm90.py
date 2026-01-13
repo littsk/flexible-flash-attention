@@ -968,8 +968,6 @@ class FlashAttentionBackwardSm90:
             smem_thr_copy_PdS=smem_thr_copy_PdS,
             smem_thr_copy_dQaccum=smem_thr_copy_dQaccum,
             softmax_scale_log2=softmax_scale_log2,
-            # acc_dV=acc_dV,
-            # acc_dK=acc_dK,
         )
 
         consumer_state_Q = cutlass.pipeline.make_pipeline_state(
@@ -999,7 +997,6 @@ class FlashAttentionBackwardSm90:
             )
             if const_expr(not self.use_block_sparsity):
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
-                # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tidx = {}, m_block_min = {}, m_block_max = {}", cute.arch.thread_idx()[0], m_block_min, m_block_max)
                 dKV_accumulate = False
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                     consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
@@ -1029,8 +1026,6 @@ class FlashAttentionBackwardSm90:
 
                 for i in cutlass.range(0, curr_mask_block_cnt):
                     m_block = curr_mask_block_idx[curr_mask_block_offset + i]
-                    if cute.arch.thread_idx()[0] == 128:
-                        cute.printf("m_block = %d", m_block)
                     consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
                         m_block,
                         consumer_state_Q,
@@ -1051,7 +1046,6 @@ class FlashAttentionBackwardSm90:
                     )
                     dKV_accumulate = True
 
-            # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dV)
             # scale dK
             acc_dK.store(acc_dK.load() * softmax_scale)
             self.epilogue_dKV(
@@ -1098,8 +1092,6 @@ class FlashAttentionBackwardSm90:
         smem_thr_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
         mask_fn: Optional[Callable] = None,
-        # acc_dV,
-        # acc_dK,
         dKV_accumulate: Boolean = True,
     ):
         consumer_state_dO_cur = (
@@ -1120,19 +1112,13 @@ class FlashAttentionBackwardSm90:
         # (3) [Pointwise 1] P = exp(S - LSE)
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        if cute.arch.thread_idx()[0] == 128:
-            cute.print_tensor(acc_S)
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
-        # if cute.arch.thread_idx()[0] == 256: cute.print_tensor(acc_S_mn)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 acc_S_mn[r, c] = cute.math.exp2(
                     acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True
                 )
 
-        if cute.arch.thread_idx()[0] == 128:
-            cute.print_tensor(acc_S_mn)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_S_mn)
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
 
         # Convert P from f32 -> f16
@@ -1150,11 +1136,9 @@ class FlashAttentionBackwardSm90:
         # (4) [Pointwise 2] dS = P*(dP-dPsum)
         warpgroup.wait_group(0)
         acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP, transpose=self.SdP_swapAB)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dP_mn)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
                 acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - tLSErdPsum[r])
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dP_mn)
         # Convert dS from f32 -> f16
         tdKrdS = utils.cvt_f16(utils.make_acc_tensor_frgA_view(acc_dP), self.dtype)
 
@@ -1189,7 +1173,6 @@ class FlashAttentionBackwardSm90:
         )
         # (6) [GEMM 4] dQ = dS @ K
         acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dV)
         pipeline_dO.consumer_release(consumer_state_dO_cur)  # release dO as dV mma is done
 
         # (7) [GEMM 5] dK += dS.T @ Q
@@ -1199,7 +1182,6 @@ class FlashAttentionBackwardSm90:
             )
         else:
             mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dQ)
 
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
@@ -1214,9 +1196,7 @@ class FlashAttentionBackwardSm90:
         )
 
         warpgroup.wait_group(0)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dK)
         pipeline_Q.consumer_release(consumer_state_Q)
-        # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tidx = {}, m_block = {}, after pipeline_Q consumer release", cute.arch.thread_idx()[0], m_block)
 
         consumer_state_Q.advance()
         consumer_state_dO.advance()

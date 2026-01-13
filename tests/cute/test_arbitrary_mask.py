@@ -17,6 +17,7 @@ from typing import Optional
 from einops import rearrange, repeat
 
 import torch
+import pytest
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
@@ -25,7 +26,7 @@ from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, bhqk_to_line
 from flash_attn.cute.mask_definitions import (
     get_mask_pair,
     STATIC_MASKS,
-    random_arbitrary_func_tensor,
+    arbitrary_func_tensor,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -34,11 +35,6 @@ def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
 ):
     device = "cuda"
-    # lengths = torch.randint(1, seqlen_q + 1, (batch_size,))
-    # cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)])
-    # cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
-    # total_q = cu_seqlens_q[-1]
-    # total_k = total_q
     q = torch.empty(batch_size, seqlen_q, nheads, headdim, device=device, dtype=dtype).uniform_(-1, 1).requires_grad_(True)
     k = torch.empty(
         batch_size, seqlen_k, nheads_kv, headdim, device=device, dtype=dtype
@@ -90,13 +86,12 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
         )
 
     func_num = arbitrary_func.shape[2]
+    valid_mask = torch.zeros_like(qk_attn, dtype=torch.bool)
     for i in range(seqlen_q):
-        for j in range(seqlen_k):
-            value_valid = j < arbitrary_func[0, 0, 0, i]
-            for k in range(func_num // 2):
-                if j >= arbitrary_func[0, 0, 2 * k + 1, i] and j < arbitrary_func[0, 0, 2 * k + 2, i]:
-                    value_valid = True
-            qk_attn[:, :, i, j] = -float("inf") if not value_valid else qk_attn[:, :, i, j]
+        valid_mask[:, :, i, :arbitrary_func[0, 0, 0, i]] = True
+        for j in range(func_num // 2):
+            valid_mask[:, :, i, arbitrary_func[0, 0, 2 * j + 1, i]:arbitrary_func[0, 0, 2 * j + 2, i]] = True
+    qk_attn = torch.where(valid_mask, qk_attn, torch.full_like(qk_attn, -float("inf")))
 
     softmax_attn = F.softmax(qk_attn, dim=-1)
     out = torch.einsum(
@@ -106,8 +101,7 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
     )
 
     is_all_zero = torch.count_nonzero(arbitrary_func) == 0
-    if is_all_zero:
-        out[:] = 0.0
+    out.fill_(0.0) if is_all_zero else out
 
     return out
 
@@ -122,8 +116,6 @@ def _run_mask_test(
     tile_n,
     use_block_sparsity,
 ):
-    # torch.manual_seed(42)
-
     # Determine nheads_kv based on mode
     if kv_mode == "mha":
         nheads_kv = nheads
@@ -140,7 +132,7 @@ def _run_mask_test(
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = random_arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda")
+    arbitrary_func = arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda", pattern="random")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -190,7 +182,7 @@ def _run_mask_test(
         seqlen_q,
         seqlen_k,
         device="cuda",
-        BLOCK_SIZE=(tile_m, tile_n),
+        BLOCK_SIZE=(128, 128) if COMPUTE_CAPABILITY == 10 else (80, 128),
     )
     q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx = None, None, None, None
     if COMPUTE_CAPABILITY == 10:
@@ -257,22 +249,26 @@ def _run_mask_test(
     print(f"dQ max diff: {(dq - dq_ref_fp32).abs().max().item()}")
     print(f"dQ Pytorch max diff: {(dq_ref - dq_ref_fp32).abs().max().item()}")
 
-    # diff = (dq - dq_ref).abs()
-    # print(f"shape diff: {diff.shape}")  # b s h d
-    # for bs in range(batch_size):
-    #     for h in range(nheads):
-    #         for s in range(seqlen_q):
-    #             diff_i = diff[bs, s, h, 0] #只取当前dim的第一个值
-    #             if diff_i.abs().max().item() > 1e-2:
-    #                 out_i = dq[bs, s, h, 0]
-    #                 out_ref_i = dq_ref[bs, s, h, 0]
-    #                 print(f"=== out[bs, s, h, 0] = {out_i}, out_ref[bs, s, h, 0] = {out_ref_i}, diff[bs, s, h, 0] = {diff_i}, bs = {bs}, s = {s}, h = {h}")
-    
     assert (dv - dv_ref_fp32).abs().max().item() <= 5 * (dv_ref - dv_ref_fp32).abs().max().item()
     assert (dk - dk_ref_fp32).abs().max().item() <= 5 * (dk_ref - dk_ref_fp32).abs().max().item()
     assert (dq - dq_ref_fp32).abs().max().item() <= 5 * (dq_ref - dq_ref_fp32).abs().max().item()
 
 
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [
+  (128, 128),
+  (256, 256),
+  (511, 511),
+  (1057, 1057),
+  (2123, 2123),
+  (4259, 4259),
+  (8521, 8521)
+])
+@pytest.mark.parametrize("nheads", [16])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("headdim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_block_sparsity", [True])
+@pytest.mark.parametrize("tile_m,tile_n", [(128, 128)])
 def test_arbitrary_mask(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, tile_m, tile_n
 ):
@@ -280,6 +276,12 @@ def test_arbitrary_mask(
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
         pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+
+    if COMPUTE_CAPABILITY == 9 and headdim < 128:
+        pytest.skip("TODO: Non-128hdim currently not supported on SM 9.0 backward")
+
+    if COMPUTE_CAPABILITY == 9 and kv_mode != "mha":
+        pytest.skip("TODO: Non-mha kv_mode currently not supported on SM 9.0 backward")
 
     _run_mask_test(
         seqlen_q=seqlen_q,
@@ -296,11 +298,11 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=513,
-        seqlen_k=513,
+        seqlen_q=329,
+        seqlen_k=329,
         nheads=1,
         kv_mode="mha",
-        headdim=64,
+        headdim=128,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,

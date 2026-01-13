@@ -591,7 +591,6 @@ class FlashAttentionBackwardSm100:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        # cute.printf("grid_dim = {}", grid_dim)
 
         # Compute allocation sizes for shared buffers that are reused
         # sQ is reused for sdK, sdO is reused for sdV
@@ -2628,7 +2627,7 @@ class FlashAttentionBackwardSm100:
             )
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
-        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):
             tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
             tdKVrdKV_r2s.fill(0)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)

@@ -329,9 +329,11 @@ def load_block_list_bwd(
             producer_state_Q.advance()
             producer_state_dO.advance()
 
+            block_count -= 1
+
         # Remaining blocks
-        for offset in cutlass.range(1, block_count):
-            m_block = block_indices[block_offset + offset]
+        for offset in cutlass.range(0, block_count):
+            m_block = block_indices[block_offset + offset + (1 if load_kv_with_first else 0)]
             pipeline_Q.producer_acquire(producer_state_Q)
             load_Q(m_block, producer_state=producer_state_Q)
             # cp.async.bulk is using ptx, so we need to elect one thread to do it

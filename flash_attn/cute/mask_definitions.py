@@ -263,28 +263,15 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
-def random_arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu"):
+def arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu", pattern="random"):
     arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
-    # lengths = [315, 1021, 2201, 199, 1266, 494, 1204, 2669, 555, 6, 1217, 1351, 1136, 281, 2475]
-    # lengths = [128]
-    lengths = [513] # TODO: rewrite it
-    offset = 0
-    for i in range(len(lengths)):
-        if i == 0:
-            for j in range(lengths[i]):
-                # arbitrary_func_tensor[:, :, 0, offset + j] = j + 1
-                arbitrary_func_tensor[:, :, 0, offset + j] = 0
-                # arbitrary_func_tensor[:, :, 1, offset + j] = j + 2
-                # arbitrary_func_tensor[:, :, 2, offset + j] = j + 2
-        else:
-            for j in range(lengths[i]):
-                arbitrary_func_tensor[:, :, 0, offset + j] = 0
-                # arbitrary_func_tensor[:, :, 1, offset + j] = offset
-                # arbitrary_func_tensor[:, :, 2, offset + j] = offset + j + 1
-        offset += lengths[i]
-    # coef = 1 / n_func
-    # for i in range(n_func):
-    #     arbitrary_func_tensor[:, :, i, :] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)
+    coef = 1 / n_func
+    if pattern == "random":
+        for i in range(n_func):
+            arbitrary_func_tensor[:, :, i, :seqlen_q] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)
+    elif pattern == "causal":
+        for i in range(seqlen_q + 256):
+            arbitrary_func_tensor[:, :, 0, i] = i + 1
     return arbitrary_func_tensor
 
 STATIC_MASKS = {

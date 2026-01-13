@@ -62,9 +62,6 @@ def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> N
             out_bound = cutlass.Boolean(mask & (1 << i))
             c = s * 24 + i
             X[c] = -Float32.inf if out_bound else X[c]
-            # tidx = cute.arch.thread_idx()[0] % 256
-            # if tidx == 128:
-            #     cute.printf("tidx = {}, s = {}, i = {}, row_limit_top = {}, row_limit_top_s = {}, mask = {}, out_bound = {}", tidx, s, i, row_limit_top, row_limit_top_s, mask, out_bound)
 
 
 @dataclass(frozen=True)
@@ -101,10 +98,6 @@ class AttentionMask:
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=self.swap_AB)
-        tScS_mn_2 = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=False)
-        if cute.arch.thread_idx()[0] == 128:
-            cute.print_tensor(tScS_mn)
-            cute.print_tensor(tScS_mn_2)
         # We use t0ScS as these indices are known at compile time. We then must subtract the
         # column limit by the thread column offset.
         t0ScS_mn = utils.make_acc_tensor_mn_view(
@@ -184,40 +177,6 @@ class AttentionMask:
                     else:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
-        # elif const_expr(mask_arbitrary):
-        #     nrow = const_expr(cute.size(tScS_mn.shape[0]))
-        #     ncol = const_expr(cute.size(tScS_mn.shape[1]))
-        #     thr_col_offset = tScS_mn[0, 0][ROW]
-        #     has_fastdiv = const_expr(
-        #         fastdiv_mods is not None
-        #         and fastdiv_mods[0] is not None
-        #         and fastdiv_mods[1] is not None
-        #     )
-        #     wrap_aux_indices = const_expr(
-        #         has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
-        #     )
-
-        #     for r in cutlass.range_constexpr(nrow):
-        #         global_row_idx = tScS_mn[r, 0][ROW] + m_block * self.tile_m
-        #         row_for_mod = global_row_idx
-        #         if const_expr(wrap_aux_indices):
-        #             _, row_for_mod = divmod(global_row_idx, fastdiv_mods[0])
-
-        #         arbitrary_func = aux_tensors[0]
-        #         col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
-        #         col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
-        #         col_max[0] = arbitrary_func[batch_idx, 0, 0, row_for_mod]
-        #         if cute.arch.thread_idx()[0] == 128:
-        #             cute.printf("col_max[0] = %d, row_for_mod = %d", col_max[0], row_for_mod)
-        #         for i in cutlass.range_constexpr(func_num // 2):
-        #             col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, row_for_mod]
-        #             col_max[i + 1] = arbitrary_func[batch_idx, 0, 2 * i + 2, row_for_mod]
-
-        #         for c in cutlass.range_constexpr(ncol):
-        #             col_idx_local = t0ScS_mn[0, c][COL]
-        #             # Convert to absolute column index
-        #             global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
-        #             col_for_mod = global_col_idx
         elif const_expr(mask_arbitrary):
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
@@ -247,7 +206,6 @@ class AttentionMask:
                 for c in cutlass.range_constexpr(ncol):
                     col_idx_local = tScS_mn[0, c][COL]
                     # Convert to absolute column index
-                    # global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     global_col_idx = col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
                     if const_expr(wrap_aux_indices):
@@ -336,7 +294,6 @@ class AttentionMask:
                             if const_expr(self.window_size_left is not None)
                             else 0
                         )
-                        # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block = {}, r = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", n_block, r, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                         # traverse column index.
                         for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                             col_idx = t0ScS_mn[0, c][1]
@@ -365,8 +322,6 @@ class AttentionMask:
                                 if t0ScS_mn[r, 0][ROW] < row_limit_top
                                 else acc_S_mn[r, c]
                             )
-                            if cute.arch.thread_idx()[0] == 128:
-                                cute.printf("row_limit_top = %d, t0ScS_mn[r, 0][ROW] = %d, col0 = %d, r = %d, c = %d, acc_S_mn[r, c] = %f", row_limit_top, t0ScS_mn[r, 0][ROW], col0, r, c, acc_S_mn[r, c])
                 else:
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col0 = t0ScS_mn[0, c][COL]
@@ -527,8 +482,6 @@ class AttentionMask:
                 col_limit_right = row_idx + causal_row_offset
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
-                # if cute.arch.thread_idx()[0] % 32 == 0:
-                #     cute.printf("tidx = %d, tidx tmem = %d, row_idx = %d, col_limit_right = %d, causal_row_offset = %d\n", cute.arch.thread_idx()[0], thr_tmem_load.thr_idx, row_idx, col_limit_right, causal_row_offset)
                 ncol = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(not r2p):
                     for i in cutlass.range(ncol, unroll_full=True):
@@ -557,7 +510,6 @@ class AttentionMask:
                     if const_expr(self.window_size_left is not None)
                     else 0
                 )
-                # if cute.arch.thread_idx()[0] == 0 or cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", m_block, n_block, row_idx, causal_row_offset, col_limit_right, col_limit_left)
                 for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                     col_idx = tScS_t2r[i][1]
                     acc_S[i] = (
@@ -627,9 +579,6 @@ class AttentionMask:
             if const_expr(mask_causal):
                 col0 = t0ScS_t2r[0][COL]
                 row_limit_top = col0 - causal_row_offset
-                # tidx = cute.arch.thread_idx()[0] % 256
-                # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}, col0 = {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1], col0)
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire
                     # column, by setting row limit to be self.tile_m.

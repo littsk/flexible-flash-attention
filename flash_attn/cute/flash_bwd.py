@@ -400,7 +400,7 @@ class FlashAttentionBackwardSm80:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
 
-        # Uses seqlen k, etc. since main bwd kernel's blocks are over n 
+        # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
@@ -415,7 +415,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
         )
-        
+
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -876,12 +876,9 @@ class FlashAttentionBackwardSm80:
             mask_fn(acc_S, m_block=m_block)
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
         bidx = 0
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
         for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(utils.exp2f(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r]))
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
         # MMA dP
         acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
@@ -901,11 +898,9 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
         acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP)
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             acc_dP_mn[r, None].store(acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r]))
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
@@ -933,7 +928,6 @@ class FlashAttentionBackwardSm80:
             A_in_regs=self.Mma_dKV_is_RS,
             swap_AB=self.dKV_swapAB,
         )
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(mma_params.acc_dV)
         cute.arch.barrier()  # Make sure dS is written
 
         # MMA dQ
@@ -957,7 +951,6 @@ class FlashAttentionBackwardSm80:
             for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
                 utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
                 # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
-            # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)
 
         # If num_stages_Q == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
         if cutlass.const_expr(self.num_stages_Q > 1):
@@ -977,7 +970,6 @@ class FlashAttentionBackwardSm80:
             swap_AB=self.dKV_swapAB,
             hook_fn=load_dO_next if cutlass.const_expr(self.num_stages_Q == 1) else None,
         )
-        # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(mma_params.acc_dK)
         if cutlass.const_expr(self.num_stages_Q == 1):
             cute.arch.barrier()
             dQ_mma(load_Q_next)
@@ -999,7 +991,7 @@ class FlashAttentionBackwardSm80:
         num_head: cutlass.Int32,
         batch_size: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        d_head: cutlass.Int32, 
+        d_head: cutlass.Int32,
         d_head_v: cutlass.Int32
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)
