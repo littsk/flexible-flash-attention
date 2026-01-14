@@ -66,6 +66,7 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim == self.tile_hdimv, (
             "tile_hdim and tile_hdimv must be the same for now"
         )
+        self.half_dim = self.tile_hdim // 2  # 2 wgs for epi and compute
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -172,11 +173,11 @@ class FlashAttentionBackwardSm100:
 
     def _setup_attributes(self):
         self.Q_stage = 2
-        self.dO_stage = 1
+        self.dO_stage = 1 if self.tile_hdim >= 96 else 2
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         # self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
-        self.dQ_reduce_ncol = 32
+        self.dQ_reduce_ncol = 32 if self.tile_hdim % 32 == 0 else 16
         self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
         assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
@@ -2106,9 +2107,10 @@ class FlashAttentionBackwardSm100:
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
             num_epi_stages = self.num_epi_stages
-
+        
+        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
@@ -2576,8 +2578,9 @@ class FlashAttentionBackwardSm100:
         mdV_cur = mdV[None, None, head_idx, batch_idx]
         mdK_cur = mdK[None, None, head_idx, batch_idx]
 
+        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
 
         # dV
@@ -2760,8 +2763,10 @@ class FlashAttentionBackwardSm100:
         else:
             num_epi_stages = self.num_epi_stages
 
+
+        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)

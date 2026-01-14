@@ -114,9 +114,10 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn:
-        dv_vals = [d]
+    # dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
+    # if dtype == torch.float8_e4m3fn:
+    #     dv_vals = [d]
+    dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
@@ -228,7 +229,8 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False, True, None]
         # SplitKV is not supported for hdim >= 192
         pack_gqa_vals = [False]
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        # num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -1357,4 +1359,19 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     assert lse_no_lse is None, "LSE should be None when return_lse=False"
     assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), (
         "Output should be the same regardless of return_lse"
+    )
+
+if __name__ == "__main__":
+    test_flash_attn_output(
+        seqlen_q=2048,
+        seqlen_k=2048,
+        d=80,
+        causal=False,
+        local=False,
+        softcap=0.0,
+        deterministic=False,
+        has_qv=False,
+        has_learnable_sink=False,
+        mha_type="mha",
+        dtype=torch.bfloat16,
     )

@@ -522,25 +522,26 @@ def _flash_attn_fwd(
             # pip install torch-c-dlpack-ext
         )
     # Execute with torch tensors directly (TVM FFI compiled functions accept DLPack-compatible tensors)
-    _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        out if not is_split_kv else out_partial,
-        lse_partial if is_split_kv else lse,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        block_sparse_tensors,
-        aux_tensors,
-    )
+    with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
+        _flash_attn_fwd.compile_cache[compile_key](
+            q,
+            k,
+            v,
+            out if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            block_sparse_tensors,
+            aux_tensors,
+        )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -694,7 +695,7 @@ def _flash_attn_bwd(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    head_dim_rounded = (head_dim + 16 - 1) // 16 * 16
 
     if cu_seqlens_q is None:
         seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
@@ -989,28 +990,29 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi"
         )
     # Execute with torch tensors directly
-    _flash_attn_bwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        dout,
-        lse_log2,
-        dpsum,
-        dq_accum,
-        dk if qhead_per_kvhead == 1 else dk_accum,
-        dv if qhead_per_kvhead == 1 else dv_accum,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        blocksparse_tensors=block_sparse_tensors,
-        aux_tensors=aux_tensors,
-        mdQ_semaphore=dQ_semaphore,
-        mdK_semaphore=dK_semaphore,
-        mdV_semaphore=dV_semaphore,
-    )
+    with torch.cuda.nvtx.range("flash_attn_bwd_kernel"):
+        _flash_attn_bwd.compile_cache[compile_key](
+            q,
+            k,
+            v,
+            dout,
+            lse_log2,
+            dpsum,
+            dq_accum,
+            dk if qhead_per_kvhead == 1 else dk_accum,
+            dv if qhead_per_kvhead == 1 else dv_accum,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            blocksparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            mdQ_semaphore=dQ_semaphore,
+            mdK_semaphore=dK_semaphore,
+            mdV_semaphore=dV_semaphore,
+        )
 
     num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16

@@ -51,8 +51,8 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # padding head_dim to a multiple of 16 as k_block_size
+        hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
@@ -169,8 +169,17 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // dQaccum_reduce_stage, dQaccum_reduce_stage)
             )
 
+        gmem_k_block_size = (
+            128
+            if self.tile_hdim % 128 == 0
+            else (
+                64
+                if self.tile_hdim % 64 == 0
+                else (32 if self.tile_hdim % 32 == 0 else 16)
+            )
+        )
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
-            self.dtype, self.tile_hdim, self.num_threads
+            self.dtype, gmem_k_block_size, self.num_threads
         )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQ
@@ -393,7 +402,7 @@ class FlashAttentionBackwardPostprocess:
                     cute.make_identity_tensor((self.tile_m, self.tile_hdim))
                 )
                 tmem_load_atom = cute.make_copy_atom(
-                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8)), Float32
                 )
                 tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
@@ -455,7 +464,9 @@ class FlashAttentionBackwardPostprocess:
                         gmem_tiled_copy_dQ,
                         tdQrdQ[None, rest_m, None],
                         tdQgdQ[None, rest_m, None],
-                        pred=tdQpdQ[None, rest_m, None],
+                        pred=tdQpdQ[None, rest_m, None]
+                        if const_expr(self.check_hdim_oob)
+                        else None,
                     )
 
 

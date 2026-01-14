@@ -566,11 +566,11 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=20000,
-        seqlen_k=20000,
-        nheads=2,
+        seqlen_q=1024,
+        seqlen_k=1024,
+        nheads=1,
         kv_mode="mha",
-        headdim=128,
+        headdim=80,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,
