@@ -21,8 +21,8 @@ from typing import Iterable
 import torch
 from einops import rearrange
 
-from flash_attn.cute.benchmark import benchmark_forward
-from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
+from flash_attn_cute.benchmark import benchmark_forward
+from flash_attn_cute.interface import _flash_attn_fwd as flash_attn_cute_fwd
 
 try:
     import cudnn
