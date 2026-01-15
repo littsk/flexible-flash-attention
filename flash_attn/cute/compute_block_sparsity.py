@@ -7,8 +7,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import torch
 
-from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
+from flash_attn_cute.block_sparsity import BlockSparseTensors
+from flash_attn_cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
 
 
 class BlockSparsityKernel:

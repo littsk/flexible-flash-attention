@@ -27,26 +27,26 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-from flash_attn.cute.paged_kv import PagedKVManager
-import flash_attn.cute.utils as utils
-from flash_attn.cute import copy_utils
-import flash_attn.cute.pipeline as pipeline
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import LinearBlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_attn_cute.paged_kv import PagedKVManager
+import flash_attn_cute.utils as utils
+from flash_attn_cute import copy_utils
+import flash_attn_cute.pipeline as pipeline
+from flash_attn_cute.mask import AttentionMask
+from flash_attn_cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.block_info import BlockInfo
+from flash_attn_cute.block_sparsity import LinearBlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute import mma_sm100_desc as sm100_desc
-from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn_cute.pack_gqa import PackGQA
+from flash_attn_cute import mma_sm100_desc as sm100_desc
+from flash_attn_cute import blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,

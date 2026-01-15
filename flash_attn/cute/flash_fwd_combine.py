@@ -13,8 +13,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, const_expr
 
-from flash_attn.cute import utils
-from flash_attn.cute.seqlen_info import SeqlenInfo
+from flash_attn_cute import utils
+from flash_attn_cute.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 
 

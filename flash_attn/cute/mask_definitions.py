@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
-from flash_attn.cute import utils
+from flash_attn_cute import utils
 
 
 MaskModCallable = Optional[

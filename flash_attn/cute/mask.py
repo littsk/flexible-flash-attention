@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-import flash_attn.cute.utils as utils
+import flash_attn_cute.utils as utils
 
 
 @cute.jit

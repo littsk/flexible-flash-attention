@@ -13,29 +13,29 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
-from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
-from flash_attn.cute import pipeline
-from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import LinearBlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_attn_cute import utils
+from flash_attn_cute import copy_utils
+from flash_attn_cute import pipeline
+from flash_attn_cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from flash_attn_cute.mask import AttentionMask
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.block_info import BlockInfo
+from flash_attn_cute.block_sparsity import LinearBlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_bwd_sm100,
     compute_block_sparse_bwd_sm100,
     reduce_block_sparse_bwd_sm100,
 )
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     ParamsBase,
 )
 
-from flash_attn.cute import barrier
-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
+from flash_attn_cute import barrier
+from flash_attn_cute.named_barrier import NamedBarrierBwdSm100
 
 
 class FlashAttentionBackwardSm100:

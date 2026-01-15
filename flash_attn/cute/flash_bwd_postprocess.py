@@ -14,13 +14,13 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
-from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
-from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute import hopper_helpers as sm90_utils
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute import utils
+from flash_attn_cute import copy_utils
+from flash_attn_cute import ampere_helpers as sm80_utils
+from flash_attn_cute import hopper_helpers as sm90_utils
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute.tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,

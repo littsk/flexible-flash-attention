@@ -21,23 +21,23 @@ import cutlass.utils as utils_basic
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
-from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute import hopper_helpers as sm90_utils
-from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
+from flash_attn_cute import ampere_helpers as sm80_utils
+from flash_attn_cute import hopper_helpers as sm90_utils
+from flash_attn_cute import utils
+from flash_attn_cute import copy_utils
+from flash_attn_cute.mask import AttentionMask
+from flash_attn_cute.softmax import Softmax, apply_score_mod_inner
+from flash_attn_cute.seqlen_info import SeqlenInfoQK
+from flash_attn_cute.block_info import BlockInfo
+from flash_attn_cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
+from flash_attn_cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from flash_attn.cute import pipeline
-from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute.named_barrier import NamedBarrierFwd
-from flash_attn.cute.tile_scheduler import (
+from flash_attn_cute import pipeline
+from flash_attn_cute.pack_gqa import PackGQA
+from flash_attn_cute.named_barrier import NamedBarrierFwd
+from flash_attn_cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,

@@ -13,8 +13,8 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
-from flash_attn.cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
-from flash_attn.cute import utils
+from flash_attn_cute.block_sparsity import BlockSparseTensors, LinearBlockSparseTensors
+from flash_attn_cute import utils
 
 
 @cute.jit

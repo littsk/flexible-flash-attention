@@ -13,8 +13,8 @@ from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-import flash_attn.cute.utils as utils
-from flash_attn.cute.fast_math import clz
+import flash_attn_cute.utils as utils
+from flash_attn_cute.fast_math import clz
 from cutlass.cute import FastDivmodDivisor
 
 

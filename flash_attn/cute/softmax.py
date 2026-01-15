@@ -9,8 +9,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-import flash_attn.cute.utils as utils
-from flash_attn.cute.cute_dsl_utils import ParamsBase
+import flash_attn_cute.utils as utils
+from flash_attn_cute.cute_dsl_utils import ParamsBase
 
 
 @dataclass

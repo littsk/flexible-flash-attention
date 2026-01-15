@@ -32,17 +32,17 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
-from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn_cute import utils
+from flash_attn_cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
+from flash_attn_cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn_cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from flash_attn_cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn_cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn_cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn_cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn_cute.flash_fwd_combine import FlashAttentionForwardCombine
 
-from flash_attn.cute.block_sparsity import (
+from flash_attn_cute.block_sparsity import (
     BlockSparseTensorsTorch,
     LinearBlockSparseTensorsTorch,
     to_cute_linear_block_sparse_tensors,
