@@ -1,9 +1,13 @@
+.PHONY: install tt vt bm fm clean_dist create_dist upload_package
 
 install:
-	cd flash_attn/cute && pip install -e . 
+	bash install.sh
 
 tt:
 	PYTHONPATH=${PWD} python tests/cute/test_flash_attn.py
+
+vt:
+	PYTHONPATH=${PWD} pytest tests/cute/test_flash_attn.py::test_flash_attn_output -v
 
 # profile fwd and bwd
 bm:
