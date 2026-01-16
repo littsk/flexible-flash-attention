@@ -56,7 +56,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 80, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -243,7 +243,7 @@ def test_flash_attn_output(
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
                 learnable_sink=learnable_sink,
-                # pack_gqa=pack_gqa,
+                pack_gqa=pack_gqa,  # Explicitly set pack_gqa to avoid auto-enable for GQA， Jerry
                 num_splits=num_splits,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
@@ -1363,15 +1363,15 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
 
 if __name__ == "__main__":
     test_flash_attn_output(
-        seqlen_q=2048,
-        seqlen_k=2048,
+        seqlen_q=128,
+        seqlen_k=128,
         d=80,
-        causal=False,
+        causal=True,
         local=False,
         softcap=0.0,
         deterministic=False,
         has_qv=False,
         has_learnable_sink=False,
-        mha_type="mha",
+        mha_type="mqa",  
         dtype=torch.bfloat16,
     )

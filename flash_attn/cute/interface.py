@@ -723,7 +723,7 @@ def _flash_attn_bwd(
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
     if qhead_per_kvhead > 1:
-        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        head_dim_v_rounded = (head_dim_v + 16 - 1) // 16 * 16
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
             num_n_blocks = seqlen_k_rounded // n_block_size

@@ -183,7 +183,10 @@ class FlashAttentionBackwardSm100:
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        # n & -n finds the largest power of 2 factor of n
+        self.max_power_of_2_half_dim = self.half_dim & -self.half_dim
+        self.dK_reduce_ncol = min(32, self.max_power_of_2_half_dim)
+        self.num_epi_stages_gqa = self.half_dim // self.dK_reduce_ncol
 
     def _get_tiled_mma(self):
         cta_group = tcgen05.CtaGroup.ONE
@@ -337,6 +340,7 @@ class FlashAttentionBackwardSm100:
         # headdim_64 gets 1 stage
         self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
+        self.sdKV_flat_epi_tile_gqa = self.tile_n * self.dK_reduce_ncol
         # TODO: dK and dV could have different shapes
         if const_expr(self.qhead_per_kvhead == 1):
             self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -2086,8 +2090,8 @@ class FlashAttentionBackwardSm100:
                 ((None, wg_idx),)
             ]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+                gdKV, (self.sdKV_flat_epi_tile_gqa,)
+            )  # (tile_n * dK_reduce_ncol, num_epi_stages_gqa)
 
         deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
         if const_expr(deterministic_KV):
@@ -2106,9 +2110,9 @@ class FlashAttentionBackwardSm100:
             num_epi_stages = cute.size(tdKVgdKV.shape[1])
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
-            num_epi_stages = self.num_epi_stages
+            num_epi_stages = self.num_epi_stages_gqa
         
-        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
@@ -2578,9 +2582,8 @@ class FlashAttentionBackwardSm100:
         mdV_cur = mdV[None, None, head_idx, batch_idx]
         mdK_cur = mdK[None, None, head_idx, batch_idx]
 
-        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.max_power_of_2_half_dim)), Float32
         )
 
         # dV
@@ -2741,8 +2744,8 @@ class FlashAttentionBackwardSm100:
                 ((None, wg_idx),)
             ]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+                gdKV, (self.sdKV_flat_epi_tile_gqa,)
+            )  # (tile_n * dK_reduce_ncol, num_epi_stages_gqa)
 
         deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
         if const_expr(deterministic_KV):
@@ -2761,10 +2764,10 @@ class FlashAttentionBackwardSm100:
             num_epi_stages = cute.size(tdKVgdKV.shape[1])
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
-            num_epi_stages = self.num_epi_stages
+            num_epi_stages = self.num_epi_stages_gqa
 
 
-        max_power_of_2 = self.half_dim & -self.half_dim  # find max num of instructions for LDTM
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
