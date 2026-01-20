@@ -115,15 +115,16 @@ def test_irregular_mask():
     func_out = magi_to_hstu_cuda.magi_to_hstu(
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
+    n_func = func_out.size(0)
     
     # Print func_out
-    print(f"\n=== func_out (shape: [{n_max_func}, {seqlen_q}]) ===")
+    print(f"\n=== func_out (shape: {list(func_out.shape)}, n_func: {n_func}) ===")
     print("        ", end="")
     for q in range(seqlen_q):
         print(f"q={q:<3} ", end="")
     print()
     
-    for f in range(n_max_func):
+    for f in range(n_func):
         print(f"F[{f}]:   ", end="")
         for q in range(seqlen_q):
             val = func_out[f, q].item()
@@ -177,6 +178,7 @@ def test_varlen_sliding_window_causal():
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
     
+    print(f"\nfunc_out shape: {list(func_out.shape)}")
     print("\n=== Attention Mask (reconstructed from func_out) ===")
     mask = reconstruct_mask(func_out, seqlen_q, seqlen_k)
     print_mask(mask)
@@ -210,6 +212,7 @@ def test_varlen_causal():
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
     
+    print(f"\nfunc_out shape: {list(func_out.shape)}")
     print("\n=== Attention Mask (reconstructed from func_out) ===")
     mask = reconstruct_mask(func_out, seqlen_q, seqlen_k)
     print_mask(mask)
@@ -243,6 +246,7 @@ def test_varlen_block_causal():
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
     
+    print(f"\nfunc_out shape: {list(func_out.shape)}")
     print("\n=== Attention Mask (reconstructed from func_out) ===")
     mask = reconstruct_mask(func_out, seqlen_q, seqlen_k)
     print_mask(mask)
@@ -270,6 +274,7 @@ def test_inverse_mask():
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
     
+    print(f"\nfunc_out shape: {list(func_out.shape)}")
     print("\n=== Attention Mask (reconstructed from func_out) ===")
     mask = reconstruct_mask(func_out, seqlen_q, seqlen_k)
     print_mask(mask)
@@ -297,6 +302,7 @@ def test_bicausal_mask():
         q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k, n_max_func
     )
     
+    print(f"\nfunc_out shape: {list(func_out.shape)}")
     print("\n=== Attention Mask (reconstructed from func_out) ===")
     mask = reconstruct_mask(func_out, seqlen_q, seqlen_k)
     print_mask(mask)
