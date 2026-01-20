@@ -300,16 +300,16 @@ def compute_block_sparsity(
     )
 
     # Convert to cute tensors
-    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=2
     )
-    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=3
     )
-    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=2
     )
-    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
         leading_dim=3
     )
 

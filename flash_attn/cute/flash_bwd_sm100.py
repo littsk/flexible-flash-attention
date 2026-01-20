@@ -1927,9 +1927,9 @@ class FlashAttentionBackwardSm100:
                     )
             if const_expr(self.use_block_sparsity) and m_block_min >= m_block_max:
                 thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
-                 #### STORE dV
+                #### STORE dV
                 if const_expr(not self.use_tma_store):
-                     assert False, "Not implemented for epi clear for no tma store"
+                    assert False, "Not implemented for epi clear for no tma store"
                 else:
                     consumer_state_dKV = self.epilogue_dKV_clear(
                             dp_idx,
@@ -2431,7 +2431,7 @@ class FlashAttentionBackwardSm100:
         mdK_cur = mdK[None, None, head_idx, batch_idx]
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.max_power_of_2_half_dim)), Float32
         )
 
         # dV
@@ -2730,8 +2730,8 @@ class FlashAttentionBackwardSm100:
                 ((None, wg_idx),)
             ]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
+                gdKV, (self.sdKV_flat_epi_tile_gqa,)
+            )  # (tile_n * dK_reduce_ncol, num_epi_stages_gqa)
 
         deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
         if const_expr(deterministic_KV):
@@ -2750,10 +2750,12 @@ class FlashAttentionBackwardSm100:
             num_epi_stages = cute.size(tdKVgdKV.shape[1])
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
-            num_epi_stages = self.num_epi_stages
+            num_epi_stages = self.num_epi_stages_gqa
 
+
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)

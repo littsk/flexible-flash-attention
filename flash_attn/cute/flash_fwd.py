@@ -634,12 +634,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        softmax_scale: Float32,
         stream: cuda.CUstream,
-        softmax_scale: Optional[Float32] = None,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        aux_tensors=None,
+        blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        aux_tensors: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -648,7 +654,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
-            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE))
+            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
@@ -760,7 +766,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, num_head, batch_size = cute.arch.block_idx()
+        m_block, head_idx, batch_idx = cute.arch.block_idx()
 
         block_info = BlockInfo(
             self.tile_m,
@@ -772,7 +778,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfoQK.create(seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0])
+        seqlen = SeqlenInfoQK.create(seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0], batch_idx=batch_idx)
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
         # if self.is_causal:
@@ -786,10 +792,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        gQ = cute.local_tile(mQ[None, None, num_head, batch_size], blkQ_shape, (m_block, 0))
-        num_head_kv = num_head // self.qhead_per_kvhead
-        gK = cute.local_tile(mK[None, None, num_head_kv, batch_size], blkK_shape, (None, 0))
-        gV = cute.local_tile(mV[None, None, num_head_kv, batch_size], blkV_shape, (None, 0))
+        gQ = cute.local_tile(mQ[None, None, head_idx, batch_idx], blkQ_shape, (m_block, 0))
+        num_head_kv = head_idx // self.qhead_per_kvhead
+        gK = cute.local_tile(mK[None, None, num_head_kv, batch_idx], blkK_shape, (None, 0))
+        gV = cute.local_tile(mV[None, None, num_head_kv, batch_idx], blkV_shape, (None, 0))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -907,8 +913,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             load_K=load_K,
             load_V=load_V,
             score_mod=self.score_mod,
-            batch_idx=batch_size,
-            head_idx=num_head,
+            batch_idx=batch_idx,
+            head_idx=head_idx,
             m_block=m_block,
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods,
@@ -969,6 +975,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         mask_fn = partial(
             mask.apply_mask,
+            batch_idx=batch_idx,
+            head_idx=head_idx,
             m_block=m_block,
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,
@@ -1035,8 +1043,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tiled_mma_pv,
             tidx,
             m_block,
-            num_head,
-            batch_size,
+            head_idx,
+            batch_idx,
         )
 
     @cute.jit

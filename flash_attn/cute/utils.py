@@ -66,7 +66,7 @@ def create_softcap_scoremod(softcap_val):
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
-        from_dlpack(x, assumed_align=alignment)
+        from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=True)
         .mark_layout_dynamic(leading_dim=leading_dim)
         .mark_compact_shape_dynamic(
             mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
@@ -79,7 +79,7 @@ def convert_from_dlpack_leading_static(
 ) -> cute.Tensor:
     if stride_order is None:
         stride_order = x.dim_order()
-    x_ = from_dlpack(x, assumed_align=alignment)
+    x_ = from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=True)
     for i in range(x.ndim):
         if i != leading_dim and (static_modes is None or i not in static_modes):
             x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=stride_order)

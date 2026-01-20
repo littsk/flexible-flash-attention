@@ -173,20 +173,20 @@ def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[B
         return None
 
     mask_block_cnt_tensor = from_dlpack(
-        tensors.mask_block_cnt.detach(), assumed_align=4
+        tensors.mask_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=2)
     mask_block_idx_tensor = from_dlpack(
-        tensors.mask_block_idx.detach(), assumed_align=4
+        tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=3)
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=2
         )
         if tensors.full_block_cnt is not None
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=3
         )
         if tensors.full_block_idx is not None
@@ -206,16 +206,16 @@ def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) 
         return None
 
     mask_block_cnt_tensor = from_dlpack(
-        tensors.mask_block_cnt.detach(), assumed_align=4
+        tensors.mask_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=0)
     mask_block_offset_tensor = from_dlpack(
-        tensors.mask_block_offset.detach(), assumed_align=4
+        tensors.mask_block_offset.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=0)
     mask_block_idx_tensor = from_dlpack(
-        tensors.mask_block_idx.detach(), assumed_align=4
+        tensors.mask_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=0)
     full_block_cnt_tensor = (
-        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=0
         )
         if tensors.full_block_cnt is not None
@@ -223,13 +223,13 @@ def to_cute_linear_block_sparse_tensors(tensors: LinearBlockSparseTensorsTorch) 
     )
     full_block_offset_tensor = (
         from_dlpack(
-            tensors.full_block_offset.detach(), assumed_align=4
+            tensors.full_block_offset.detach(), assumed_align=4, enable_tvm_ffi=True
         ).mark_layout_dynamic(leading_dim=0)
         if tensors.full_block_offset is not None
         else None
     )
     full_block_idx_tensor = (
-        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        from_dlpack(tensors.full_block_idx.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=0
         )
         if tensors.full_block_idx is not None
