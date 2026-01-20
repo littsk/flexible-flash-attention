@@ -488,6 +488,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
+        # Compile with from_dlpack tensors, execute with torch tensors directly
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
@@ -512,25 +513,27 @@ def _flash_attn_fwd(
             # pip install apache-tvm-ffi
             # pip install torch-c-dlpack-ext
         )
-    _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        out if not is_split_kv else out_partial,
-        lse_partial if is_split_kv else lse,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        block_sparse_tensors,
-        aux_tensors,
-    )
+    # Execute with torch tensors directly (TVM FFI compiled functions accept DLPack-compatible tensors)
+    with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
+        _flash_attn_fwd.compile_cache[compile_key](
+            q,
+            k,
+            v,
+            out if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            block_sparse_tensors,
+            aux_tensors,
+        )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -582,7 +585,7 @@ def _flash_attn_bwd(
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
     if compute_capability == 9:
-        m_block_size = 80 if not causal else 64
+        m_block_size = 64 if (causal or arbitrary) else 80
         n_block_size = 128
         num_stages_Q = 2
         num_stages_dO = 2
@@ -607,6 +610,8 @@ def _flash_attn_bwd(
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    print(f"m_block_size: {m_block_size}")
+    print(f"n_block_size: {n_block_size}")
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -894,7 +899,7 @@ def _flash_attn_bwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
-
+        
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -977,28 +982,30 @@ def _flash_attn_bwd(
             mdV_semaphore=dV_semaphore_tensor,
             options="--enable-tvm-ffi"
         )
-    _flash_attn_bwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        dout,
-        lse_log2,
-        dpsum,
-        dq_accum,
-        dk if qhead_per_kvhead == 1 else dk_accum,
-        dv if qhead_per_kvhead == 1 else dv_accum,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        blocksparse_tensors=block_sparse_tensors,
-        aux_tensors=aux_tensors,
-        mdQ_semaphore=dQ_semaphore,
-        mdK_semaphore=dK_semaphore,
-        mdV_semaphore=dV_semaphore,
-    )
+    # Execute with torch tensors directly
+    with torch.cuda.nvtx.range("flash_attn_bwd_kernel"):
+        _flash_attn_bwd.compile_cache[compile_key](
+            q,
+            k,
+            v,
+            dout,
+            lse_log2,
+            dpsum,
+            dq_accum,
+            dk if qhead_per_kvhead == 1 else dk_accum,
+            dv if qhead_per_kvhead == 1 else dv_accum,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            blocksparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
+            mdQ_semaphore=dQ_semaphore,
+            mdK_semaphore=dK_semaphore,
+            mdV_semaphore=dV_semaphore,
+        )
 
     num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
@@ -1009,7 +1016,7 @@ def _flash_attn_bwd(
         dq_tensor = from_dlpack(dq.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq.ndim - 1)
         cu_seqlens_q_tensor = from_dlpack(cu_seqlens_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_q.ndim - 1) if cu_seqlens_q is not None else None
         seqused_q_tensor = from_dlpack(seqused_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_q.ndim - 1) if seqused_q is not None else None
-
+        
         arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
@@ -1044,7 +1051,7 @@ def _flash_attn_bwd(
             dk_tensor = from_dlpack(dk.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk.ndim - 1)
             cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
-
+            
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
@@ -1082,7 +1089,7 @@ def _flash_attn_bwd(
             dv_tensor = from_dlpack(dv.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv.ndim - 1)
             cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
-
+            
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )

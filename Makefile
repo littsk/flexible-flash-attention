@@ -1,8 +1,31 @@
+.PHONY: install tt vt bm fm clean_dist create_dist upload_package
+
+# Set ARBITRARY=1 to use test_arbitrary_mask.py, otherwise use test_flash_attn.py
+# Example: make fm ARBITRARY=1
+ARBITRARY ?= 0
+ifeq ($(ARBITRARY),1)
+    TEST_FILE = tests/cute/test_arbitrary_mask.py
+else
+    TEST_FILE = tests/cute/test_flash_attn.py
+endif
+
+install:
+	bash install.sh editable
 
 tt:
-	PYTHONPATH=$(PWD) python tests/cute/test_arbitrary_mask.py
+	PYTHONPATH=${PWD} python $(TEST_FILE)
+
+vt:
+	PYTHONPATH=${PWD} pytest tests/cute/test_flash_attn.py::test_flash_attn_output -v
+
+
+# profile fwd and bwd
+bm:
+	PYTHONPATH=${PWD} ncu --set full --nvtx --nvtx-include "flash_attn_bwd_kernel/" --nvtx-include "flash_attn_fwd_kernel/"  -f -o flash_bwd.%p  python $(TEST_FILE)
+
+# profile fwd
 fm:
-	PYTHONPATH=$(PWD) ncu --set full --clock-control none -f -o baseline --kernel-id ::regex:kernel_cutlass_kernel: python tests/cute/test_arbitrary_mask.py
+	PYTHONPATH=${PWD} ncu --set full --nvtx --nvtx-include "flash_attn_fwd_kernel/"  -f -o flash_fwd.%p  python $(TEST_FILE)
 
 clean_dist:
 	rm -rf dist/*

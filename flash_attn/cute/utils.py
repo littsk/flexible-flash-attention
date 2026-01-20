@@ -704,13 +704,27 @@ def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
 
 # TODO: check that the ex2_emulation_2 produces the same SASS as the ptx version
 @dsl_user_op
-def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def ex2_emulation_2(
+    x: Float32, y: Float32, high_precision: cutlass.Constexpr[bool] = False, *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
+    # Original 3rd-degree polynomial (4 coefficients):
     poly_ex2_deg3 = (
         1.0,
         0.695146143436431884765625,
         0.227564394474029541015625,
         0.077119089663028717041015625,
+    )
+    # 4th-degree polynomial from exp2.cu (5 coefficients):
+    # Horner: ((((a1*x + a2)*x + a3)*x + a4)*x + a5)
+    # a1..a5 = 0.01369766, 0.05169036, 0.24163845, 0.69296612, 1.0000037
+    # Order: constant term first (a5, a4, a3, a2, a1)
+    poly_ex2_deg4 = (
+        1.0000037,       # a5: x^0
+        0.69296612,      # a4: x^1
+        0.24163845,      # a3: x^2
+        0.05169036,      # a2: x^3
+        0.01369766,      # a1: x^4
     )
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
@@ -722,7 +736,10 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
     xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
-    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg3, loc=loc, ip=ip)
+    if cutlass.const_expr(high_precision):
+        xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg4, loc=loc, ip=ip)
+    else:
+        xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg3, loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
     return x_out, y_out

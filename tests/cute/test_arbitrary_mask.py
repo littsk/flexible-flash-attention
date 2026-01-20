@@ -263,7 +263,7 @@ def _run_mask_test(
         seqlen_q,
         seqlen_k,
         device="cuda",
-        BLOCK_SIZE=(128, 128) if COMPUTE_CAPABILITY == 10 else (80, 128),
+        BLOCK_SIZE=(128, 128) if COMPUTE_CAPABILITY == 10 else (64, 128), # casual 64 128, non causal 80 128
     )
     q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx = None, None, None, None
     if isinstance(bm.as_tuple()[0], int):
@@ -311,13 +311,15 @@ def _run_mask_test(
             )
         with torch.cuda.nvtx.range("create_k2q_csr_sparse_from_func"):
             # K2Q (Backward): fix kv_block, loop q_blocks
+            # Note: Q_BLOCK_SIZE must match PyTorch's bm_bwd BLOCK_SIZE[0]
+            k2q_q_block_size = 128 if COMPUTE_CAPABILITY == 10 else 64
             (cuda_q_mask_cnt, cuda_q_mask_offset, cuda_q_mask_idx,
             cuda_q_full_cnt, cuda_q_full_offset, cuda_q_full_idx) = \
                 create_block_mask_cuda.create_k2q_csr_sparse_from_func(
                     arbitrary_func,
                     seqlen_q,
                     seqlen_k,
-                    Q_BLOCK_SIZE=128 if COMPUTE_CAPABILITY == 10 else 80,
+                    Q_BLOCK_SIZE=k2q_q_block_size,
                     KV_BLOCK_SIZE=128
                 )
 
@@ -483,10 +485,10 @@ def test_arbitrary_mask(
     """Test arbitrary mask
     """
     if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
-        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0.")
 
     if COMPUTE_CAPABILITY == 9 and headdim < 128:
-        pytest.skip("TODO: Non-128hdim currently not supported on SM 9.0 backward")
+        pytest.skip("TODO: hdim > 128 currently not supported on SM 9.0 backward")
 
     if COMPUTE_CAPABILITY == 9 and kv_mode != "mha":
         pytest.skip("TODO: Non-mha kv_mode currently not supported on SM 9.0 backward")
@@ -506,9 +508,9 @@ def test_arbitrary_mask(
 
 if __name__ == "__main__":
     test_arbitrary_mask(
-        seqlen_q=517,
-        seqlen_k=517,
-        nheads=1,
+        seqlen_q=8192,
+        seqlen_k=8192,
+        nheads=32,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,

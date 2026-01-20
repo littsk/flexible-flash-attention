@@ -90,6 +90,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        self.high_precision_e2e = False
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -1916,6 +1917,7 @@ class FlashAttentionForwardSm100:
             tSrP_r2t,
             e2e=mask_fn is None and self.head_dim_padded <= 128,
             e2e_freq=self.e2e_freq,
+            high_precision_e2e=self.high_precision_e2e,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

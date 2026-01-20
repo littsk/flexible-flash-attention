@@ -66,6 +66,7 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim == self.tile_hdimv, (
             "tile_hdim and tile_hdimv must be the same for now"
         )
+        self.half_dim = self.tile_hdim // 2  # 2 wgs for epi and compute
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -172,17 +173,20 @@ class FlashAttentionBackwardSm100:
 
     def _setup_attributes(self):
         self.Q_stage = 2
-        self.dO_stage = 1
+        self.dO_stage = 1 if self.tile_hdim >= 96 else 2
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         # self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
-        self.dQ_reduce_ncol = 32
+        self.dQ_reduce_ncol = 32 if self.tile_hdim % 32 == 0 else 16
         self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
         assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        # n & -n finds the largest power of 2 factor of n
+        self.max_power_of_2_half_dim = self.half_dim & -self.half_dim
+        self.dK_reduce_ncol = min(32, self.max_power_of_2_half_dim)
+        self.num_epi_stages_gqa = self.half_dim // self.dK_reduce_ncol
 
     def _get_tiled_mma(self):
         cta_group = tcgen05.CtaGroup.ONE
@@ -336,6 +340,7 @@ class FlashAttentionBackwardSm100:
         # headdim_64 gets 1 stage
         self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
+        self.sdKV_flat_epi_tile_gqa = self.tile_n * self.dK_reduce_ncol
         # TODO: dK and dV could have different shapes
         if const_expr(self.qhead_per_kvhead == 1):
             self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -1927,9 +1932,8 @@ class FlashAttentionBackwardSm100:
                     )
             if const_expr(self.use_block_sparsity) and m_block_min >= m_block_max:
                 thr_copy_r2s_dKV = tiled_copy_r2s_dKV.get_slice(dp_idx)
-                #### STORE dV
                 if const_expr(not self.use_tma_store):
-                    assert False, "Not implemented for epi clear for no tma store"
+                        assert False, "Not implemented for epi clear for no tma store"
                 else:
                     consumer_state_dKV = self.epilogue_dKV_clear(
                             dp_idx,
@@ -2025,6 +2029,147 @@ class FlashAttentionBackwardSm100:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def epilogue_dKV_clear(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        n_block: Int32,
+        thr_mma: cute.core.ThrMma,
+        tdKVtdKV: cute.Tensor,
+        mdKV: cute.Tensor,
+        sdKV: cute.Tensor,
+        tma_atom_dKV: cute.CopyAtom,
+        thr_copy_r2s_dKV: cute.TiledCopy,
+        pipeline_dKV: PipelineAsync,
+        consumer_state_dKV: cutlass.pipeline.PipelineState,
+        scale: Optional[Float32],
+        barrier_id: Int32,
+        mdKV_semaphore: Optional[cute.Tensor],
+    ):
+        # assumes mma_tiler_pdo = mma_tiler_dsq = (tile_n, head_dim)
+        # head_dim = head_dim_v, dk_dtype = dv_dtype
+        num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+        wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
+        num_wg = num_compute_threads // 128
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+
+        if const_expr(self.qhead_per_kvhead == 1):
+            sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
+        else:
+            sdKV = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
+
+        # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
+        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
+
+        head_idx_kv = head_idx // self.qhead_per_kvhead
+        if const_expr(self.qhead_per_kvhead == 1):
+            mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
+            gdKV_p = cute.local_tile(
+                mdKV_cur, (self.tile_n, self.tile_hdim), (n_block, 0)
+            )  # (tile_n, hdim)
+            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
+            gdKV_epi = cute.local_tile(
+                gdKV, self.sdKV_epi_tile, (0, None)
+            )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
+        else:
+            mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
+            gdKV_p = cute.local_tile(
+                mdKV_cur, (self.tile_n * self.tile_hdim,), (n_block,)
+            )  # (tile_n * hdim)
+            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * self.tile_hdim // num_wg,))[
+                ((None, wg_idx),)
+            ]  # (tile_n * hdim / 2)
+            gdKV_epi = cute.flat_divide(
+                gdKV, (self.sdKV_flat_epi_tile_gqa,)
+            )  # (tile_n * dK_reduce_ncol, num_epi_stages_gqa)
+
+        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
+        if const_expr(deterministic_KV):
+            mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
+
+        if const_expr(self.qhead_per_kvhead == 1):
+            tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
+                tma_atom_dKV,
+                0,  # no multicast
+                cute.make_layout(1),
+                cute.group_modes(sdKV, 0, 2),
+                cute.group_modes(gdKV_epi, 0, 2),
+            )  # (TMA) and (TMA, EPI_STAGE)
+            assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
+            assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
+            num_epi_stages = cute.size(tdKVgdKV.shape[1])
+            assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
+        else:
+            num_epi_stages = self.num_epi_stages_gqa
+        
+        max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
+        )
+
+        read_flag = const_expr(not deterministic_KV)
+
+        # pipeline_dKV.consumer_wait(consumer_state_dKV)
+
+        # semaphore acquire
+        if const_expr(deterministic_KV):
+            barrier.wait_eq(
+                mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
+            )
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+            tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
+            tdKVrdKV_r2s.fill(0)
+            cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+
+            # SMEM -> GMEM
+            if leader_warp:
+                if const_expr(self.qhead_per_kvhead == 1):
+                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                else:
+                    with cute.arch.elect_one():
+                        copy_utils.cpasync_reduce_bulk_add_f32(
+                            sdKV.iterator,
+                            gdKV_epi[None, epi_stage].iterator,
+                            self.tma_copy_bytes["dKacc"],
+                        )
+                if const_expr(epi_stage < num_epi_stages - 1):
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                cute.arch.barrier_arrive(
+                    barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+                )
+
+            # Barrier since all warps need to wait for SMEM to be freed
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
+            cute.arch.barrier(
+                barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+            )
+
+        # semaphore release
+        # NOTE: arrive_inc calls red_release which issues membar
+        if const_expr(deterministic_KV):
+            if leader_warp:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+            barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
+
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            pipeline_dKV.consumer_release(consumer_state_dKV)
+        consumer_state_dKV.advance()
+        return consumer_state_dKV
 
     @cute.jit
     def compute_step(
@@ -2532,144 +2677,6 @@ class FlashAttentionBackwardSm100:
         tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
 
         cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g)
-
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            pipeline_dKV.consumer_release(consumer_state_dKV)
-        consumer_state_dKV.advance()
-        return consumer_state_dKV
-
-    @cute.jit
-    def epilogue_dKV_clear(
-        self,
-        tidx: Int32,
-        batch_idx: Int32,
-        head_idx: Int32,
-        n_block: Int32,
-        thr_mma: cute.core.ThrMma,
-        tdKVtdKV: cute.Tensor,
-        mdKV: cute.Tensor,
-        sdKV: cute.Tensor,
-        tma_atom_dKV: cute.CopyAtom,
-        thr_copy_r2s_dKV: cute.TiledCopy,
-        pipeline_dKV: PipelineAsync,
-        consumer_state_dKV: cutlass.pipeline.PipelineState,
-        scale: Optional[Float32],
-        barrier_id: Int32,
-        mdKV_semaphore: Optional[cute.Tensor],
-    ):
-        # assumes mma_tiler_pdo = mma_tiler_dsq = (tile_n, head_dim)
-        # head_dim = head_dim_v, dk_dtype = dv_dtype
-        num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
-        wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
-        num_wg = num_compute_threads // 128
-        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
-
-        if const_expr(self.qhead_per_kvhead == 1):
-            sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
-        else:
-            sdKV = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
-
-        # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
-        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
-
-        head_idx_kv = head_idx // self.qhead_per_kvhead
-        if const_expr(self.qhead_per_kvhead == 1):
-            mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
-            gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n, self.tile_hdim), (n_block, 0)
-            )  # (tile_n, hdim)
-            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
-            gdKV_epi = cute.local_tile(
-                gdKV, self.sdKV_epi_tile, (0, None)
-            )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
-        else:
-            mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
-            gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n * self.tile_hdim,), (n_block,)
-            )  # (tile_n * hdim)
-            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * self.tile_hdim // num_wg,))[
-                ((None, wg_idx),)
-            ]  # (tile_n * hdim / 2)
-            gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile,)
-            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
-
-        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
-        if const_expr(deterministic_KV):
-            mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
-
-        if const_expr(self.qhead_per_kvhead == 1):
-            tdKVsdKV, tdKVgdKV = cpasync.tma_partition(
-                tma_atom_dKV,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sdKV, 0, 2),
-                cute.group_modes(gdKV_epi, 0, 2),
-            )  # (TMA) and (TMA, EPI_STAGE)
-            assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
-            assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
-            num_epi_stages = cute.size(tdKVgdKV.shape[1])
-            assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
-        else:
-            num_epi_stages = self.num_epi_stages
-
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
-        )
-
-        read_flag = const_expr(not deterministic_KV)
-
-        # semaphore acquire
-        if const_expr(deterministic_KV):
-            barrier.wait_eq(
-                mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
-            )
-            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
-
-        for epi_stage in cutlass.range_constexpr(num_epi_stages):
-            tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
-            tdKVrdKV_r2s.fill(0)
-            cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
-
-            # SMEM -> GMEM
-            if leader_warp:
-                if const_expr(self.qhead_per_kvhead == 1):
-                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
-                else:
-                    with cute.arch.elect_one():
-                        copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV.iterator,
-                            gdKV_epi[None, epi_stage].iterator,
-                            self.tma_copy_bytes["dKacc"],
-                        )
-                if const_expr(epi_stage < num_epi_stages - 1):
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                cute.arch.barrier_arrive(
-                    barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
-                )
-
-            # Barrier since all warps need to wait for SMEM to be freed
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            cute.arch.barrier(
-                barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
-            )
-
-        # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(deterministic_KV):
-            if leader_warp:
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
-            barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():

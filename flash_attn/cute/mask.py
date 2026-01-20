@@ -490,7 +490,13 @@ class AttentionMask:
             arbitrary_func = aux_tensors[0]
             n_block_offset = n_block * self.tile_n
             ncol = const_expr(cute.size(tScS_t2r.shape))
-
+            # get arbitrary bs and head
+            arbitrary_bs = arbitrary_func.shape[0]
+            arbitrary_head = arbitrary_func.shape[1]
+            if arbitrary_bs == 1:
+                batch_idx = 0
+            if arbitrary_head == 1:
+                head_idx = 0
             # R2P optimization: use bit mask to represent intervals and R2P instruction to batch set predicate
             r2p_arbitrary = True  # Toggle for arbitrary mask R2P optimization
             if const_expr(not wrap_aux_indices and not self.swap_AB and r2p_arbitrary):
@@ -499,19 +505,19 @@ class AttentionMask:
                 num_limits = const_expr(func_num + 1)  # func_num // 2 * 2 + 1
                 col_limits = cute.make_fragment((num_limits,), Int32)
                 # load and convert to local coordinates relative to current n_block
-                col_limits[0] = max(arbitrary_func[batch_idx, 0, 0, mask_row_for_mod] - n_block_offset, 0)
+                col_limits[0] = max(arbitrary_func[batch_idx, head_idx, 0, mask_row_for_mod] - n_block_offset, 0)
                 for j in cutlass.range_constexpr(func_num // 2):
-                    col_limits[2 * j + 1] = max(arbitrary_func[batch_idx, 0, 2 * j + 1, mask_row_for_mod] - n_block_offset, 0)
-                    col_limits[2 * j + 2] = max(arbitrary_func[batch_idx, 0, 2 * j + 2, mask_row_for_mod] - n_block_offset, 0)
+                    col_limits[2 * j + 1] = max(arbitrary_func[batch_idx, head_idx, 2 * j + 1, mask_row_for_mod] - n_block_offset, 0)
+                    col_limits[2 * j + 2] = max(arbitrary_func[batch_idx, head_idx, 2 * j + 2, mask_row_for_mod] - n_block_offset, 0)
                 mask_r2p_intervals(acc_S, col_limits, func_num // 2)
             else:
                 # fallback to naive method
                 col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
                 col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
-                col_max[0] = arbitrary_func[batch_idx, 0, 0, mask_row_for_mod]
+                col_max[0] = arbitrary_func[batch_idx, head_idx, 0, mask_row_for_mod]
                 for i in cutlass.range_constexpr(func_num // 2):
-                    col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, mask_row_for_mod]
-                    col_max[i + 1] = arbitrary_func[batch_idx, 0, 2 * i + 2, mask_row_for_mod]
+                    col_min[i] = arbitrary_func[batch_idx, head_idx, 2 * i + 1, mask_row_for_mod]
+                    col_max[i + 1] = arbitrary_func[batch_idx, head_idx, 2 * i + 2, mask_row_for_mod]
 
                 for i in cutlass.range_constexpr(ncol):
                     col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]

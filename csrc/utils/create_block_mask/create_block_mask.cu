@@ -362,7 +362,7 @@ __device__ __forceinline__ void reduce_kv_block_range(
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
     
     // Warp-level min/max reduction
     int warp_min = __reduce_min_sync(0xFFFFFFFF, thread_min_kv);
@@ -428,7 +428,7 @@ __device__ __forceinline__ void reduce_kv_range_raw(
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
-    int num_warps = blockDim.x / WARP_SIZE;
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
     
     // Warp-level min/max reduction
     int warp_min = __reduce_min_sync(0xFFFFFFFF, thread_min_kv);
@@ -532,7 +532,7 @@ __device__ __forceinline__ int reduce_block_state(
     // Each thread in warp 0 reads one warp result, then reduce across the warp
     unsigned int final_mask = 0;
     if (warp_id == 0) {
-        int num_warps = blockDim.x / WARP_SIZE;
+        int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
         // Lane i reads warp_results[i] if valid, else 0 (neutral for OR)
         unsigned int my_result = (lane_id < num_warps) ? 
             static_cast<unsigned int>(warp_results[lane_id]) : 0u;
@@ -587,7 +587,7 @@ __device__ __forceinline__ int block_reduce_state_bitmask(
     // Phase 3: Warp 0 performs final reduction
     unsigned int final_mask = 0;
     if (warp_id == 0) {
-        int num_warps = blockDim.x / WARP_SIZE;
+        int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
         unsigned int my_result = (lane_id < num_warps) ? 
             static_cast<unsigned int>(warp_results[lane_id]) : 0u;
         final_mask = __reduce_or_sync(0xFFFFFFFF, my_result);
