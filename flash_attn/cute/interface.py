@@ -598,8 +598,8 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
     else:
-        m_block_size = 128
-        n_block_size = 128
+        assert m_block_size == 128, "For SM 10.0, m_block_size in bwd must be 128 for now"
+        assert n_block_size == 128, "For SM 10.0, n_block_size in bwd must be 128 for now"
         dQ_swapAB = False
         dKV_swapAB = False
         AtomLayoutMdQ = 1

@@ -306,7 +306,7 @@ def _run_mask_test(
                     seqlen_k,
                     Q_BLOCK_SIZE=sparse_tile_m,
                     KV_BLOCK_SIZE=tile_n,
-                    check_q_boundary=True  # True just to align to flex attention, change to False for performance
+                    check_q_boundary=False  # True just to align to flex attention, change to False for performance
                 )
 
             # Convert to LinearBlockSparseTensorsTorch format

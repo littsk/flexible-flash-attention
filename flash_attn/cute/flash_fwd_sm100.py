@@ -1646,16 +1646,7 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
-            if const_expr(self.use_block_sparsity):
-                #  Full blocks dont need mask_mod
-                mask_fn_none = partial(
-                    mask.apply_mask_sm100,
-                    mask_mod=None,
-                    fastdiv_mods=fastdiv_mods,
-                    **shared_mask_kwargs,
-                )
-            else:
-                mask_fn_none = None
+            mask_fn_none = None
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,

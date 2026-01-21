@@ -359,6 +359,8 @@ def load_block_list_bwd(
 @cute.jit
 def produce_block_sparse_loads_bwd(
     blocksparse_tensors: LinearBlockSparseTensors,
+    batch_idx,
+    head_idx,
     n_block,
     load_Q,
     load_K,

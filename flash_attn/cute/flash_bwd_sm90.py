@@ -788,6 +788,8 @@ class FlashAttentionBackwardSm90:
                 else:
                     producer_state_Q, producer_state_dO = produce_block_sparse_loads_bwd(
                         blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
                         n_block,
                         load_Q,
                         load_K,
@@ -1014,13 +1016,15 @@ class FlashAttentionBackwardSm90:
                     dKV_accumulate = True
             else:
                 mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
-                curr_mask_block_cnt = mask_block_cnt[n_block]
-                curr_mask_block_offset = mask_block_offset[n_block]
+                batch, nheads, n_blocks = mask_block_cnt.shape
+                offset_idx = (0 if batch == 1 else (batch_idx * nheads * n_blocks)) + (0 if nheads == 1 else (head_idx * n_blocks)) + n_block
+                curr_mask_block_cnt = mask_block_cnt[0 if batch == 1 else batch_idx, 0 if nheads == 1 else head_idx, n_block]
+                curr_mask_block_offset = mask_block_offset[offset_idx]
                 curr_mask_block_idx = mask_block_idx
 
                 if const_expr(full_block_cnt is not None):
-                    curr_full_block_cnt = full_block_cnt[n_block]
-                    curr_full_block_offset = full_block_offset[n_block]
+                    curr_full_block_cnt = full_block_cnt[0 if batch == 1 else batch_idx, 0 if nheads == 1 else head_idx, n_block]
+                    curr_full_block_offset = full_block_offset[offset_idx]
                     curr_full_block_idx = full_block_idx
                 else:
                     curr_full_block_cnt = Int32(0)
@@ -1310,13 +1314,15 @@ class FlashAttentionBackwardSm90:
                     dQaccum_step_fn(m_block=m_block)
             else:
                 mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
-                curr_mask_block_cnt = mask_block_cnt[n_block]
-                curr_mask_block_offset = mask_block_offset[n_block]
+                batch, nheads, n_blocks = mask_block_cnt.shape
+                offset_idx = (0 if batch == 1 else (batch_idx * nheads * n_blocks)) + (0 if nheads == 1 else (head_idx * n_blocks)) + n_block
+                curr_mask_block_cnt = mask_block_cnt[0 if batch == 1 else batch_idx, 0 if nheads == 1 else head_idx, n_block]
+                curr_mask_block_offset = mask_block_offset[offset_idx]
                 curr_mask_block_idx = mask_block_idx
 
                 if const_expr(full_block_cnt is not None):
-                    curr_full_block_cnt = full_block_cnt[n_block]
-                    curr_full_block_offset = full_block_offset[n_block]
+                    curr_full_block_cnt = full_block_cnt[0 if batch == 1 else batch_idx, 0 if nheads == 1 else head_idx, n_block]
+                    curr_full_block_offset = full_block_offset[offset_idx]
                     curr_full_block_idx = full_block_idx
                 else:
                     curr_full_block_cnt = Int32(0)
