@@ -263,7 +263,7 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
-def arbitrary_func_tensor(batch, nheads, n_func, seqlen_q, seqlen_k, device="cpu", pattern="random"):
+def arbitrary_func_tensor(batch, nheads, n_func, seqlen_q, seqlen_k, device="cpu", pattern="random", extra_args=None):
     arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
     coef = 1 / n_func
     if pattern == "random":
@@ -272,8 +272,22 @@ def arbitrary_func_tensor(batch, nheads, n_func, seqlen_q, seqlen_k, device="cpu
                 for k in range(n_func):
                     arbitrary_func_tensor[i, j, k, :seqlen_q] = torch.randint((int)(k * coef * seqlen_k), (int)((k + 1) * coef * seqlen_k), size=(seqlen_q,), device=device)
     elif pattern == "causal":
-        for i in range(seqlen_q + 256):
+        for i in range(seqlen_q):
             arbitrary_func_tensor[:, :, 0, i] = i + 1
+    elif pattern == "sink+local":
+        sink_width = extra_args["sink_width"]
+        window_left = extra_args["window_left"]
+        window_right = extra_args["window_right"]
+        hole_flag = False
+        for i in range(seqlen_q):
+            if not hole_flag:
+                arbitrary_func_tensor[:, :, 0, i] = min(i + 1 + window_right, seqlen_k)
+                if i - window_left >= sink_width:
+                    hole_flag = True
+            else:
+                arbitrary_func_tensor[:, :, 0, i] = sink_width
+                arbitrary_func_tensor[:, :, 1, i] = min(i - window_left, seqlen_k)
+                arbitrary_func_tensor[:, :, 2, i] = min(i + 1 + window_right, seqlen_k)
     return arbitrary_func_tensor
 
 STATIC_MASKS = {
@@ -326,3 +340,6 @@ def get_mask_pair(mask_name, seqlen_q=None, seqlen_k=None, window_size=None):
 if __name__ == "__main__":
     doc_ids = random_doc_id_tensor(1, 2, 128)
     print(f"{doc_ids = }")
+
+    arbitrary_func = arbitrary_func_tensor(1, 1, 3, 64, 64, device="cuda", pattern="sink+local", extra_args={"sink_width": 3, "window_left": 1, "window_right": 2})
+    print(f"{arbitrary_func = }")
