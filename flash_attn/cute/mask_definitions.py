@@ -63,10 +63,10 @@ def flex_document_mask(b, h, q_idx, kv_idx, doc_id):
 
 def flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func):
     zero = h * 0
-    value_valid = kv_idx < arbitrary_func[b, zero, zero, q_idx]
+    value_valid = kv_idx < arbitrary_func[b, h, zero, q_idx]
     n_func = arbitrary_func.shape[2]
     for i in range(n_func // 2):
-        in_range = (kv_idx >= arbitrary_func[b, zero, zero + (2*i+1), q_idx]) & (kv_idx < arbitrary_func[b, zero, zero + (2*i+2), q_idx])
+        in_range = (kv_idx >= arbitrary_func[b, h, zero + (2*i+1), q_idx]) & (kv_idx < arbitrary_func[b, h, zero + (2*i+2), q_idx])
         value_valid = value_valid | in_range
     return value_valid
 
@@ -263,12 +263,14 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
     return doc_ids_tensor
 
-def arbitrary_func_tensor(nheads, batch, n_func, seqlen_q, seqlen_k, device="cpu", pattern="random"):
+def arbitrary_func_tensor(batch, nheads, n_func, seqlen_q, seqlen_k, device="cpu", pattern="random"):
     arbitrary_func_tensor = torch.zeros(batch, nheads, n_func, seqlen_q + 256, dtype=torch.int32, device=device)
     coef = 1 / n_func
     if pattern == "random":
-        for i in range(n_func):
-            arbitrary_func_tensor[:, :, i, :seqlen_q] = torch.randint((int)(i * coef * seqlen_k), (int)((i + 1) * coef * seqlen_k), size=(batch, nheads, seqlen_q), device=device)
+        for i in range(batch):
+            for j in range(nheads):
+                for k in range(n_func):
+                    arbitrary_func_tensor[i, j, k, :seqlen_q] = torch.randint((int)(k * coef * seqlen_k), (int)((k + 1) * coef * seqlen_k), size=(seqlen_q,), device=device)
     elif pattern == "causal":
         for i in range(seqlen_q + 256):
             arbitrary_func_tensor[:, :, 0, i] = i + 1

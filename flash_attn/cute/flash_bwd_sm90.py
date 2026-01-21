@@ -976,6 +976,11 @@ class FlashAttentionBackwardSm90:
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
+        arb_multi_batch, arb_multi_heads = False, False
+        if const_expr(self.is_arbitrary):
+            func = aux_tensors[0]
+            arb_multi_heads = func.shape[1] > 1
+            arb_multi_batch = func.shape[0] > 1
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -984,8 +989,8 @@ class FlashAttentionBackwardSm90:
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
-                batch_idx=0,
-                head_idx=0,
+                batch_idx=batch_idx if arb_multi_batch else 0,
+                head_idx=head_idx if arb_multi_heads else 0,
                 n_block=n_block,
                 thr_mma=thr_mma_SdP,
                 mask_seqlen=True,

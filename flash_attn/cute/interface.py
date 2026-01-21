@@ -610,8 +610,6 @@ def _flash_attn_bwd(
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
-    print(f"m_block_size: {m_block_size}")
-    print(f"n_block_size: {n_block_size}")
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -631,6 +629,10 @@ def _flash_attn_bwd(
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+
+    if compute_capability == 9:
+        assert head_dim == 128, "For SM 9.0, head_dim must be 128 for now"
+        assert num_head == num_head_kv, "For SM 9.0, num_head must be equal to num_head_kv for now"
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -899,7 +901,7 @@ def _flash_attn_bwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
-        
+
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -1016,7 +1018,7 @@ def _flash_attn_bwd(
         dq_tensor = from_dlpack(dq.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq.ndim - 1)
         cu_seqlens_q_tensor = from_dlpack(cu_seqlens_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_q.ndim - 1) if cu_seqlens_q is not None else None
         seqused_q_tensor = from_dlpack(seqused_q.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_q.ndim - 1) if seqused_q is not None else None
-        
+
         arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
@@ -1051,7 +1053,7 @@ def _flash_attn_bwd(
             dk_tensor = from_dlpack(dk.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk.ndim - 1)
             cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
-            
+
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
@@ -1089,7 +1091,7 @@ def _flash_attn_bwd(
             dv_tensor = from_dlpack(dv.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv.ndim - 1)
             cu_seqlens_k_tensor = from_dlpack(cu_seqlens_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=cu_seqlens_k.ndim - 1) if cu_seqlens_k is not None else None
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
-            
+
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )

@@ -1982,17 +1982,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_v=pipeline_v,
             mma_pv_fn=mma_pv_fn,
         )
+        arb_multi_batch, arb_multi_heads = False, False
+        if const_expr(self.is_arbitrary):
+            func = aux_tensors[0]
+            arb_multi_heads = func.shape[1] > 1
+            arb_multi_batch = func.shape[0] > 1
         while work_tile.is_valid_tile:
-            # if work_tile.is_valid_tile:
-
             # shape: (atom_v_m * rest_m)
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
+                batch_idx=batch_idx if arb_multi_batch else 0,
+                head_idx=head_idx if arb_multi_heads else 0,
                 m_block=m_block,
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,

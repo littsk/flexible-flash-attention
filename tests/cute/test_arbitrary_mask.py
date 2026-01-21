@@ -66,49 +66,56 @@ COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 def apply_arbitrary_mask_to_qk(qk_attn, arbitrary_func, seqlen_q, seqlen_k):
     """
     qk_attn: [B, H, seqlen_q, seqlen_k]
-    arbitrary_func: [1, 1, func_num, seqlen_q + 256] (int-like indices)
+    arbitrary_func: [b, h, func_num, seqlen_q + 256] where b=1 or B, h=1 or H
     Only the first `seqlen_q` positions of the last dim are used.
     """
     device = qk_attn.device
     B, H, sq, sk = qk_attn.shape
     assert sq == seqlen_q and sk == seqlen_k
 
+    b_size, h_size = arbitrary_func.shape[0], arbitrary_func.shape[1]
+
     # Use only the first seqlen_q entries along last dim
-    af = arbitrary_func[..., :seqlen_q]   # [1,1,func_num,seqlen_q]
+    af = arbitrary_func[..., :seqlen_q]   # [b, h, func_num, seqlen_q]
     func_num = af.shape[2]
 
-    # j grid: [1,1,1,seqlen_k]
+    # j grid: [1, 1, 1, seqlen_k]
     j = torch.arange(seqlen_k, device=device, dtype=af.dtype).view(1, 1, 1, seqlen_k)
 
-    # base cutoff: af[0,0,0,i] -> [1,1,seqlen_q,1]
-    base_cut = af[0, 0, 0, :].view(1, 1, seqlen_q, 1)
-    base_valid = j < base_cut   # [1,1,seqlen_q,seqlen_k]
+    # Initialize valid mask as all False
+    valid = torch.zeros(B, H, seqlen_q, seqlen_k, dtype=torch.bool, device=device)
 
-    # intervals: starts = af[0,0,1::2,:], ends = af[0,0,2::2,:]
-    num_intervals = func_num // 2
-    if num_intervals > 0:
-        starts = af[0, 0, 1:func_num:2, :]  # [num_intervals, seqlen_q]
-        ends   = af[0, 0, 2:func_num:2, :]  # [num_intervals, seqlen_q]
+    for b in range(B):
+        for h in range(H):
+            # Support broadcasting
+            b_idx = 0 if b_size == 1 else b
+            h_idx = 0 if h_size == 1 else h
 
-        # reshape for broadcasting: [1, num_intervals, seqlen_q, 1]
-        starts = starts.view(1, num_intervals, seqlen_q, 1)
-        ends   = ends.view(1, num_intervals, seqlen_q, 1)
+            # base cutoff: af[b_idx, h_idx, 0, :] -> [seqlen_q, 1]
+            base_cut = af[b_idx, h_idx, 0, :].view(seqlen_q, 1)
+            base_valid = j.squeeze(0).squeeze(0) < base_cut  # [seqlen_q, seqlen_k]
 
-        # j expanded: [1,1,seqlen_q,seqlen_k] -> then [1, num_intervals, seqlen_q, seqlen_k]
-        j_exp = j.expand(1, num_intervals, seqlen_q, seqlen_k)
+            # intervals
+            num_intervals = func_num // 2
+            if num_intervals > 0:
+                starts = af[b_idx, h_idx, 1:func_num:2, :]  # [num_intervals, seqlen_q]
+                ends = af[b_idx, h_idx, 2:func_num:2, :]    # [num_intervals, seqlen_q]
 
-        in_interval = (j_exp >= starts) & (j_exp < ends)  # [1,num_intervals,seqlen_q,seqlen_k]
-        interval_valid = in_interval.any(dim=1, keepdim=True)  # [1,1,seqlen_q,seqlen_k]
-    else:
-        interval_valid = torch.zeros(1, 1, seqlen_q, seqlen_k, dtype=torch.bool, device=device)
+                # reshape for broadcasting: [num_intervals, seqlen_q, 1]
+                starts = starts.view(num_intervals, seqlen_q, 1)
+                ends = ends.view(num_intervals, seqlen_q, 1)
 
-    # combined mask [1,1,seqlen_q,seqlen_k]
-    valid = base_valid | interval_valid
+                # j expanded: [num_intervals, seqlen_q, seqlen_k]
+                j_exp = j.squeeze(0).squeeze(0).expand(num_intervals, seqlen_q, seqlen_k)
 
-    # expand to [B,H,seqlen_q,seqlen_k]
-    valid = valid.expand(B, H, seqlen_q, seqlen_k)
+                in_interval = (j_exp >= starts) & (j_exp < ends)  # [num_intervals, seqlen_q, seqlen_k]
+                interval_valid = in_interval.any(dim=0)  # [seqlen_q, seqlen_k]
+            else:
+                interval_valid = torch.zeros(seqlen_q, seqlen_k, dtype=torch.bool, device=device)
 
-    # set invalid positions to -inf (works in-place style by assigning back)
+            valid[b, h] = base_valid | interval_valid
+
+    # set invalid positions to -inf
     qk_attn = torch.where(valid, qk_attn, torch.full_like(qk_attn, -float("inf")))
 
     return qk_attn
@@ -186,31 +193,37 @@ def compute_reference_arbitrary(tensors, arbitrary_func, up_cast=False):
 def _run_mask_test(
     seqlen_q,
     seqlen_k,
+    batch_size,
     nheads,
+    arb_multi_batch,
+    arb_multi_heads,
+    func_num,
     kv_mode,
     headdim,
     dtype,
     tile_m,
     tile_n,
     use_block_sparsity,
+    run_benchmark,
 ):
     # Determine nheads_kv based on mode
     if kv_mode == "mha":
         nheads_kv = nheads
     elif kv_mode == "gqa":
-        nheads_kv = nheads // 2
+        nheads_kv = max(1, nheads // 2)
     elif kv_mode == "mqa":
         nheads_kv = 1
     else:
         raise ValueError(f"Unknown kv_mode: {kv_mode}")
 
-    batch_size = 1
     headdim_v = headdim
 
     # aux_tensors_arg = None
     # mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q, seqlen_k)
     mask_mod_cute, mask_mod_flex = get_mask_pair("arbitrary")
-    arbitrary_func = arbitrary_func_tensor(1, 1, 3, seqlen_q, seqlen_k, device="cuda", pattern="causal")
+    arb_batch_size = batch_size if arb_multi_batch else 1
+    arb_nheads = nheads if arb_multi_heads else 1
+    arbitrary_func = arbitrary_func_tensor(arb_batch_size, arb_nheads, func_num, seqlen_q, seqlen_k, device="cuda", pattern="causal")
     original_flex_mask = mask_mod_flex
 
     def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
@@ -235,8 +248,8 @@ def _run_mask_test(
     # =========================================================================
     bm = create_block_mask(
         mask_mod_flex,
-        1,
-        1,
+        arb_batch_size,
+        arb_nheads,
         seqlen_q,
         seqlen_k,
         device="cuda",
@@ -258,15 +271,15 @@ def _run_mask_test(
 
     bm_bwd = create_block_mask(
         mask_mod_flex,
-        1,
-        1,
+        arb_batch_size,
+        arb_nheads,
         seqlen_q,
         seqlen_k,
         device="cuda",
         BLOCK_SIZE=(128, 128) if COMPUTE_CAPABILITY == 10 else (64, 128), # casual 64 128, non causal 80 128
     )
     q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx = None, None, None, None
-    if isinstance(bm.as_tuple()[0], int):
+    if isinstance(bm_bwd.as_tuple()[0], int):
         _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
     else:
         _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
@@ -302,10 +315,10 @@ def _run_mask_test(
             #   - offset: [B * H * num_blocks + 1] - flattened exclusive prefix sum (starts with 0)
             #   - idx: [total_blocks] - compact indices
             cuda_linear_k_block_sparse_mask = LinearBlockSparseTensorsTorch(
-                mask_block_cnt=cuda_k_mask_cnt.flatten(),
+                mask_block_cnt=cuda_k_mask_cnt,
                 mask_block_offset=cuda_k_mask_offset,
                 mask_block_idx=cuda_k_mask_idx,
-                full_block_cnt=cuda_k_full_cnt.flatten(),
+                full_block_cnt=cuda_k_full_cnt,
                 full_block_offset=cuda_k_full_offset,
                 full_block_idx=cuda_k_full_idx,
             )
@@ -324,10 +337,10 @@ def _run_mask_test(
                 )
 
             cuda_linear_q_block_sparse_mask = LinearBlockSparseTensorsTorch(
-                mask_block_cnt=cuda_q_mask_cnt.flatten(),
+                mask_block_cnt=cuda_q_mask_cnt,
                 mask_block_offset=cuda_q_mask_offset,
                 mask_block_idx=cuda_q_mask_idx,
-                full_block_cnt=cuda_q_full_cnt.flatten(),
+                full_block_cnt=cuda_q_full_cnt,
                 full_block_offset=cuda_q_full_offset,
                 full_block_idx=cuda_q_full_idx,
             )
@@ -407,6 +420,166 @@ def _run_mask_test(
         linear_k_block_sparse_mask = ref_linear_k_block_sparse_mask
         linear_q_block_sparse_mask = ref_linear_q_block_sparse_mask
 
+    # =========================================================================
+    # Benchmarking mode
+    # =========================================================================
+    if run_benchmark:
+        num_runs = 21
+
+        # Pre-create dout for backward pass
+        dout = torch.rand(batch_size, seqlen_q, nheads, headdim_v, device="cuda", dtype=dtype)
+
+        # Create CUDA events for accurate GPU timing
+        fwd_start_event = torch.cuda.Event(enable_timing=True)
+        fwd_end_event = torch.cuda.Event(enable_timing=True)
+        bwd_start_event = torch.cuda.Event(enable_timing=True)
+        bwd_end_event = torch.cuda.Event(enable_timing=True)
+
+        # Calculate FLOPS
+        # Forward: 4 * B * H * seqlen_q * seqlen_k * headdim (Q*K^T and attn*V)
+        # Backward: approximately 2.5x forward (dP*V^T, dP^T*Q, dP*K, Q*K^T)
+        fwd_flops = 4 * batch_size * nheads * seqlen_q * seqlen_k * headdim
+        bwd_flops = 2.5 * fwd_flops  # Backward is roughly 2.5x forward
+
+        # =====================================================================
+        # Benchmark 1: Baseline causal attention (no arbitrary mask)
+        # =====================================================================
+        baseline_fwd_times = []
+        baseline_bwd_times = []
+
+        for i in range(num_runs):
+            q = tensors["q"].detach().clone().requires_grad_(True)
+            k = tensors["k"].detach().clone().requires_grad_(True)
+            v = tensors["v"].detach().clone().requires_grad_(True)
+
+            # Forward pass timing
+            fwd_start_event.record()
+
+            out_baseline, lse_baseline = flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                arbitrary=False,
+                window_size=(None, None),
+                learnable_sink=None,
+                softcap=0.0,
+                num_splits=1,
+                pack_gqa=False,
+                deterministic=False,
+                mask_mod=None,
+                linear_k_block_sparse_tensors=None,
+                linear_q_block_sparse_tensors=None,
+                aux_tensors=None,
+            )
+
+            fwd_end_event.record()
+
+            # Backward pass timing
+            bwd_start_event.record()
+
+            dq, dk, dv = torch.autograd.grad(
+                out_baseline, (q, k, v), dout
+            )
+
+            bwd_end_event.record()
+
+            torch.cuda.synchronize()
+
+            # Skip the first run (warmup)
+            if i > 0:
+                baseline_fwd_times.append(fwd_start_event.elapsed_time(fwd_end_event))
+                baseline_bwd_times.append(bwd_start_event.elapsed_time(bwd_end_event))
+
+        # =====================================================================
+        # Benchmark 2: Arbitrary mask attention
+        # =====================================================================
+        arb_fwd_times = []
+        arb_bwd_times = []
+
+        for i in range(num_runs):
+            q = tensors["q"].detach().clone().requires_grad_(True)
+            k = tensors["k"].detach().clone().requires_grad_(True)
+            v = tensors["v"].detach().clone().requires_grad_(True)
+
+            # Forward pass timing
+            fwd_start_event.record()
+
+            out_cute, lse_cute = flash_attn_func(
+                q=q,
+                k=k,
+                v=v,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                arbitrary=True,
+                window_size=(None, None),
+                learnable_sink=None,
+                softcap=0.0,
+                num_splits=1,
+                pack_gqa=False,
+                deterministic=False,
+                mask_mod=None,
+                linear_k_block_sparse_tensors=linear_k_block_sparse_mask,
+                linear_q_block_sparse_tensors=linear_q_block_sparse_mask,
+                aux_tensors=aux_tensors_arg,
+            )
+
+            fwd_end_event.record()
+
+            # Backward pass timing
+            bwd_start_event.record()
+
+            dq, dk, dv = torch.autograd.grad(
+                out_cute, (q, k, v), dout
+            )
+
+            bwd_end_event.record()
+
+            torch.cuda.synchronize()
+
+            # Skip the first run (warmup)
+            if i > 0:
+                arb_fwd_times.append(fwd_start_event.elapsed_time(fwd_end_event))
+                arb_bwd_times.append(bwd_start_event.elapsed_time(bwd_end_event))
+
+        # =====================================================================
+        # Calculate and print results
+        # =====================================================================
+        baseline_avg_fwd_ms = sum(baseline_fwd_times) / len(baseline_fwd_times)
+        baseline_avg_bwd_ms = sum(baseline_bwd_times) / len(baseline_bwd_times)
+        arb_avg_fwd_ms = sum(arb_fwd_times) / len(arb_fwd_times)
+        arb_avg_bwd_ms = sum(arb_bwd_times) / len(arb_bwd_times)
+
+        baseline_fwd_tflops = fwd_flops / (baseline_avg_fwd_ms * 1e-3) / 1e12
+        baseline_bwd_tflops = bwd_flops / (baseline_avg_bwd_ms * 1e-3) / 1e12
+        arb_fwd_tflops = fwd_flops / (arb_avg_fwd_ms * 1e-3) / 1e12
+        arb_bwd_tflops = bwd_flops / (arb_avg_bwd_ms * 1e-3) / 1e12
+
+        print("\n" + "=" * 70)
+        print("Benchmark Results:")
+        print("=" * 70)
+        print(f"Configuration: B={batch_size}, H={nheads}, seqlen_q={seqlen_q}, seqlen_k={seqlen_k}, headdim={headdim}")
+        print(f"Number of runs: {num_runs} (first run excluded for warmup)")
+        print("-" * 70)
+        print(f"{'Kernel':<20} {'Forward (ms)':<15} {'Fwd TFLOPS*':<12} {'Backward (ms)':<15} {'Bwd TFLOPS*':<12}")
+        print("-" * 70)
+        print(f"{'Baseline (causal)':<20} {baseline_avg_fwd_ms:<15.3f} {baseline_fwd_tflops:<12.2f} {baseline_avg_bwd_ms:<15.3f} {baseline_bwd_tflops:<12.2f}")
+        print(f"{'Arbitrary mask':<20} {arb_avg_fwd_ms:<15.3f} {arb_fwd_tflops:<12.2f} {arb_avg_bwd_ms:<15.3f} {arb_bwd_tflops:<12.2f}")
+        print("-" * 70)
+        fwd_overhead = (arb_avg_fwd_ms - baseline_avg_fwd_ms) / baseline_avg_fwd_ms * 100
+        bwd_overhead = (arb_avg_bwd_ms - baseline_avg_bwd_ms) / baseline_avg_bwd_ms * 100
+        total_baseline = baseline_avg_fwd_ms + baseline_avg_bwd_ms
+        total_arb = arb_avg_fwd_ms + arb_avg_bwd_ms
+        total_overhead = (total_arb - total_baseline) / total_baseline * 100
+        print(f"{'Overhead':<20} {fwd_overhead:+.1f}%{'':<10} {'':<12} {bwd_overhead:+.1f}%{'':<10}")
+        print("-" * 70)
+        print(f"{'Total time':<20} {total_baseline:<15.3f} {'':<12} {total_arb:<15.3f} {'':12} overhead: {total_overhead:+.1f}%")
+        print("=" * 70)
+        print("* TFLOPS is calculated based on full mask, not actual mask")
+
+        return  # Skip correctness checks in benchmark mode
+
     out_cute, lse_cute = flash_attn_func(
         q=tensors["q"],
         k=tensors["k"],
@@ -473,14 +646,32 @@ def _run_mask_test(
   (4259, 4259),
   (8521, 8521)
 ])
-@pytest.mark.parametrize("nheads", [16])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("nheads", [1, 4])
+@pytest.mark.parametrize("arb_multi_batch", [True, False])
+@pytest.mark.parametrize("arb_multi_heads", [True, False])
+@pytest.mark.parametrize("func_num", [3, 9])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("headdim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True])
 @pytest.mark.parametrize("tile_m,tile_n", [(128, 128)])
+@pytest.mark.parametrize("run_benchmark", [False])
 def test_arbitrary_mask(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, tile_m, tile_n
+    seqlen_q,
+    seqlen_k,
+    batch_size,
+    nheads,
+    arb_multi_batch,
+    arb_multi_heads,
+    func_num,
+    kv_mode,
+    headdim,
+    dtype,
+    use_block_sparsity,
+    tile_m,
+    tile_n,
+    run_benchmark,
 ):
     """Test arbitrary mask
     """
@@ -496,13 +687,18 @@ def test_arbitrary_mask(
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
+        batch_size=batch_size,
         nheads=nheads,
+        arb_multi_batch=arb_multi_batch,
+        arb_multi_heads=arb_multi_heads,
+        func_num=func_num,
         kv_mode=kv_mode,
         headdim=headdim,
         dtype=dtype,
         tile_m=tile_m,
         tile_n=tile_n,
         use_block_sparsity=use_block_sparsity,
+        run_benchmark=run_benchmark,
     )
 
 
@@ -510,11 +706,16 @@ if __name__ == "__main__":
     test_arbitrary_mask(
         seqlen_q=8192,
         seqlen_k=8192,
+        batch_size=1,
         nheads=32,
+        arb_multi_batch=False,
+        arb_multi_heads=True,
+        func_num=3,
         kv_mode="mha",
         headdim=128,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,
         tile_n=128,
+        run_benchmark=True,
     )

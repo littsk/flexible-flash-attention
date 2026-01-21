@@ -237,10 +237,10 @@ class AttentionMask:
                 arbitrary_func = aux_tensors[0]
                 col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
                 col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
-                col_max[0] = arbitrary_func[batch_idx, 0, 0, row_for_mod]
+                col_max[0] = arbitrary_func[batch_idx, head_idx, 0, row_for_mod]
                 for i in cutlass.range_constexpr(func_num // 2):
-                    col_min[i] = arbitrary_func[batch_idx, 0, 2 * i + 1, row_for_mod]
-                    col_max[i + 1] = arbitrary_func[batch_idx, 0, 2 * i + 2, row_for_mod]
+                    col_min[i] = arbitrary_func[batch_idx, head_idx, 2 * i + 1, row_for_mod]
+                    col_max[i + 1] = arbitrary_func[batch_idx, head_idx, 2 * i + 2, row_for_mod]
 
                 for c in cutlass.range_constexpr(ncol):
                     col_idx_local = tScS_mn[0, c][COL]
@@ -490,13 +490,6 @@ class AttentionMask:
             arbitrary_func = aux_tensors[0]
             n_block_offset = n_block * self.tile_n
             ncol = const_expr(cute.size(tScS_t2r.shape))
-            # get arbitrary bs and head
-            arbitrary_bs = arbitrary_func.shape[0]
-            arbitrary_head = arbitrary_func.shape[1]
-            if arbitrary_bs == 1:
-                batch_idx = 0
-            if arbitrary_head == 1:
-                head_idx = 0
             # R2P optimization: use bit mask to represent intervals and R2P instruction to batch set predicate
             r2p_arbitrary = True  # Toggle for arbitrary mask R2P optimization
             if const_expr(not wrap_aux_indices and not self.swap_AB and r2p_arbitrary):
@@ -593,6 +586,8 @@ class AttentionMask:
         mask_local: cutlass.Constexpr,
         mask_arbitrary: cutlass.Constexpr[bool] = False,
         func_num: cutlass.Constexpr[int] = 0,
+        batch_idx: Int32 = None,
+        head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
     ) -> None:
         """
@@ -610,22 +605,23 @@ class AttentionMask:
                         acc_S[i] = -cutlass.Float32.inf
 
         elif const_expr(mask_arbitrary):
-            if const_expr(mask_seqlen):
-                if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
-                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                        acc_S[i] = -cutlass.Float32.inf
-
             base_row = m_block * self.tile_m
             base_col = n_block * self.tile_n
+            arbitrary_func = aux_tensors[0]
+            col_min = cute.make_fragment((func_num // 2, ), Int32) if const_expr(func_num // 2 > 0) else None
+            col_max = cute.make_fragment((func_num // 2 + 1, ), Int32)
             for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                 block_row = tScS_t2r[i][ROW]
                 row = block_row + base_row
                 block_col = tScS_t2r[i][COL]
                 col = block_col + base_col
-                arbitrary_func = aux_tensors[0]
-                value_valid = col < arbitrary_func[0, 0, 0, row]
-                for j in cutlass.range(func_num // 2, unroll_full=True):
-                    if col >= arbitrary_func[0, 0, 2 * j + 1, row] and col < arbitrary_func[0, 0, 2 * j + 2, row]:
+                col_max[0] = arbitrary_func[batch_idx, head_idx, 0, row]
+                for j in cutlass.range_constexpr(func_num // 2):
+                    col_min[j] = arbitrary_func[batch_idx, head_idx, 2 * j + 1, row]
+                    col_max[j + 1] = arbitrary_func[batch_idx, head_idx, 2 * j + 2, row]
+                value_valid = col < col_max[0]
+                for j in cutlass.range_constexpr(func_num // 2):
+                    if col >= col_min[j] and col < col_max[j + 1]:
                         value_valid = True
                 acc_S[i] = -cutlass.Float32.inf if not value_valid else acc_S[i]
                 # Fow bwd dKV compute, we need mask seq_q, while it can not mask in arbitrary func, thus we need add mask_seqlen to check boundary.

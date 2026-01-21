@@ -1370,6 +1370,8 @@ class FlashAttentionBackwardSm100:
             else:
                 producer_state_Q_LSE, producer_state_dO_dPsum = produce_block_sparse_loads_bwd_sm100(
                     blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
                     n_block,
                     load_Q,
                     load_K,
@@ -1843,6 +1845,11 @@ class FlashAttentionBackwardSm100:
         consumer_state_dPsum = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
+        arb_multi_batch, arb_multi_heads = False, False
+        if const_expr(self.is_arbitrary):
+            func = aux_tensors[0]
+            arb_multi_heads = func.shape[1] > 1
+            arb_multi_batch = func.shape[0] > 1
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1857,7 +1864,6 @@ class FlashAttentionBackwardSm100:
                 m_block_min, m_block_max = 0, block_iter_count
 
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
-            # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
@@ -1868,18 +1874,8 @@ class FlashAttentionBackwardSm100:
                 mask_local=self.is_local,
                 mask_arbitrary=self.is_arbitrary,
                 func_num=self.func_num,
-                aux_tensors=aux_tensors,
-            )
-            mask_fn_seqlen = partial(
-                mask.apply_mask_sm100_transposed,
-                tScS_t2r=tScS_t2r,
-                t0ScS_t2r=t0ScS_t2r,
-                n_block=n_block,
-                mask_seqlen=True,
-                mask_causal=False,
-                mask_local=False,
-                mask_arbitrary=False,
-                func_num=self.func_num,
+                batch_idx=batch_idx if arb_multi_batch else 0,
+                head_idx=head_idx if arb_multi_heads else 0,
                 aux_tensors=aux_tensors,
             )
 
@@ -1911,6 +1907,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.use_block_sparsity):
                 (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_block_sparse_bwd_sm100(
                     blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
                     n_block,
                     compute_step_fn,
                     mask_fn=mask_fn,
@@ -2104,7 +2102,7 @@ class FlashAttentionBackwardSm100:
             assert num_epi_stages == self.num_epi_stages, "Epi stage calculation is wrong"
         else:
             num_epi_stages = self.num_epi_stages_gqa
-        
+
         max_power_of_2 = (self.half_dim // num_epi_stages) & -(self.half_dim // num_epi_stages)  # find max num of instructions for LDTM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(max_power_of_2)), Float32
@@ -2121,7 +2119,7 @@ class FlashAttentionBackwardSm100:
             )
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
-        for epi_stage in cutlass.range_constexpr(num_epi_stages):            
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):
             tdKVrdKV_r2s = cute.make_fragment(tdKVsdKV_r2s.shape, self.dv_dtype)
             tdKVrdKV_r2s.fill(0)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
@@ -2422,6 +2420,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.use_block_sparsity):
                 (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_block_sparse_bwd_sm100(
                     blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
                     n_block,
                     reduce_dQaccum_step_fn,
                     dQ_consumer_state,

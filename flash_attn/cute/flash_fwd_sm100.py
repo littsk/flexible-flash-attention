@@ -1613,6 +1613,11 @@ class FlashAttentionForwardSm100:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         mbar_s0_s1_sequence_offset = self.mbar_s0_s1_sequence_offset + warp_idx_in_wg
+        arb_multi_batch, arb_multi_heads = False, False
+        if const_expr(self.is_arbitrary):
+            func = aux_tensors[0]
+            arb_multi_heads = func.shape[1] > 1
+            arb_multi_batch = func.shape[0] > 1
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1630,8 +1635,8 @@ class FlashAttentionForwardSm100:
                 mask_local=self.is_local,
                 mask_arbitrary=self.is_arbitrary,
                 func_num=self.func_num,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
+                batch_idx=batch_idx if arb_multi_batch else 0,
+                head_idx=head_idx if arb_multi_heads else 0,
                 aux_tensors=aux_tensors,
             )
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
@@ -1899,7 +1904,6 @@ class FlashAttentionForwardSm100:
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
-        # print(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
@@ -1922,7 +1926,6 @@ class FlashAttentionForwardSm100:
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
-        # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
