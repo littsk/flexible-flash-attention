@@ -67,6 +67,26 @@ ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TR
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
+DISABLE_ARBITRARY = os.getenv("FLASH_ATTENTION_DISABLE_ARBITRARY", "FALSE") == "TRUE"
+# NUM_FUNC is a comma-separated list of func_num values to compile, e.g., "1,3,5"
+# Valid values are odd numbers from 1 to 33
+# These values are used for template instantiation, not for separate .cu files
+# Use smaller values where possible; smaller values yield better performance.
+NUM_FUNC_STR = os.getenv("FLASH_ATTENTION_NUM_FUNC", "1")
+NUM_FUNC_VALUES = []
+if not DISABLE_ARBITRARY:
+    for x in NUM_FUNC_STR.split(","):
+        x = x.strip()
+        if x:
+            val = int(x)
+            if val > 33:
+                raise ValueError(f"NUM_FUNC value {val} exceeds maximum allowed value 33")
+            if val <= 0 or val % 2 == 0:
+                raise ValueError(f"NUM_FUNC value {val} must be a positive odd number")
+            NUM_FUNC_VALUES.append(val)
+    if not NUM_FUNC_VALUES:
+        NUM_FUNC_VALUES = [1]  # default
+
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
 # and pass "-gencode arch=compute_sm80,code=sm_80" to files ending in '_sm80.cu'
@@ -105,6 +125,8 @@ def create_build_config_file():
             "FLASHATTENTION_ENABLE_VCOLMAJOR": ENABLE_VCOLMAJOR,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF64": DISABLE_HDIMDIFF64,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF192": DISABLE_HDIMDIFF192,
+            "FLASHATTENTION_DISABLE_ARBITRARY": DISABLE_ARBITRARY,
+            "FLASHATTENTION_NUM_FUNC": NUM_FUNC_VALUES if not DISABLE_ARBITRARY else [],
         }
     }
 
@@ -431,6 +453,12 @@ if not SKIP_CUDA_BUILD:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
+    # Auto-generate kernel instantiation files if they don't exist or are empty
+    instantiations_dir = Path(this_dir) / "instantiations"
+    if not instantiations_dir.exists() or not any(instantiations_dir.glob("*.cu")):
+        print("Generating kernel instantiation files...")
+        subprocess.run([sys.executable, "generate_kernels.py", "-o", "instantiations"], cwd=this_dir, check=True)
+
     create_build_config_file()
     check_if_cuda_home_none(PACKAGE_NAME)
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
@@ -516,6 +544,9 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
+        + (["-DFLASHATTENTION_DISABLE_ARBITRARY"] if DISABLE_ARBITRARY else [])
+        # Generate -DFLASHATTENTION_NFUNC_X for each supported NUM_FUNC value
+        + [f"-DFLASHATTENTION_NFUNC_{val}" for val in NUM_FUNC_VALUES]
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -572,11 +603,13 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm80 = []
     
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
+    # Can be overridden by setting FLASH_ATTENTION_FORCE_UNSTABLE_API=TRUE
+    FORCE_UNSTABLE_API = os.getenv("FLASH_ATTENTION_FORCE_UNSTABLE_API", "FALSE") == "TRUE"
     torch_version = parse(torch.__version__)
     target_version = parse("2.9.0.dev20250830")
     stable_args = []
       
-    if torch_version >= target_version:
+    if torch_version >= target_version and not FORCE_UNSTABLE_API:
         flash_api_source = "flash_api_stable.cpp"
         stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
     else:

@@ -6,6 +6,18 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+// Runtime check macro nFunc
+#define FLASH_CHECK(cond, ...)                                                                       \
+    do {                                                                                             \
+        if (!(cond)) {                                                                               \
+            fprintf(stderr, "FlashAttention Arbitrary Mask Function error (%s:%d): ", __FILE__, __LINE__);                   \
+            fprintf(stderr, __VA_ARGS__);                                                            \
+            fprintf(stderr, "\n");                                                                   \
+            exit(1);                                                                                 \
+        }                                                                                            \
+    } while(0)
 
 #define CHECK_CUDA(call)                        \
     do {                                                                                                  \

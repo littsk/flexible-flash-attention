@@ -1468,7 +1468,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             TileScheduler = (
                 SingleTileScheduler
-                if const_expr(not self.is_causal or self.is_local)
+                if const_expr(not self.is_causal or self.is_local or self.is_arbitrary)
                 else SingleTileLPTScheduler
             )
         tile_sched_args = TileSchedulerArguments(
@@ -2100,7 +2100,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state,
                         n_block=n_block_max - 1 - n_tile,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False, mask_causal=False, mask_local=False), # or None
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left
@@ -2220,7 +2220,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Apply mask; mask_seqlen always True for first block
         # Caveat: if full block further right than mask block, seqlen masking is redundant;
         # however, masking is being applied anyway, so essentially no perf hit
-        mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
 
         softmax.online_softmax(acc_S, is_first=is_first_block)
 

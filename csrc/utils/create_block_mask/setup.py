@@ -4,6 +4,8 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+# Project root contains hopper/tile_size.h - for determining tile sizes in sparsity blocks
+project_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 
 # ============================================================================
 # Optimization Control via Environment Variables (for benchmarking)
@@ -92,7 +94,7 @@ setup(
                     "-gencode", "arch=compute_100,code=sm_100",
                 ] + extra_defines,
             },
-            include_dirs=[this_dir],
+            include_dirs=[this_dir, project_root],  # project_root for hopper/tile_size.h
         )
     ],
     cmdclass={"build_ext": BuildExtension},

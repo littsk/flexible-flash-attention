@@ -482,31 +482,18 @@ def consume_block_sparse_loads(
     curr_full_block_idx = full_block_idx
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
-
+    # note: only works for arbitrary mask mode
     if const_expr(not intra_wg_overlap):
         if curr_mask_block_cnt > 0:
             mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1]
             warp_scheduler_barrier_sync()
-            kv_consumer_state = mma_one_n_block(
-                kv_consumer_state,
-                n_block=mask_n_block,
-                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                mask_fn=partial(
-                    mask_fn,
-                    mask_mod=mask_mod,
-                    mask_seqlen=True,
-                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
-                ),
-                is_first_n_block=True,
-            )
-            O_should_accumulate = True
-            for i in cutlass.range(1, curr_mask_block_cnt):
+            for i in cutlass.range(0, curr_mask_block_cnt):
                 mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
+                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False), # arbitrary mask do not need to check seqlen_k
                     is_first_n_block=False,
                 )
                 O_should_accumulate = True
@@ -515,45 +502,16 @@ def consume_block_sparse_loads(
 
         if curr_full_block_cnt > 0:
             full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1]
-            if curr_mask_block_cnt == 0:
-                warp_scheduler_barrier_sync()
+            for i in cutlass.range(0, curr_full_block_cnt):
+                full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
-                    is_first_n_block=True,
-                )
-                O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=full_n_block,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_seqlen=False),
-                        is_first_n_block=False,
-                    )
-                    O_should_accumulate = True
-            else:
-                kv_consumer_state = mma_one_n_block(
-                    kv_consumer_state,
-                    n_block=full_n_block,
-                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    mask_fn=None,
                     is_first_n_block=False,
                 )
                 O_should_accumulate = True
-                for i in cutlass.range(1, curr_full_block_cnt):
-                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
-                    kv_consumer_state = mma_one_n_block(
-                        kv_consumer_state,
-                        n_block=full_n_block,
-                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
-                        is_first_n_block=False,
-                    )
-                    O_should_accumulate = True
             warp_scheduler_barrier_arrive()
     else:
         if curr_mask_block_cnt > 0:
@@ -564,7 +522,7 @@ def consume_block_sparse_loads(
                 mask_fn=partial(
                     mask_fn,
                     mask_mod=mask_mod,
-                    mask_seqlen=True,
+                    mask_seqlen=False, # arbitrary mask do not need to check seqlen_k
                     fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
                 ),
                 score_mod_fn=score_mod_fn,
@@ -586,7 +544,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = process_first_half_block(
                     n_block=full_n_block,
                     kv_consumer_state=kv_consumer_state,
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    mask_fn=None,
                     score_mod_fn=score_mod_fn,
                     is_first_block=True,
                 )
@@ -595,7 +553,7 @@ def consume_block_sparse_loads(
                     kv_consumer_state,
                     n_block=full_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    mask_fn=None,
                 )
                 O_should_accumulate = True
             for i in cutlass.range(1, curr_full_block_cnt):
@@ -604,7 +562,7 @@ def consume_block_sparse_loads(
                     kv_consumer_state,
                     n_block=full_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+                    mask_fn=None,
                 )
                 O_should_accumulate = True
 

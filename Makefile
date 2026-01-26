@@ -2,7 +2,7 @@
 
 # Set ARBITRARY=1 to use test_arbitrary_mask.py, otherwise use test_flash_attn.py
 # Example: make fm ARBITRARY=1
-ARBITRARY ?= 0
+ARBITRARY ?= 1
 ifeq ($(ARBITRARY),1)
     TEST_FILE = tests/cute/test_arbitrary_mask.py
 else

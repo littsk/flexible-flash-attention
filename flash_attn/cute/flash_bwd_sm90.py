@@ -596,7 +596,7 @@ class FlashAttentionBackwardSm90:
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx < 4:
-            # cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
+            cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
             if warp_idx == 0:
                 self.load(
                     mQ,
@@ -631,7 +631,7 @@ class FlashAttentionBackwardSm90:
                     )
                 self.dQaccum_store(mdQaccum, sdQaccum, block_info, TileSchedulerCls, SeqlenInfoCls, blocksparse_tensors)
         else:
-            # cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
+            cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
             self.mma(
@@ -1005,6 +1005,7 @@ class FlashAttentionBackwardSm90:
             if const_expr(not self.use_block_sparsity):
                 m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
                 dKV_accumulate = False
+                # TODO: fine control mask_fn execution
                 for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                     consumer_state_Q, consumer_state_dO = mma_one_m_block_all(
                         m_block,
