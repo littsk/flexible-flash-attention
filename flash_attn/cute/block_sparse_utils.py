@@ -487,13 +487,26 @@ def consume_block_sparse_loads(
         if curr_mask_block_cnt > 0:
             mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1]
             warp_scheduler_barrier_sync()
-            for i in cutlass.range(0, curr_mask_block_cnt):
+            kv_consumer_state = mma_one_n_block(
+                kv_consumer_state,
+                n_block=mask_n_block,
+                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                mask_fn=partial(
+                    mask_fn,
+                    mask_mod=mask_mod,
+                    mask_seqlen=False,  # arbitrary mask do not need to check seqlen_k
+                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+                ),
+                is_first_n_block=True,
+            )
+            O_should_accumulate = True
+            for i in cutlass.range(1, curr_mask_block_cnt):
                 mask_n_block = curr_mask_block_idx[curr_mask_block_offset + curr_mask_block_cnt - 1 - i]
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                    mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False), # arbitrary mask do not need to check seqlen_k
+                    mask_fn=None,
                     is_first_n_block=False,
                 )
                 O_should_accumulate = True
@@ -502,8 +515,27 @@ def consume_block_sparse_loads(
 
         if curr_full_block_cnt > 0:
             full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1]
-            for i in cutlass.range(0, curr_full_block_cnt):
-                full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+            if curr_mask_block_cnt == 0:
+                warp_scheduler_barrier_sync()
+                kv_consumer_state = mma_one_n_block(
+                    kv_consumer_state,
+                    n_block=full_n_block,
+                    mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                    mask_fn=None,
+                    is_first_n_block=True,
+                )
+                O_should_accumulate = True
+                for i in cutlass.range(1, curr_full_block_cnt):
+                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=full_n_block,
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=None,
+                        is_first_n_block=False,
+                    )
+                    O_should_accumulate = True
+            else:
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
@@ -512,6 +544,16 @@ def consume_block_sparse_loads(
                     is_first_n_block=False,
                 )
                 O_should_accumulate = True
+                for i in cutlass.range(1, curr_full_block_cnt):
+                    full_n_block = curr_full_block_idx[curr_full_block_offset + curr_full_block_cnt - 1 - i]
+                    kv_consumer_state = mma_one_n_block(
+                        kv_consumer_state,
+                        n_block=full_n_block,
+                        mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=None,
+                        is_first_n_block=False,
+                    )
+                    O_should_accumulate = True
             warp_scheduler_barrier_arrive()
     else:
         if curr_mask_block_cnt > 0:

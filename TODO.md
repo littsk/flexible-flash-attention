@@ -9,6 +9,7 @@ for full block
   not first (non mask)
 4. 编译过于耗时，如何加速编译 (把 casual local 提出来？) （如果 dsl ok，优先级低）
 5. PackGQA存在 error，在 PackGQA 的模式下，arbitrary Func 也应该使用 PackGQA 的空间，即q0h0 q0h1 q0h2... q1h0 q1h1 q1h2...？
-
+6. dsl Hopper bwd check dim=256？ 是否需要 merge 最新的 dsl 代码？
+7. dsl Hopper bwd 目前不支持 gqa mqa
 
 

@@ -592,7 +592,8 @@ def _flash_attn_bwd(
         num_stages_PdS = 2
         SdP_swapAB = True
         dKV_swapAB = False
-        dQ_swapAB = not causal
+        # dQ_swapAB = not causal
+        dQ_swapAB = False  # Jiayu
         AtomLayoutMSdP = 1
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
@@ -631,8 +632,8 @@ def _flash_attn_bwd(
     head_dim_v = v.shape[-1]
 
     if compute_capability == 9:
-        assert head_dim == 128, "For SM 9.0, head_dim must be 128 for now"
-        assert num_head == num_head_kv, "For SM 9.0, num_head must be equal to num_head_kv for now"
+        assert head_dim <= 128, "For SM 9.0, head_dim must less than or equal to 128 for now in hopper dsl code"
+        assert num_head == num_head_kv, "For SM 9.0, num_head must be equal to num_head_kv for now" # TODO: support mqa and gqa in dsl code
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)

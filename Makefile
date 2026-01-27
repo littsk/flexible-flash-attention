@@ -16,8 +16,7 @@ tt:
 	PYTHONPATH=${PWD} python $(TEST_FILE)
 
 vt:
-	PYTHONPATH=${PWD} pytest tests/cute/test_flash_attn.py::test_flash_attn_output -v
-
+	PYTHONPATH=${PWD} pytest $(TEST_FILE)::test_arbitrary_mask -v
 
 # profile fwd and bwd
 bm:

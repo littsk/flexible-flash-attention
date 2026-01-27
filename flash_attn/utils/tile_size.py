@@ -11,9 +11,17 @@ The tile sizes must match between:
 Users should NOT manually set Q_BLOCK_SIZE / KV_BLOCK_SIZE. Instead, use these
 helper functions to get the correct values automatically.
 
+IMPORTANT: DSL and C++ backends have DIFFERENT tile sizes!
+- C++ backend: Tile sizes come from hopper/tile_size.h (varies by headdim, causal, etc.)
+- DSL backend: Tile sizes are fixed (see get_fwd_tile_sizes_dsl / get_bwd_tile_sizes_dsl)
+
+Use the appropriate function based on your backend:
+- C++ backend (hopper): get_fwd_tile_sizes() / get_bwd_tile_sizes()
+- DSL backend (cute):   get_fwd_tile_sizes_dsl() / get_bwd_tile_sizes_dsl()
+
 IMPLEMENTATION NOTE:
 The C++ extension (create_block_mask_cuda) calls hopper/tile_size.h directly,
-which is the SINGLE SOURCE OF TRUTH for tile sizes. This ensures tile sizes
+which is the SINGLE SOURCE OF TRUTH for C++ tile sizes. This ensures tile sizes
 stay in sync with actual kernel implementations.
 
 If the C++ extension is not available, a Python fallback is used (which may
@@ -461,3 +469,139 @@ def validate_tile_sizes(
             f"  Expected: Q_BLOCK_SIZE={expected_q_block_size}, KV_BLOCK_SIZE={expected_kv_block_size}\n"
             f"  Use get_fwd_tile_sizes() or get_bwd_tile_sizes() to get correct values."
         )
+
+
+# =============================================================================
+# DSL Backend Tile Sizes (CUTE DSL / flash_attn.cute.interface)
+# =============================================================================
+# DSL backend uses FIXED tile sizes defined in flash_attn/cute/interface.py
+# These are different from C++ backend tile sizes in hopper/tile_size.h
+#
+# DSL Forward:  (128, 128) for all configurations with block sparsity
+# DSL Backward: (64, 128) for SM90 with arbitrary, (128, 128) for SM100
+# =============================================================================
+
+def get_fwd_tile_sizes_dsl(
+    arch: int = None,
+) -> Tuple[int, int]:
+    """Get forward pass tile sizes for DSL backend (flash_attn.cute.interface).
+    
+    DSL backend uses fixed tile sizes for block sparsity mode:
+    - Forward: (128, 128) for all architectures
+    
+    This is different from C++ backend which varies by headdim.
+    
+    Args:
+        arch: GPU architecture (auto-detected if None). Currently unused but
+              kept for API consistency.
+    
+    Returns:
+        Tuple of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) = (128, 128)
+    """
+    # DSL forward pass always uses (128, 128) for block sparsity mode
+    # See flash_attn/cute/interface.py:
+    #   m_block_size: int = 128,
+    #   n_block_size: int = 128,
+    # Note: n_block_size can be 192 when NOT using block_sparsity, but
+    # for arbitrary mask (which requires block_sparsity), it's always 128
+    return (128, 128)
+
+
+def get_bwd_tile_sizes_dsl(
+    arch: int = None,
+    is_causal: bool = False,
+    is_arbitrary: bool = False,
+) -> Tuple[int, int]:
+    """Get backward pass tile sizes for DSL backend (flash_attn.cute.interface).
+    
+    DSL backend backward tile sizes from flash_attn/cute/interface.py:
+    - SM90: m_block_size = 64 if (causal or arbitrary) else 80, n_block_size = 128
+    - SM100: m_block_size = 128, n_block_size = 128
+    
+    Args:
+        arch: GPU architecture (auto-detected if None)
+        is_causal: Whether using causal attention
+        is_arbitrary: Whether using arbitrary mask
+    
+    Returns:
+        Tuple of (Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    """
+    if arch is None:
+        arch = get_arch()
+    
+    # From interface.py _flash_attn_bwd:
+    # if compute_capability == 9:
+    #     m_block_size = 64 if (causal or arbitrary) else 80
+    #     n_block_size = 128
+    # else:  # SM100
+    #     m_block_size = 128
+    #     n_block_size = 128
+    
+    if arch >= 100:
+        return (128, 128)
+    elif arch >= 90:
+        m_block_size = 64 if (is_causal or is_arbitrary) else 80
+        return (m_block_size, 128)
+    else:
+        # DSL doesn't support SM8x, but provide fallback
+        return (64, 128)
+
+
+def get_tile_sizes_by_backend(
+    backend: str,
+    pass_type: str = "forward",
+    arch: int = None,
+    headdim: int = 128,
+    is_causal: bool = False,
+    is_local: bool = False,
+    is_arbitrary: bool = False,
+    has_softcap: bool = False,
+) -> Tuple[int, int]:
+    """Get tile sizes based on backend type.
+    
+    This is a convenience function that selects the appropriate tile size
+    function based on the backend.
+    
+    Args:
+        backend: Either "cute" (DSL) or "hopper" (C++)
+        pass_type: Either "forward" or "backward"
+        arch: GPU architecture (auto-detected if None)
+        headdim: Head dimension (only used for C++ backend)
+        is_causal: Whether using causal attention
+        is_local: Whether using local attention
+        is_arbitrary: Whether using arbitrary mask
+        has_softcap: Whether using softcap (only for backward)
+    
+    Returns:
+        Tuple of (Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+    
+    Example:
+        # For DSL backend
+        fwd_q, fwd_kv = get_tile_sizes_by_backend("cute", "forward")
+        bwd_q, bwd_kv = get_tile_sizes_by_backend("cute", "backward", is_arbitrary=True)
+        
+        # For C++ backend
+        fwd_q, fwd_kv = get_tile_sizes_by_backend("hopper", "forward", headdim=128, is_arbitrary=True)
+        bwd_q, bwd_kv = get_tile_sizes_by_backend("hopper", "backward", headdim=128, is_arbitrary=True)
+    """
+    if arch is None:
+        arch = get_arch()
+    
+    if backend == "cute":
+        # DSL backend: fixed tile sizes
+        if pass_type == "forward":
+            return get_fwd_tile_sizes_dsl(arch=arch)
+        else:
+            return get_bwd_tile_sizes_dsl(arch=arch, is_causal=is_causal, is_arbitrary=is_arbitrary)
+    else:
+        # C++ backend (hopper): variable tile sizes from tile_size.h
+        if pass_type == "forward":
+            return get_fwd_tile_sizes(
+                arch=arch, headdim=headdim, is_causal=is_causal,
+                is_local=is_local, is_arbitrary=is_arbitrary
+            )
+        else:
+            return get_bwd_tile_sizes(
+                arch=arch, headdim=headdim, is_causal=is_causal,
+                is_local=is_local, is_arbitrary=is_arbitrary, has_softcap=has_softcap
+            )

@@ -65,7 +65,11 @@ else:
     )
 
 # Import tile size utilities for automatic tile size detection
-from flash_attn.utils.tile_size import get_fwd_tile_sizes, get_bwd_tile_sizes, get_arch
+from flash_attn.utils.tile_size import (
+    get_fwd_tile_sizes, get_bwd_tile_sizes, get_arch,
+    get_fwd_tile_sizes_dsl, get_bwd_tile_sizes_dsl,
+    get_tile_sizes_by_backend,
+)
 
 # Import arbitrary_func_tensor from mask_definitions
 from flash_attn.cute.mask_definitions import arbitrary_func_tensor
@@ -465,13 +469,19 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
         def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
             return flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func)
 
-        fwd_q_block, fwd_kv_block = get_fwd_tile_sizes(
-            arch=arch, headdim=headdim, is_causal=causal, is_local=False, is_arbitrary=True,
+        # Get tile sizes based on backend:
+        # - C++ backend (hopper): uses tile_size.h (varies by headdim)
+        # - DSL backend (cute): uses fixed tile sizes (128, 128 for fwd)
+        fwd_q_block, fwd_kv_block = get_tile_sizes_by_backend(
+            backend=BACKEND, pass_type="forward", arch=arch, headdim=headdim,
+            is_causal=causal, is_local=False, is_arbitrary=True,
         )
-        bwd_q_block, bwd_kv_block = get_bwd_tile_sizes(
-            arch=arch, headdim=headdim, is_causal=causal, is_local=False, is_arbitrary=True,
+        bwd_q_block, bwd_kv_block = get_tile_sizes_by_backend(
+            backend=BACKEND, pass_type="backward", arch=arch, headdim=headdim,
+            is_causal=causal, is_local=False, is_arbitrary=True,
         )
         
+        print(f"  Backend: {BACKEND}")
         print(f"  Forward (Q2K): Q_BLOCK={fwd_q_block}, KV_BLOCK={fwd_kv_block}")
         print(f"  Backward (K2Q): Q_BLOCK={bwd_q_block}, KV_BLOCK={bwd_kv_block}")
 
@@ -681,6 +691,15 @@ def test_arbitrary_mask(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use
     if COMPUTE_CAPABILITY == 10 and headdim not in [64, 128]:
         pytest.skip(f"SM100 does not support headdim={headdim} for arbitrary mask")
 
+    # DSL SM90 limitations (from interface.py):
+    # - headdim must be 128 (backward pass limitation)
+    # - num_head must equal num_head_kv (MHA only, no GQA/MQA)
+    if BACKEND == "cute" and COMPUTE_CAPABILITY == 9:
+        if headdim > 128:
+            pytest.skip(f"DSL SM90 does not support headdim={headdim} (only headdim <= 128 supported)")
+        if kv_mode != "mha":
+            pytest.skip(f"DSL SM90 does not support {kv_mode} mode (only MHA supported)")
+
     # Skip unsupported pattern + use_block_sparsity combinations
     if not use_block_sparsity and pattern not in NATIVE_MASK_PATTERNS:
         pytest.skip(f"Pattern '{pattern}' requires use_block_sparsity=True (not natively supported)")
@@ -885,13 +904,16 @@ def benchmark_arbitrary_mask(
     
     print(f"\n[2/2] Benchmarking Block Sparsity + Arbitrary mask ({pattern})...")
     
-    # Get tile sizes
-    fwd_q_block, fwd_kv_block = get_fwd_tile_sizes(
-        arch=arch, headdim=headdim, is_causal=False, is_local=False, is_arbitrary=True,
+    # Get tile sizes based on backend
+    fwd_q_block, fwd_kv_block = get_tile_sizes_by_backend(
+        backend=BACKEND, pass_type="forward", arch=arch, headdim=headdim,
+        is_causal=False, is_local=False, is_arbitrary=True,
     )
-    bwd_q_block, bwd_kv_block = get_bwd_tile_sizes(
-        arch=arch, headdim=headdim, is_causal=False, is_local=False, is_arbitrary=True,
+    bwd_q_block, bwd_kv_block = get_tile_sizes_by_backend(
+        backend=BACKEND, pass_type="backward", arch=arch, headdim=headdim,
+        is_causal=False, is_local=False, is_arbitrary=True,
     )
+    print(f"  Backend: {BACKEND}")
     print(f"  Forward (Q2K): Q_BLOCK={fwd_q_block}, KV_BLOCK={fwd_kv_block}")
     print(f"  Backward (K2Q): Q_BLOCK={bwd_q_block}, KV_BLOCK={bwd_kv_block}")
     
