@@ -1142,7 +1142,6 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     full_n_block,
-                    # mask_fn=partial(mask_fn_none, mask_seqlen=False),
                     mask_fn=None,
                 )
 
@@ -1213,6 +1212,66 @@ def compute_block_sparse_bwd_sm100(
         consumer_state_dPsum,
         producer_state_dS,
     )
+
+
+@cute.jit
+def get_block_sparse_iteration_info_bwd(
+    blocksparse_tensors: LinearBlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+):
+    """Extract block-sparse iteration info for backward pass (LinearBlockSparseTensors version).
+
+    Returns (curr_mask_cnt, curr_mask_offset, curr_full_cnt, curr_full_offset, total_count).
+    """
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    curr_mask_cnt = mask_block_cnt[n_block]
+    curr_mask_offset = mask_block_offset[n_block]
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_cnt = full_block_cnt[n_block]
+        curr_full_offset = full_block_offset[n_block]
+    else:
+        curr_full_cnt = Int32(0)
+        curr_full_offset = Int32(0)
+
+    total_count = curr_mask_cnt + curr_full_cnt
+
+    return curr_mask_cnt, curr_mask_offset, curr_full_cnt, curr_full_offset, total_count
+
+
+@cute.jit
+def get_m_block_from_iter_bwd(
+    iter_idx,
+    curr_mask_cnt,
+    curr_mask_offset,
+    curr_full_cnt,
+    curr_full_offset,
+    blocksparse_tensors: LinearBlockSparseTensors,
+):
+    """Derive m_block index and is_full_block flag from iteration index (LinearBlockSparseTensors version).
+
+    Returns (m_block, is_full_block):
+        - m_block: The actual Q-tile block index
+        - is_full_block: True if this is a full block (no mask_mod needed)
+    """
+    mask_block_cnt, mask_block_offset, mask_block_idx, full_block_cnt, full_block_offset, full_block_idx = blocksparse_tensors
+
+    m_block = Int32(0)
+    is_full_block = False
+
+    if const_expr(full_block_cnt is not None):
+        if iter_idx < curr_mask_cnt:
+            m_block = mask_block_idx[curr_mask_offset + iter_idx]
+        else:
+            m_block = full_block_idx[curr_full_offset + iter_idx - curr_mask_cnt]
+            is_full_block = True
+    else:
+        m_block = mask_block_idx[curr_mask_offset + iter_idx]
+
+    return m_block, is_full_block
 
 
 @cute.jit

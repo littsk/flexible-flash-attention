@@ -103,6 +103,7 @@ class FlashAttentionForwardSm100:
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
         self.q_stage = 2
+        self.high_precision_e2e = False
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA
@@ -1924,6 +1925,7 @@ class FlashAttentionForwardSm100:
             tSrP_r2t,
             e2e=mask_fn is None and self.head_dim_padded <= 128,
             e2e_freq=self.e2e_freq,
+            high_precision_e2e=self.high_precision_e2e,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

@@ -16,6 +16,7 @@ import math
 from typing import Optional
 from einops import rearrange, repeat
 
+import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
@@ -239,6 +240,7 @@ def _run_mask_test(
     tile_n,
     use_block_sparsity,
     load_tensor=False,
+    deterministic=False,
 ):
     # torch.manual_seed(42)
 
@@ -482,7 +484,7 @@ def _run_mask_test(
         softcap=0.0,
         num_splits=1,
         pack_gqa=False,
-        deterministic=False,
+        deterministic=deterministic,
         mask_mod=None,
         linear_k_block_sparse_tensors=linear_k_block_sparse_mask,
         linear_q_block_sparse_tensors=linear_q_block_sparse_mask,
@@ -543,7 +545,7 @@ def _run_mask_test(
 
 
 def test_arbitrary_mask(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, tile_m, tile_n, load_tensor=False
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, tile_m, tile_n, load_tensor=False, deterministic=False
 ):
     """Test arbitrary mask
     """
@@ -560,20 +562,44 @@ def test_arbitrary_mask(
         tile_m=tile_m,
         tile_n=tile_n,
         use_block_sparsity=use_block_sparsity,
-        load_tensor=load_tensor
+        load_tensor=load_tensor,
+        deterministic=deterministic,
     )
 
 
 if __name__ == "__main__":
+    # Test non-deterministic mode
+    print("=" * 60)
+    print("Testing non-deterministic mode (deterministic=False)")
+    print("=" * 60)
     test_arbitrary_mask(
         seqlen_q=1024,
         seqlen_k=1024,
-        nheads=1,
+        nheads=4,
         kv_mode="mha",
-        headdim=80,
+        headdim=128,
         dtype=torch.bfloat16,
         use_block_sparsity=True,
         tile_m=128,
         tile_n=128,
-        load_tensor=False
+        load_tensor=False,
+        deterministic=False,
+    )
+    
+    # Test deterministic mode
+    print("\n" + "=" * 60)
+    print("Testing deterministic mode (deterministic=True)")
+    print("=" * 60)
+    test_arbitrary_mask(
+        seqlen_q=1024,
+        seqlen_k=1024,
+        nheads=4,
+        kv_mode="mha",
+        headdim=128,
+        dtype=torch.bfloat16,
+        use_block_sparsity=True,
+        tile_m=128,
+        tile_n=128,
+        load_tensor=False,
+        deterministic=True,
     )
