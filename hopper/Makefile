@@ -32,6 +32,10 @@ NUM_FUNC ?= 3
 
 ARBITRARY_TEST ?= 1
 
+# Flex attention reference: 0=disable (use CUDA kernel only), 1=enable (use PyTorch flex_attention)
+# Set to 0 if your PyTorch version doesn't support flex_attention
+FLEXATTN ?= 0
+
 ON_VALUES := 1 true TRUE yes YES on ON
 bool_false_if_on = $(if $(filter $(ON_VALUES),$($(1))),FALSE,TRUE)
 bool_true_if_on  = $(if $(filter $(ON_VALUES),$($(1))),TRUE,FALSE)
@@ -59,6 +63,7 @@ export FLASH_ATTENTION_DISABLE_HDIMDIFF192 := $(call bool_false_if_on,HDIMDIFF19
 export FLASH_ATTENTION_FORCE_UNSTABLE_API := $(call bool_true_if_on,FORCE_UNSTABLE_API)
 export FLASH_ATTENTION_DISABLE_ARBITRARY := $(call bool_false_if_on,ARBITRARY)
 export FLASH_ATTENTION_NUM_FUNC := $(NUM_FUNC)
+export DISABLE_FLEX_ATTENTION := $(call bool_false_if_on,FLEXATTN)
 
 .PHONY: install show_flags help clean fast generate tt vt fm
 
@@ -145,6 +150,7 @@ show_flags:
 	@echo " FORCE_UNSTABLE_API=$(FORCE_UNSTABLE_API) -> FLASH_ATTENTION_FORCE_UNSTABLE_API=$(FLASH_ATTENTION_FORCE_UNSTABLE_API)"
 	@echo " ARBITRARY=$(ARBITRARY) -> FLASH_ATTENTION_DISABLE_ARBITRARY=$(FLASH_ATTENTION_DISABLE_ARBITRARY)"
 	@echo " NUM_FUNC=$(NUM_FUNC) -> FLASH_ATTENTION_NUM_FUNC=$(FLASH_ATTENTION_NUM_FUNC)"
+	@echo " FLEXATTN=$(FLEXATTN) -> DISABLE_FLEX_ATTENTION=$(DISABLE_FLEX_ATTENTION)"
 
 
 

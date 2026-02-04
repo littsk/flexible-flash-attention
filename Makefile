@@ -9,6 +9,15 @@ else
     TEST_FILE = tests/cute/test_flash_attn.py
 endif
 
+# Flex attention reference: 0=disable (use CUDA kernel only), 1=enable (use PyTorch flex_attention)
+# Set to 0 if your PyTorch version doesn't support flex_attention
+FLEXATTN ?= 1
+ifeq ($(FLEXATTN),1)
+    export DISABLE_FLEX_ATTENTION := FALSE
+else
+    export DISABLE_FLEX_ATTENTION := TRUE
+endif
+
 install:
 	bash install.sh editable
 

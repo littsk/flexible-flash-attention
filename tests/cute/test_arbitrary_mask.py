@@ -13,9 +13,22 @@ from typing import Optional, NamedTuple
 
 import torch
 import pytest
-from torch.nn.attention.flex_attention import create_block_mask
 import torch.nn.functional as F
 from einops import repeat
+
+# Try to import flex_attention's create_block_mask
+# Default: disabled (use CUDA kernel). Set DISABLE_FLEX_ATTENTION=FALSE to enable.
+DISABLE_FLEX_ATTENTION = os.getenv("DISABLE_FLEX_ATTENTION", "TRUE") == "TRUE"
+
+try:
+    if DISABLE_FLEX_ATTENTION:
+        raise ImportError("Flex attention disabled by environment variable")
+    from torch.nn.attention.flex_attention import create_block_mask
+    HAS_FLEX_ATTENTION = True
+except ImportError:
+    create_block_mask = None
+    HAS_FLEX_ATTENTION = False
+    print("Warning: flex_attention not available. Will use CUDA kernel for block mask creation.")
 
 # ============================================================================
 # Environment variables and configuration (following test_flash_attn.py style)
@@ -487,38 +500,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
         print(f"  Forward (Q2K): Q_BLOCK={fwd_q_block}, KV_BLOCK={fwd_kv_block}")
         print(f"  Backward (K2Q): Q_BLOCK={bwd_q_block}, KV_BLOCK={bwd_kv_block}")
 
-        # Create block masks using PyTorch reference
-        # Use func_batch and func_nheads to match arbitrary_func dimensions
-        # This ensures b and h indices in mask_mod_flex are valid
-        bm_fwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
-                                    BLOCK_SIZE=(fwd_q_block, fwd_kv_block))
-        
-        if isinstance(bm_fwd.as_tuple()[0], int):
-            _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
-        else:
-            k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
-
-        k_block_sparse = BlockSparseTensorsTorch(
-            mask_block_cnt=k_mask_cnt, mask_block_idx=k_mask_idx,
-            full_block_cnt=k_full_cnt, full_block_idx=k_full_idx,
-        )
-        ref_linear_k = bhqk_to_linear_sparse_tensors_local(k_block_sparse)
-
-        bm_bwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
-                                    BLOCK_SIZE=(bwd_q_block, bwd_kv_block))
-        
-        if isinstance(bm_fwd.as_tuple()[0], int):
-            _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
-        else:
-            _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
-
-        q_block_sparse = BlockSparseTensorsTorch(
-            mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
-            full_block_cnt=q_full_cnt, full_block_idx=q_full_idx,
-        )
-        ref_linear_q = bhqk_to_linear_sparse_tensors_local(q_block_sparse)
-
-        # Create block masks using CUDA kernel and compare with PyTorch reference
+        # Create block masks using CUDA kernel (preferred) or PyTorch flex_attention reference
         if HAS_CREATE_BLOCK_MASK_CUDA:
             # Q2K (Forward)
             (cuda_k_mask_cnt, cuda_k_mask_offset, cuda_k_mask_idx,
@@ -529,7 +511,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                     check_q_boundary=True
                 )
 
-            cuda_linear_k = LinearBlockSparseTensors(
+            linear_k = LinearBlockSparseTensors(
                 mask_block_cnt=cuda_k_mask_cnt,
                 mask_block_offset=cuda_k_mask_offset,
                 mask_block_idx=cuda_k_mask_idx,
@@ -546,7 +528,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                     Q_BLOCK_SIZE=bwd_q_block, KV_BLOCK_SIZE=bwd_kv_block,
                 )
 
-            cuda_linear_q = LinearBlockSparseTensors(
+            linear_q = LinearBlockSparseTensors(
                 mask_block_cnt=cuda_q_mask_cnt,
                 mask_block_offset=cuda_q_mask_offset,
                 mask_block_idx=cuda_q_mask_idx,
@@ -554,22 +536,84 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                 full_block_offset=cuda_q_full_offset,
                 full_block_idx=cuda_q_full_idx,
             )
+            
+            # Optionally compare with PyTorch flex_attention reference (if available)
+            if HAS_FLEX_ATTENTION:
+                bm_fwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
+                                            BLOCK_SIZE=(fwd_q_block, fwd_kv_block))
+                
+                if isinstance(bm_fwd.as_tuple()[0], int):
+                    _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
+                else:
+                    k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
 
-            # Compare CUDA kernel vs PyTorch reference
-            print("\nComparing CUDA kernel vs PyTorch reference:")
-            k_match = compare_linear_sparse_tensors(cuda_linear_k, ref_linear_k, "Q2K")
-            q_match = compare_linear_sparse_tensors(cuda_linear_q, ref_linear_q, "K2Q")
+                k_block_sparse = BlockSparseTensorsTorch(
+                    mask_block_cnt=k_mask_cnt, mask_block_idx=k_mask_idx,
+                    full_block_cnt=k_full_cnt, full_block_idx=k_full_idx,
+                )
+                ref_linear_k = bhqk_to_linear_sparse_tensors_local(k_block_sparse)
 
-            if k_match and q_match:
-                print("✓ All CUDA kernel outputs match PyTorch reference!")
+                bm_bwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
+                                            BLOCK_SIZE=(bwd_q_block, bwd_kv_block))
+                
+                if isinstance(bm_fwd.as_tuple()[0], int):
+                    _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+                else:
+                    _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+
+                q_block_sparse = BlockSparseTensorsTorch(
+                    mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+                    full_block_cnt=q_full_cnt, full_block_idx=q_full_idx,
+                )
+                ref_linear_q = bhqk_to_linear_sparse_tensors_local(q_block_sparse)
+
+                # Compare CUDA kernel vs PyTorch reference
+                print("\nComparing CUDA kernel vs PyTorch flex_attention reference:")
+                k_match = compare_linear_sparse_tensors(linear_k, ref_linear_k, "Q2K")
+                q_match = compare_linear_sparse_tensors(linear_q, ref_linear_q, "K2Q")
+
+                if k_match and q_match:
+                    print("✓ All CUDA kernel outputs match PyTorch reference!")
+                else:
+                    print("✗ Some outputs do not match!")
             else:
-                print("✗ Some outputs do not match!")
+                print("\nUsing CUDA kernel for block mask creation (flex_attention not available)")
 
-            linear_k = cuda_linear_k
-            linear_q = cuda_linear_q
+        elif HAS_FLEX_ATTENTION:
+            # Fallback to PyTorch flex_attention reference
+            print("\nUsing PyTorch flex_attention for block mask creation (CUDA kernel not available)")
+            bm_fwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
+                                        BLOCK_SIZE=(fwd_q_block, fwd_kv_block))
+            
+            if isinstance(bm_fwd.as_tuple()[0], int):
+                _, _, k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
+            else:
+                k_mask_cnt, k_mask_idx, k_full_cnt, k_full_idx, *_ = bm_fwd.as_tuple()
+
+            k_block_sparse = BlockSparseTensorsTorch(
+                mask_block_cnt=k_mask_cnt, mask_block_idx=k_mask_idx,
+                full_block_cnt=k_full_cnt, full_block_idx=k_full_idx,
+            )
+            linear_k = bhqk_to_linear_sparse_tensors_local(k_block_sparse)
+
+            bm_bwd = create_block_mask(mask_mod_flex, func_batch, func_nheads, seqlen_q, seqlen_k, device="cuda",
+                                        BLOCK_SIZE=(bwd_q_block, bwd_kv_block))
+            
+            if isinstance(bm_fwd.as_tuple()[0], int):
+                _, _, _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+            else:
+                _, _, _, _, q_mask_cnt, q_mask_idx, q_full_cnt, q_full_idx, *_ = bm_bwd.as_tuple()
+
+            q_block_sparse = BlockSparseTensorsTorch(
+                mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+                full_block_cnt=q_full_cnt, full_block_idx=q_full_idx,
+            )
+            linear_q = bhqk_to_linear_sparse_tensors_local(q_block_sparse)
         else:
-            linear_k = ref_linear_k
-            linear_q = ref_linear_q
+            raise RuntimeError(
+                "Neither CUDA kernel nor flex_attention available for block mask creation. "
+                "Please either build create_block_mask_cuda or upgrade PyTorch to support flex_attention."
+            )
 
         # Run flash attention with block sparsity
         if BACKEND == "hopper":
@@ -964,8 +1008,9 @@ def benchmark_arbitrary_mask(
             full_block_idx=q_full_idx,
         )
         print(f"  K2Q: mask_cnt={q_mask_cnt.shape}, mask_idx={q_mask_idx.shape}, full_idx={q_full_idx.shape}")
-    else:
-        # Fallback to PyTorch create_block_mask
+    elif HAS_FLEX_ATTENTION:
+        # Fallback to PyTorch create_block_mask (flex_attention)
+        print("  Using PyTorch flex_attention for block mask creation")
         def mask_mod_flex(b, h, q_idx, kv_idx, arbitrary_func=arbitrary_func):
             return flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func)
         
@@ -996,6 +1041,11 @@ def benchmark_arbitrary_mask(
             full_block_cnt=q_full_cnt, full_block_idx=q_full_idx,
         )
         linear_q = bhqk_to_linear_sparse_tensors_local(q_block_sparse)
+    else:
+        raise RuntimeError(
+            "Neither CUDA kernel nor flex_attention available for block mask creation. "
+            "Please either build create_block_mask_cuda or upgrade PyTorch to support flex_attention."
+        )
     
     # Create tensors without grad for forward-only benchmark
     device = "cuda"
