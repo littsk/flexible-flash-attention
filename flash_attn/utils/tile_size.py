@@ -504,7 +504,10 @@ def get_fwd_tile_sizes_dsl(
     #   n_block_size: int = 128,
     # Note: n_block_size can be 192 when NOT using block_sparsity, but
     # for arbitrary mask (which requires block_sparsity), it's always 128
-    return (128, 128)
+    if arch >= 100:
+        return (128*2, 128)
+    elif arch >= 90:
+        return (128, 128)
 
 
 def get_bwd_tile_sizes_dsl(

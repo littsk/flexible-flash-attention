@@ -82,6 +82,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=True,
         qhead_broadcast=True,
+        deterministic=False,
     )
     
     # Test with block sparsity (causal pattern via arbitrary mask)
@@ -100,6 +101,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=True,
         qhead_broadcast=True,
+        deterministic=False,
     )
     
     # Test without broadcast
@@ -118,6 +120,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=False,
         qhead_broadcast=False,
+        deterministic=False,
     )
     
     # Run benchmark (use GQA mode for better compatibility)
@@ -138,4 +141,5 @@ if __name__ == "__main__":
         qhead_broadcast=True,
         num_warmup=5,
         num_runs=20,
+        deterministic=False,
     )

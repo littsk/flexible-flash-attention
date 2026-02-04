@@ -26,6 +26,8 @@ from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads_bwd_sm100,
     compute_block_sparse_bwd_sm100,
     reduce_block_sparse_bwd_sm100,
+    get_block_sparse_iteration_info_bwd,
+    get_m_block_from_iter_bwd,
 )
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
@@ -573,7 +575,7 @@ class FlashAttentionBackwardSm100:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = self.is_causal and self.deterministic
+        self.spt = (self.is_causal or self.is_local or self.is_arbitrary) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -2391,162 +2393,176 @@ class FlashAttentionBackwardSm100:
                 gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
             )
 
-            mdQ_semaphore_cur = None
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             delay_semaphore_release = self.is_causal
             n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
-            reduce_dQaccum_step_fn = partial(self.reduce_dQaccum_step,
-                n_block=n_block,
-                n_block_global_max=n_block_global_max,
-                tdQtdQ_t2r=tdQtdQ_t2r,
-                tdQrdQ_t2r_shape=tdQrdQ_t2r_shape,
-                tdQsdQ=tdQsdQ,
-                gdQaccum=gdQaccum,
-                sdQaccum=sdQaccum,
-                thr_copy_t2r=thr_copy_t2r,
-                thr_copy_dQaccum_r2s=thr_copy_dQaccum_r2s,
-                seqlen=seqlen,
-                pipeline_dQ=pipeline_dQ,
-                mdQ_semaphore_cur=mdQ_semaphore_cur,
-                is_tma_warp=is_tma_warp,
-                read_flag=read_flag,
-                delay_semaphore_release=delay_semaphore_release,
-                tidx=tidx
-            )
-
+            # Get iteration info for block sparsity
+            # Block sparsity: iterate over sparse m_block count and derive actual m_block
+            # from mask_block_idx/full_block_idx tensors. Dense: iterate m_block_min..m_block_max directly.
             if const_expr(self.use_block_sparsity):
-                (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_block_sparse_bwd_sm100(
+                (
+                    curr_mask_cnt,
+                    curr_mask_offset,
+                    curr_full_cnt,
+                    curr_full_offset,
+                    loop_count,
+                ) = get_block_sparse_iteration_info_bwd(
                     blocksparse_tensors,
                     batch_idx,
                     head_idx,
                     n_block,
-                    reduce_dQaccum_step_fn,
-                    dQ_consumer_state,
-                    dQ_tma_store_producer_state
                 )
+                process_tile = loop_count > Int32(0)
             else:
-                for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
-                    (dQ_consumer_state, dQ_tma_store_producer_state) = reduce_dQaccum_step_fn(
-                        m_block=m_block,
-                        dQ_consumer_state=dQ_consumer_state,
-                        dQ_tma_store_producer_state=dQ_tma_store_producer_state,
-                    )
+                process_tile = m_block_min < m_block_max
+                loop_count = m_block_max - m_block_min
 
-            if is_tma_warp:
-                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-            self.reduce_sync_barrier.arrive_and_wait()
-            # final semaphore release
-            if const_expr(self.deterministic and delay_semaphore_release):
-                barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1)
+            # dQacc_reduce mainloop - unified iteration for both block sparse and dense
+            for iter_idx in cutlass.range(loop_count, unroll=1):
+                if const_expr(self.use_block_sparsity):
+                    m_block, _ = get_m_block_from_iter_bwd(
+                        iter_idx,
+                        curr_mask_cnt,
+                        curr_mask_offset,
+                        curr_full_cnt,
+                        curr_full_offset,
+                        blocksparse_tensors,
+                    )
+                    if m_block_max > 0:
+                        m_block = cutlass.min(m_block, m_block_max - 1)
+                else:
+                    m_block = m_block_min + iter_idx
+
+                pipeline_dQ.consumer_wait(dQ_consumer_state)
+                # TMEM -> RMEM
+                tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
+                cute.arch.fence_view_async_tmem_load()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipeline_dQ.consumer_release(dQ_consumer_state)
+                dQ_consumer_state.advance()
+
+                gdQaccum_cur = gdQaccum[None, None, m_block]
+
+                for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
+                    smem_idx = dQ_tma_store_producer_state.index
+                    tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
+                    tdQrdQ_r2s = cute.make_tensor(
+                        tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
+                    )
+                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                    )
+                    # semaphore acquire
+                    if const_expr(self.deterministic and stage == 0):
+                        if const_expr(self.spt):
+                            n_block_max_for_m_block = min(
+                                n_block_global_max,
+                                cute.ceil_div(
+                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
+                                    self.tile_n,
+                                ),
+                            )
+                            lock_value = n_block_max_for_m_block - 1 - n_block
+                        else:
+                            lock_value = n_block
+                        barrier.wait_eq(
+                            mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value
+                        )
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    # Copy from shared memory to global memory
+                    if is_tma_warp:
+                        with cute.arch.elect_one():
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sdQaccum[None, smem_idx].iterator,
+                                gdQaccum_cur[None, stage].iterator,
+                                self.tma_copy_bytes["dQ"] // 1,
+                            )
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    dQ_tma_store_producer_state.advance()
+                    # semaphore release for prior m_block
+                    # NOTE: In block sparse mode with delay_semaphore_release, we use iter_idx == 0
+                    # instead of m_block > m_block_min to correctly handle non-contiguous m_blocks
+                    if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                        if const_expr(self.use_block_sparsity):
+                            # For block sparse: check if this is NOT the first iteration
+                            if iter_idx > 0:
+                                # Get previous m_block from the sparse iteration
+                                prev_m_block, _ = get_m_block_from_iter_bwd(
+                                    iter_idx - 1,
+                                    curr_mask_cnt,
+                                    curr_mask_offset,
+                                    curr_full_cnt,
+                                    curr_full_offset,
+                                    blocksparse_tensors,
+                                )
+                                if m_block_max > 0:
+                                    prev_m_block = cutlass.min(prev_m_block, m_block_max - 1)
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(prev_m_block, None)].iterator, tidx, 0, 1
+                                )
+                        else:
+                            # For dense: use original logic
+                            if m_block > m_block_min:
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
+                                )
+
+                # semaphore release (non-delay mode)
+                # NOTE: arrive_inc calls red_release which issues membar
+                if const_expr(self.deterministic and not delay_semaphore_release):
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                    self.reduce_sync_barrier.arrive_and_wait()
+                    barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
+
+            # Final cleanup after loop
+            if const_expr(not self.is_local) or m_block_min < m_block_max:
+                if is_tma_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                self.reduce_sync_barrier.arrive_and_wait()
+                # final semaphore release for delay mode
+                if const_expr(self.deterministic and delay_semaphore_release):
+                    if const_expr(self.use_block_sparsity):
+                        # For block sparse: release the last processed m_block
+                        if loop_count > 0:
+                            last_m_block, _ = get_m_block_from_iter_bwd(
+                                loop_count - 1,
+                                curr_mask_cnt,
+                                curr_mask_offset,
+                                curr_full_cnt,
+                                curr_full_offset,
+                                blocksparse_tensors,
+                            )
+                            if m_block_max > 0:
+                                last_m_block = cutlass.min(last_m_block, m_block_max - 1)
+                            barrier.arrive_inc(
+                                mdQ_semaphore_cur[(last_m_block, None)].iterator, tidx, 0, 1
+                            )
+                    else:
+                        # For dense: use original logic
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1
+                        )
+
+            # Handle local window: release semaphores for m_blocks that weren't processed
+            if const_expr(
+                self.deterministic and not self.spt and block_info.window_size_left is not None
+            ):
+                m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
+                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, 1)
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
-    @cute.jit
-    def reduce_dQaccum_step(
-        self,
-        m_block,
-        n_block,
-        n_block_global_max,
-        tdQtdQ_t2r,
-        tdQrdQ_t2r_shape,
-        tdQsdQ,
-        gdQaccum,
-        sdQaccum,
-        thr_copy_t2r,
-        thr_copy_dQaccum_r2s,
-        seqlen,
-        pipeline_dQ,
-        dQ_consumer_state,
-        dQ_tma_store_producer_state,
-        mdQ_semaphore_cur,
-        is_tma_warp,
-        read_flag,
-        delay_semaphore_release,
-        tidx
-    ):
-        pipeline_dQ.consumer_wait(dQ_consumer_state)
-        # TMEM -> RMEM
-        tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
-        cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
-        cute.arch.fence_view_async_tmem_load()
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            pipeline_dQ.consumer_release(dQ_consumer_state)
-        dQ_consumer_state.advance()
-
-        gdQaccum_cur = gdQaccum[None, None, m_block]
-
-        for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
-            smem_idx = dQ_tma_store_producer_state.index
-            tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
-            tdQrdQ_r2s = cute.make_tensor(
-                tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
-            )
-            cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
-            # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
-            # semaphore acquire
-            if const_expr(self.deterministic and stage == 0):
-                if const_expr(self.spt):
-                    n_block_max_for_m_block = min(
-                        n_block_global_max,
-                        cute.ceil_div(
-                            (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                            self.tile_n,
-                        ),
-                    )
-                    lock_value = n_block_max_for_m_block - 1 - n_block
-                else:
-                    lock_value = n_block
-                barrier.wait_eq(
-                    mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value
-                )
-            self.reduce_sync_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                with cute.arch.elect_one():
-                    copy_utils.cpasync_reduce_bulk_add_f32(
-                        sdQaccum[None, smem_idx].iterator,
-                        gdQaccum_cur[None, stage].iterator,
-                        self.tma_copy_bytes["dQ"] // 1,
-                    )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
-            self.reduce_sync_barrier.arrive_and_wait()
-            dQ_tma_store_producer_state.advance()
-            # Directly add to gmem, much slower
-            # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])
-            # assert cute.size(tdQrdQ_r2s) == cute.size(tdQgdQ)
-            # for i in cutlass.range(cute.size(tdQrdQ_r2s) // 4, unroll_full=True):
-            #     copy_utils.atomic_add_fp32x4(
-            #         tdQrdQ_r2s[4 * i],
-            #         tdQrdQ_r2s[4 * i + 1],
-            #         tdQrdQ_r2s[4 * i + 2],
-            #         tdQrdQ_r2s[4 * i + 3],
-            #         utils.elem_pointer(tdQgdQ, 4 * i),
-            #     )
-            # semaphore release for prior m_block
-            if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                if m_block > m_block_min:
-                    barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
-                    )
-
-        # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(self.deterministic and not delay_semaphore_release):
-            if is_tma_warp:
-                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-            self.reduce_sync_barrier.arrive_and_wait()
-            barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
-
-        return dQ_consumer_state, dQ_tma_store_producer_state
 
     @cute.jit
     def epilogue_dKV(

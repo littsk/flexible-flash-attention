@@ -347,7 +347,8 @@ NATIVE_MASK_PATTERNS = ["causal", "full"]  # Patterns that can use kernel's nati
 # ============================================================================
 def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                    use_block_sparsity=True, pattern="causal",
-                   n_func=3, batch_broadcast=True, qhead_broadcast=True):
+                   n_func=3, batch_broadcast=True, qhead_broadcast=True,
+                   deterministic=False):
     """Run arbitrary mask test with automatic tile size detection.
     
     Args:
@@ -360,6 +361,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                         If False, arbitrary_func batch dim = batch_size.
         qhead_broadcast: If True, arbitrary_func head dim = 1 (broadcast).
                         If False, arbitrary_func head dim = nheads (q_head).
+        deterministic: If True, use deterministic mode for backward pass (fixed accumulation order).
     """
     # Set random seed for reproducibility (ensures same behavior in pytest and direct run)
     torch.manual_seed(0)
@@ -424,7 +426,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal, arbitrary=False,
                 window_size=(None, None), softcap=0.0, num_splits=1,
-                pack_gqa=False, deterministic=False,
+                pack_gqa=False, deterministic=deterministic,
             )
         
         # Compute reference for native mask (need separate computations for fp32 and dtype)
@@ -582,7 +584,7 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal, arbitrary=True,
                 window_size=(None, None), softcap=0.0, num_splits=1,
-                pack_gqa=False, deterministic=False, mask_mod=None,
+                pack_gqa=False, deterministic=deterministic, mask_mod=None,
                 linear_k_block_sparse_tensors=linear_k,
                 linear_q_block_sparse_tensors=linear_q,
                 aux_tensors=[arbitrary_func],
@@ -658,8 +660,9 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
 @pytest.mark.parametrize("n_func", [3])  # Number of functions for arbitrary mask (must be odd)
 @pytest.mark.parametrize("batch_broadcast", [True])  # True: func batch=1, False: func batch=batch_size
 @pytest.mark.parametrize("qhead_broadcast", [True])  # True: func head=1, False: func head=nheads
+@pytest.mark.parametrize("deterministic", [True])  # True: deterministic mode for backward pass
 def test_arbitrary_mask(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, pattern,
-                        n_func, batch_broadcast, qhead_broadcast):
+                        n_func, batch_broadcast, qhead_broadcast, deterministic):
     """
     Test arbitrary mask with optional block sparsity.
     
@@ -679,6 +682,7 @@ def test_arbitrary_mask(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use
                         If False, arbitrary_func batch dim = batch_size.
         qhead_broadcast: If True, arbitrary_func head dim = 1 (broadcast).
                         If False, arbitrary_func head dim = nheads (q_head).
+        deterministic: If True, use deterministic mode for backward pass (fixed accumulation order).
     
     Tile sizes are automatically detected based on GPU architecture and headdim.
     """
@@ -717,6 +721,7 @@ def test_arbitrary_mask(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use
         n_func=n_func,
         batch_broadcast=batch_broadcast,
         qhead_broadcast=qhead_broadcast,
+        deterministic=deterministic,
     )
 
 
@@ -737,6 +742,7 @@ def benchmark_arbitrary_mask(
     qhead_broadcast=True,
     num_warmup=5,
     num_runs=20,
+    deterministic=False,
 ):
     """Benchmark comparing block sparsity vs native mask implementation.
     
@@ -754,6 +760,7 @@ def benchmark_arbitrary_mask(
         qhead_broadcast: If True, use nheads=1 for arbitrary_func (broadcast across heads)
         num_warmup: Number of warmup iterations
         num_runs: Number of benchmark iterations
+        deterministic: If True, use deterministic mode for backward pass
     
     Returns:
         Dict with benchmark results
@@ -820,7 +827,7 @@ def benchmark_arbitrary_mask(
                 out, _ = flash_attn_func(
                     q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=causal,
                     arbitrary=False, window_size=(None, None), softcap=0.0,
-                    num_splits=1, pack_gqa=False, deterministic=False,
+                    num_splits=1, pack_gqa=False, deterministic=deterministic,
                 )
         torch.cuda.synchronize()
         
@@ -838,7 +845,7 @@ def benchmark_arbitrary_mask(
                 out, _ = flash_attn_func(
                     q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=causal,
                     arbitrary=False, window_size=(None, None), softcap=0.0,
-                    num_splits=1, pack_gqa=False, deterministic=False,
+                    num_splits=1, pack_gqa=False, deterministic=deterministic,
                 )
         end_event.record()
         torch.cuda.synchronize()
@@ -865,13 +872,13 @@ def benchmark_arbitrary_mask(
                 out = flash_attn_func(
                     q=q_bwd, k=k_bwd, v=v_bwd, softmax_scale=softmax_scale, causal=causal,
                     window_size=(-1, -1), softcap=0.0,
-                    num_splits=1, pack_gqa=None, deterministic=False,
+                    num_splits=1, pack_gqa=None, deterministic=deterministic,
                 )
             else:
                 out, _ = flash_attn_func(
                     q=q_bwd, k=k_bwd, v=v_bwd, softmax_scale=softmax_scale, causal=causal,
                     arbitrary=False, window_size=(None, None), softcap=0.0,
-                    num_splits=1, pack_gqa=False, deterministic=False,
+                    num_splits=1, pack_gqa=False, deterministic=deterministic,
                 )
             
             # Step 2: Backward warmup (only backward, retain_graph=True)
@@ -1008,7 +1015,7 @@ def benchmark_arbitrary_mask(
             out, _ = flash_attn_func(
                 q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=False,
                 arbitrary=True, window_size=(None, None), softcap=0.0,
-                num_splits=1, pack_gqa=False, deterministic=False, mask_mod=None,
+                num_splits=1, pack_gqa=False, deterministic=deterministic, mask_mod=None,
                 linear_k_block_sparse_tensors=linear_k,
                 linear_q_block_sparse_tensors=linear_q,
                 aux_tensors=[arbitrary_func],
@@ -1031,7 +1038,7 @@ def benchmark_arbitrary_mask(
             out, _ = flash_attn_func(
                 q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=False,
                 arbitrary=True, window_size=(None, None), softcap=0.0,
-                num_splits=1, pack_gqa=False, deterministic=False, mask_mod=None,
+                num_splits=1, pack_gqa=False, deterministic=deterministic, mask_mod=None,
                 linear_k_block_sparse_tensors=linear_k,
                 linear_q_block_sparse_tensors=linear_q,
                 aux_tensors=[arbitrary_func],
@@ -1068,7 +1075,7 @@ def benchmark_arbitrary_mask(
             out, _ = flash_attn_func(
                 q=q_bwd, k=k_bwd, v=v_bwd, softmax_scale=softmax_scale, causal=False,
                 arbitrary=True, window_size=(None, None), softcap=0.0,
-                num_splits=1, pack_gqa=False, deterministic=False, mask_mod=None,
+                num_splits=1, pack_gqa=False, deterministic=deterministic, mask_mod=None,
                 linear_k_block_sparse_tensors=linear_k,
                 linear_q_block_sparse_tensors=linear_q,
                 aux_tensors=[arbitrary_func],
@@ -1187,6 +1194,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=True,
         qhead_broadcast=True,
+        deterministic=False,
     )
     
     # Test with block sparsity (causal pattern via arbitrary mask)
@@ -1205,6 +1213,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=True,
         qhead_broadcast=True,
+        deterministic=False,
     )
     
     # Test without broadcast
@@ -1223,6 +1232,7 @@ if __name__ == "__main__":
         n_func=3,
         batch_broadcast=False,
         qhead_broadcast=False,
+        deterministic=False,
     )
     
     # Run benchmark (use GQA mode for better compatibility)
@@ -1243,4 +1253,5 @@ if __name__ == "__main__":
         qhead_broadcast=True,
         num_warmup=5,
         num_runs=20,
+        deterministic=False,
     )
