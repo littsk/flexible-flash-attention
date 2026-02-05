@@ -487,26 +487,28 @@ def get_fwd_tile_sizes_dsl(
     """Get forward pass tile sizes for DSL backend (flash_attn.cute.interface).
     
     DSL backend uses fixed tile sizes for block sparsity mode:
-    - Forward: (128, 128) for all architectures
+    - Forward: (128, 128) for SM90, (256, 128) for SM100
     
     This is different from C++ backend which varies by headdim.
     
     Args:
-        arch: GPU architecture (auto-detected if None). Currently unused but
-              kept for API consistency.
+        arch: GPU architecture (auto-detected if None).
     
     Returns:
-        Tuple of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) = (128, 128)
+        Tuple of (Q_BLOCK_SIZE, KV_BLOCK_SIZE)
     """
-    # DSL forward pass always uses (128, 128) for block sparsity mode
+    if arch is None:
+        arch = get_arch()
+    
+    # DSL forward pass tile sizes for block sparsity mode
     # See flash_attn/cute/interface.py:
     #   m_block_size: int = 128,
     #   n_block_size: int = 128,
     # Note: n_block_size can be 192 when NOT using block_sparsity, but
     # for arbitrary mask (which requires block_sparsity), it's always 128
     if arch >= 100:
-        return (128*2, 128)
-    elif arch >= 90:
+        return (256, 128)
+    else:  # SM90 and below
         return (128, 128)
 
 

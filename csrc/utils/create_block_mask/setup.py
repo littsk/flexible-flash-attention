@@ -89,9 +89,10 @@ setup(
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    "-gencode", "arch=compute_80,code=sm_80",
-                    "-gencode", "arch=compute_90,code=sm_90",
-                    "-gencode", "arch=compute_100,code=sm_100",
+                    # uncomment to compile for specific architectures
+                    # "-gencode", "arch=compute_80,code=sm_80",
+                    # "-gencode", "arch=compute_90,code=sm_90",
+                    # "-gencode", "arch=compute_100,code=sm_100",
                 ] + extra_defines,
             },
             include_dirs=[this_dir, project_root],  # project_root for hopper/tile_size.h

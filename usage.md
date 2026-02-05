@@ -55,17 +55,17 @@ import create_block_mask_cuda
 batch, seqlen, nheads, headdim = 1, 4096, 32, 128
 n_func = 3  # Must be odd
 
-# Create tensors
-q = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16)
-k = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16)
-v = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16)
+# Create tensors (requires_grad=True enables backward pass and returns valid lse)
+q = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+v = torch.randn(batch, seqlen, nheads, headdim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
 # Create arbitrary func (causal pattern, broadcast across batch and heads)
 arbitrary_func = arbitrary_func_tensor(1, 1, n_func, seqlen, seqlen, device="cuda", pattern="causal")
 
-# Get tile sizes for DSL backend (fixed 128x128 for forward)
+# Get tile sizes for DSL backend
 arch = get_arch()
-fwd_q, fwd_kv = get_fwd_tile_sizes_dsl()  # (128, 128)
+fwd_q, fwd_kv = get_fwd_tile_sizes_dsl(arch=arch)  # (128, 128) SM90 / (256, 128) SM100
 bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)  # (64, 128) SM90 / (128, 128) SM100
 
 # Generate block sparsity
@@ -223,7 +223,7 @@ This requires two separate block sparsity structures:
 
 | Backend | Forward Tile Size | Backward Tile Size | Source |
 |---------|-------------------|-------------------|--------|
-| **CUTE DSL** | (128, 128) fixed | (64, 128) SM90 / (128, 128) SM100 | `interface.py` |
+| **CUTE DSL** | (128, 128) SM90 / (256, 128) SM100 | (64, 128) SM90 / (128, 128) SM100 | `interface.py` |
 | **Hopper C++** | Varies by headdim | Varies by headdim | `tile_size.h` |
 
 Use the appropriate function based on your backend:
@@ -240,8 +240,8 @@ arch = get_arch()  # e.g., 90 for Hopper, 100 for Blackwell
 
 # Option 1: Use backend-specific functions
 # For DSL backend (cute):
-fwd_q, fwd_kv = get_fwd_tile_sizes_dsl()                      # Always (128, 128)
-bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)
+fwd_q, fwd_kv = get_fwd_tile_sizes_dsl(arch=arch)             # (128, 128) SM90 / (256, 128) SM100
+bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)  # (64, 128) SM90 / (128, 128) SM100
 
 # For C++ backend (hopper):
 fwd_q, fwd_kv = get_fwd_tile_sizes(arch=arch, headdim=headdim, is_arbitrary=True)
@@ -463,11 +463,11 @@ arbitrary_func = arbitrary_func_tensor(
 
 # =============================================================================
 # Get tile sizes for DSL backend (different from C++ backend!)
-# DSL uses fixed tile sizes: Forward (128, 128), Backward varies by arch
+# DSL uses fixed tile sizes: Forward varies by arch, Backward varies by arch
 # =============================================================================
 arch = get_arch()
-fwd_q_block, fwd_kv_block = get_fwd_tile_sizes_dsl()  # Always (128, 128)
-bwd_q_block, bwd_kv_block = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)
+fwd_q_block, fwd_kv_block = get_fwd_tile_sizes_dsl(arch=arch)  # (128, 128) SM90 / (256, 128) SM100
+bwd_q_block, bwd_kv_block = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)  # (64, 128) SM90 / (128, 128) SM100
 print(f"Arch: {arch}, Forward: ({fwd_q_block}, {fwd_kv_block}), Backward: ({bwd_q_block}, {bwd_kv_block})")
 
 # =============================================================================
@@ -540,6 +540,12 @@ print(f"dQ shape: {q.grad.shape}, dK shape: {k.grad.shape}, dV shape: {v.grad.sh
 ```
 
 ### Complete Workflow (Hopper C++ Backend)
+
+> **Prerequisite**: Before running this example, you must first compile and install the C++ backend:
+> ```bash
+> cd flash-attention/hopper
+> make install ARBITRARY=1 NUM_FUNC=3 HDIM128=1 BACKWARD=1
+> ```
 
 ```python
 import sys
@@ -661,6 +667,10 @@ def flash_attn_func(
 - `linear_k_block_sparse_tensors`: Block sparsity for forward pass (Q2K)
 - `linear_q_block_sparse_tensors`: Block sparsity for backward pass (K2Q)
 
+**Return values**:
+- `output`: Attention output tensor `[B, seqlen_q, H, D]`
+- `lse`: Log-sum-exp values `[B, H, seqlen_q]` (required for backward pass). Note: `lse` is only computed when any input tensor has `requires_grad=True`; otherwise it may be `None`.
+
 ### Tile Size Utility Functions
 
 ```python
@@ -676,9 +686,8 @@ arch = get_arch()  # Returns: 80, 86, 89, 90, or 100
 
 # ===== DSL Backend (CUTE DSL) =====
 # Fixed tile sizes, independent of headdim
-fwd_q, fwd_kv = get_fwd_tile_sizes_dsl()  # Always (128, 128)
-bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)
-# SM90: (64, 128), SM100: (128, 128)
+fwd_q, fwd_kv = get_fwd_tile_sizes_dsl(arch=arch)  # (128, 128) SM90 / (256, 128) SM100
+bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)  # (64, 128) SM90 / (128, 128) SM100
 
 # ===== C++ Backend (Hopper/Ampere) =====
 # Tile sizes vary by architecture and headdim
