@@ -1100,6 +1100,8 @@ void load_block_list_sm80(
     if (load_first_seqlenk_mask) {
         load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         cute::cp_async_fence();
+        // V must also use Seqlenk_mask=true for the boundary block to zero-fill
+        // out-of-bounds rows via cp.async ZFILL (IEEE 754: 0 * NaN = NaN).
         load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         cute::cp_async_fence();
     } else {

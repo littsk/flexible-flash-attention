@@ -58,7 +58,7 @@ if BACKEND == "hopper":
     hopper_dir = os.path.abspath(hopper_dir)
     if hopper_dir not in sys.path:
         sys.path.insert(0, hopper_dir)
-    from flash_attn_interface import flash_attn_forward, flash_attn_func, FlashAttnFunc
+    from flash_attn_interface import flash_attn_func, FlashAttnFunc
     
     class LinearBlockSparseTensors(NamedTuple):
         """Linear CSR format block sparse tensors for Hopper C++ API."""
@@ -140,6 +140,258 @@ def flex_arbitrary_mask(b, h, q_idx, kv_idx, arbitrary_func):
                    (kv_idx < arbitrary_func[b, h, zero + (2*i+2), q_idx])
         value_valid = value_valid | in_range
     return value_valid
+
+
+def visualize_arbitrary_mask(
+    arbitrary_func: torch.Tensor,
+    seqlen_q: int,
+    seqlen_k: int,
+    batch_idx: Optional[int] = None,
+    head_idx: Optional[int] = None,
+    max_display_size: int = 64,
+    return_tensor: bool = False,
+) -> Optional[torch.Tensor]:
+    """Visualize the mask pattern from an arbitrary_func tensor.
+    
+    Prints a 0/1 matrix where 1 = valid (attend), 0 = masked.
+    Useful for debugging custom mask patterns before running attention.
+    
+    Args:
+        arbitrary_func: Func tensor of shape [batch, nheads, n_func, seqlen_q + 256]
+        seqlen_q: Query sequence length
+        seqlen_k: Key/Value sequence length
+        batch_idx: Batch index to visualize (None = all batches)
+        head_idx: Head index to visualize (None = all heads)
+        max_display_size: Max size to display without sampling (default 64)
+        return_tensor: If True, return mask tensor instead of printing
+        
+    Returns:
+        If return_tensor=True: torch.Tensor of shape [batch, heads, seqlen_q, seqlen_k]
+        Otherwise: None (prints to stdout)
+    
+    Example:
+        >>> arbitrary_func = arbitrary_func_tensor(1, 1, 3, 16, 16, device="cuda", pattern="causal")
+        >>> visualize_arbitrary_mask(arbitrary_func, 16, 16)
+        ========================================
+        Mask [batch=0, head=0] (seqlen_q=16, seqlen_k=16)
+        ----------------------------------------
+             0 1 2 3 4 5 6 7 8 9 ...
+          0: 1 0 0 0 0 0 0 0 0 0 ...
+          1: 1 1 0 0 0 0 0 0 0 0 ...
+          ...
+        ----------------------------------------
+        Valid: 136/256 (53.1%), Masked: 120/256 (46.9%)
+    """
+    batch_size = arbitrary_func.shape[0]
+    nheads = arbitrary_func.shape[1]
+    n_func = arbitrary_func.shape[2]
+    
+    # Determine which batches and heads to process
+    batches = [batch_idx] if batch_idx is not None else list(range(batch_size))
+    heads = [head_idx] if head_idx is not None else list(range(nheads))
+    
+    # Compute mask for all requested batches and heads
+    all_masks = []
+    for b in batches:
+        head_masks = []
+        for h in heads:
+            mask = torch.zeros(seqlen_q, seqlen_k, dtype=torch.int32, device=arbitrary_func.device)
+            
+            for q_idx in range(seqlen_q):
+                # Base interval [0, F0)
+                f0 = arbitrary_func[b, h, 0, q_idx].item()
+                if f0 > 0:
+                    mask[q_idx, :min(f0, seqlen_k)] = 1
+                
+                # Additional intervals [F_{2i+1}, F_{2i+2})
+                for i in range((n_func - 1) // 2):
+                    f_start = arbitrary_func[b, h, 2*i + 1, q_idx].item()
+                    f_end = arbitrary_func[b, h, 2*i + 2, q_idx].item()
+                    if f_end > f_start:
+                        mask[q_idx, max(0, f_start):min(f_end, seqlen_k)] = 1
+            
+            head_masks.append(mask)
+        all_masks.append(torch.stack(head_masks))
+    
+    result = torch.stack(all_masks)  # [len(batches), len(heads), seqlen_q, seqlen_k]
+    
+    if return_tensor:
+        return result
+    
+    # Print visualization
+    for bi, b in enumerate(batches):
+        for hi, h in enumerate(heads):
+            mask = result[bi, hi]
+            total = seqlen_q * seqlen_k
+            valid_count = mask.sum().item()
+            masked_count = total - valid_count
+            
+            print("=" * 40)
+            print(f"Mask [batch={b}, head={h}] (seqlen_q={seqlen_q}, seqlen_k={seqlen_k})")
+            print("-" * 40)
+            
+            # Determine display size (sample if too large)
+            display_q = min(seqlen_q, max_display_size)
+            display_k = min(seqlen_k, max_display_size)
+            sampled = (display_q < seqlen_q) or (display_k < seqlen_k)
+            
+            if sampled:
+                # Sample indices uniformly
+                q_indices = torch.linspace(0, seqlen_q - 1, display_q).long()
+                k_indices = torch.linspace(0, seqlen_k - 1, display_k).long()
+                display_mask = mask[q_indices][:, k_indices]
+                print(f"[Sampled to {display_q}x{display_k}]")
+            else:
+                q_indices = torch.arange(seqlen_q)
+                k_indices = torch.arange(seqlen_k)
+                display_mask = mask
+            
+            # Print each row (0/1 matrix only, no indices)
+            for qi in range(len(q_indices)):
+                row_str = ""
+                for ki in range(len(k_indices)):
+                    row_str += f"{display_mask[qi, ki].item()} "
+                print(row_str)
+            
+            print("-" * 40)
+            print(f"Valid: {valid_count}/{total} ({100*valid_count/total:.1f}%), "
+                  f"Masked: {masked_count}/{total} ({100*masked_count/total:.1f}%)")
+            
+            # Check for empty rows (all masked)
+            empty_rows = (mask.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+            if len(empty_rows) > 0:
+                print(f"WARNING: Empty rows (all masked) at q_idx: {empty_rows.tolist()[:10]}"
+                      + ("..." if len(empty_rows) > 10 else ""))
+            print()
+    
+    return None
+
+
+def demo_mask_examples(seqlen: int = 16, device: str = "cuda"):
+    """Demonstrate mask patterns from usage.md examples.
+    
+    Run this function to visualize the 4 example mask patterns:
+    1. Causal Mask
+    2. Variable-length Causal (packed sequences)
+    3. Sink + Local Window
+    4. HSTU (Context + Causal + Target)
+    
+    Args:
+        seqlen: Sequence length for visualization (default 16)
+        device: Device to create tensors on (default "cuda")
+    
+    Usage:
+        python -c "from tests.cute.test_arbitrary_mask import demo_mask_examples; demo_mask_examples()"
+    """
+    print("\n" + "=" * 60)
+    print("DEMO: Arbitrary Mask Examples from usage.md")
+    print("=" * 60)
+    
+    # =========================================================================
+    # Example 1: Causal Mask
+    # =========================================================================
+    print("\n>>> Example 1: Causal Mask")
+    print("Each query at position i attends to keys j ∈ [0, i+1)")
+    
+    seqlen_q, seqlen_k = seqlen, seqlen
+    arbitrary_func = torch.zeros(1, 1, 1, seqlen_q + 256, dtype=torch.int32, device=device)
+    for i in range(seqlen_q):
+        arbitrary_func[:, :, 0, i] = i + 1
+    
+    visualize_arbitrary_mask(arbitrary_func, seqlen_q, seqlen_k)
+    
+    # =========================================================================
+    # Example 2: Variable-length Causal (packed sequences)
+    # =========================================================================
+    print("\n>>> Example 2: Variable-length Causal (packed sequences)")
+    print("Multiple sequences packed into one, each with causal attention within boundaries")
+    
+    # Simulate 3 sequences with lengths [5, 4, 7] packed together
+    seq_lengths = [5, 4, 7]
+    cu_seqlens_qk = [0]
+    for l in seq_lengths:
+        cu_seqlens_qk.append(cu_seqlens_qk[-1] + l)
+    cu_seqlens_qk = torch.tensor(cu_seqlens_qk, device=device)
+    
+    total_seqlen = cu_seqlens_qk[-1].item()
+    num_sequences = len(cu_seqlens_qk) - 1
+    
+    arbitrary_func = torch.zeros(1, 1, 3, total_seqlen + 256, dtype=torch.int32, device=device)
+    for i in range(num_sequences):
+        seq_start = cu_seqlens_qk[i].item()
+        seq_end = cu_seqlens_qk[i + 1].item()
+        for s in range(seq_end - seq_start):
+            q_token = seq_start + s
+            arbitrary_func[0, 0, 0, q_token] = 0           # F0: base interval is empty
+            arbitrary_func[0, 0, 1, q_token] = seq_start   # F1: sequence start
+            arbitrary_func[0, 0, 2, q_token] = q_token + 1 # F2: current position + 1
+    
+    print(f"Sequence lengths: {seq_lengths}, cu_seqlens: {cu_seqlens_qk.tolist()}")
+    visualize_arbitrary_mask(arbitrary_func, total_seqlen, total_seqlen)
+    
+    # =========================================================================
+    # Example 3: Sink + Local Window
+    # =========================================================================
+    print("\n>>> Example 3: Sink + Local Window")
+    print("Sink tokens (always attended) + local sliding window")
+    
+    seqlen_q, seqlen_k = seqlen, seqlen
+    sink_width = 2
+    window_left = 3
+    window_right = 0  # Causal-like local window
+    
+    arbitrary_func = torch.zeros(1, 1, 3, seqlen_q + 256, dtype=torch.int32, device=device)
+    hole_flag = False
+    for i in range(seqlen_q):
+        if not hole_flag:
+            arbitrary_func[:, :, 0, i] = min(i + 1 + window_right, seqlen_k)
+            if i - window_left >= sink_width:
+                hole_flag = True
+        else:
+            arbitrary_func[:, :, 0, i] = sink_width
+            arbitrary_func[:, :, 1, i] = max(0, i - window_left)
+            arbitrary_func[:, :, 2, i] = min(i + 1 + window_right, seqlen_k)
+    
+    print(f"sink_width={sink_width}, window_left={window_left}, window_right={window_right}")
+    visualize_arbitrary_mask(arbitrary_func, seqlen_q, seqlen_k)
+    
+    # =========================================================================
+    # Example 4: HSTU - Context + Causal + Target
+    # =========================================================================
+    print("\n>>> Example 4: HSTU - Context + Causal + Target")
+    print("Context: full attention | Causal: causal attention | Target: context + self")
+    
+    q_context = 4
+    q_causal = 6
+    q_target = 4
+    kv_context = q_context + q_causal
+    seqlen_q = q_context + q_causal + q_target
+    seqlen_k = seqlen_q
+    
+    arbitrary_func = torch.zeros(1, 1, 3, seqlen_q + 256, dtype=torch.int32, device=device)
+    
+    # Context tokens: attend to all context [0, kv_context)
+    for c in range(q_context):
+        arbitrary_func[:, :, 0, c] = kv_context
+    
+    # Causal tokens: attend to context + previous causal [0, pos + 1)
+    for ca in range(q_causal):
+        pos = q_context + ca
+        arbitrary_func[:, :, 0, pos] = pos + 1
+    
+    # Target tokens: attend to context + itself [0, kv_context) ∪ [pos, pos + 1)
+    for t in range(q_target):
+        pos = q_context + q_causal + t
+        arbitrary_func[:, :, 0, pos] = kv_context  # F0: attend to context
+        arbitrary_func[:, :, 1, pos] = pos         # F1: self position start
+        arbitrary_func[:, :, 2, pos] = pos + 1     # F2: self position end
+    
+    print(f"q_context={q_context}, q_causal={q_causal}, q_target={q_target}")
+    visualize_arbitrary_mask(arbitrary_func, seqlen_q, seqlen_k)
+    
+    print("\n" + "=" * 60)
+    print("DEMO COMPLETE")
+    print("=" * 60 + "\n")
 
 
 # ============================================================================
@@ -430,12 +682,12 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
         
         # Run flash attention with native mask support
         if BACKEND == "hopper":
-            out_fa, lse_fa, _, _ = flash_attn_forward(
+            out_fa = flash_attn_func(
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal,
             )
         else:  # cute
-            out_fa, lse_fa = flash_attn_func(
+            out_fa, _ = flash_attn_func(
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal, arbitrary=False,
                 window_size=(None, None), softcap=0.0, num_splits=1,
@@ -617,14 +869,14 @@ def _run_mask_test(seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype,
 
         # Run flash attention with block sparsity
         if BACKEND == "hopper":
-            out_fa, lse_fa, _, _ = flash_attn_forward(
+            out_fa = flash_attn_func(
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal,
-                block_sparse=linear_k, k2q_block_sparse=linear_q,
+                q2k_block_sparse=linear_k, k2q_block_sparse=linear_q,
                 arbitrary_func=arbitrary_func,
             )
         else:  # cute
-            out_fa, lse_fa = flash_attn_func(
+            out_fa, _ = flash_attn_func(
                 q=tensors["q"], k=tensors["k"], v=tensors["v"],
                 softmax_scale=softmax_scale, causal=causal, arbitrary=True,
                 window_size=(None, None), softcap=0.0, num_splits=1,
@@ -864,7 +1116,7 @@ def benchmark_arbitrary_mask(
         # Forward warmup
         for _ in range(num_warmup):
             if BACKEND == "hopper":
-                out, _, _, _ = flash_attn_forward(
+                out = flash_attn_func(
                     q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=causal,
                 )
             else:
@@ -882,7 +1134,7 @@ def benchmark_arbitrary_mask(
         start_event.record()
         for _ in range(num_runs):
             if BACKEND == "hopper":
-                out, _, _, _ = flash_attn_forward(
+                out = flash_attn_func(
                     q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=causal,
                 )
             else:
@@ -1056,9 +1308,9 @@ def benchmark_arbitrary_mask(
     # Forward warmup
     for _ in range(num_warmup):
         if BACKEND == "hopper":
-            out, _, _, _ = flash_attn_forward(
+            out = flash_attn_func(
                 q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=False,
-                block_sparse=linear_k, k2q_block_sparse=linear_q,
+                q2k_block_sparse=linear_k, k2q_block_sparse=linear_q,
                 arbitrary_func=arbitrary_func,
             )
         else:
@@ -1079,9 +1331,9 @@ def benchmark_arbitrary_mask(
     start_event.record()
     for _ in range(num_runs):
         if BACKEND == "hopper":
-            out, _, _, _ = flash_attn_forward(
+            out = flash_attn_func(
                 q=q_fwd, k=k_fwd, v=v_fwd, softmax_scale=softmax_scale, causal=False,
-                block_sparse=linear_k, k2q_block_sparse=linear_q,
+                q2k_block_sparse=linear_k, k2q_block_sparse=linear_q,
                 arbitrary_func=arbitrary_func,
             )
         else:
@@ -1115,10 +1367,10 @@ def benchmark_arbitrary_mask(
         
         # Step 1: Execute forward once to get out (for backward)
         if BACKEND == "hopper":
-            out, _, _, _ = flash_attn_forward(
+            out = flash_attn_func(
                 q=q_bwd, k=k_bwd, v=v_bwd,
                 softmax_scale=softmax_scale, causal=False,
-                block_sparse=linear_k, k2q_block_sparse=linear_q,
+                q2k_block_sparse=linear_k, k2q_block_sparse=linear_q,
                 arbitrary_func=arbitrary_func,
             )
         else:

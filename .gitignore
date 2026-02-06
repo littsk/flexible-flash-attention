@@ -37,3 +37,5 @@ flash_attn_config.py
 
 # generated files
 hopper/instantiations/*
+
+*.ncu-rep

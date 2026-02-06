@@ -128,11 +128,24 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_SM8x
+#if defined(FLASHATTENTION_DISABLE_SM8x) && defined(FLASHATTENTION_DISABLE_SM90)
+  #error "Cannot disable both SM8x and SM90. At least one architecture must be enabled."
+#elif defined(FLASHATTENTION_DISABLE_SM8x)
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
     constexpr static int ARCH_NAME = 90;                                                         \
     return __VA_ARGS__();                                                                        \
+  }()
+#elif defined(FLASHATTENTION_DISABLE_SM90)
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH == 86 || ARCH == 89) {                                                              \
+      constexpr static int ARCH_NAME = 86;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
   }()
 #else
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \

@@ -18,6 +18,7 @@ HDIM128 ?= 1
 HDIM192 ?= 0
 HDIM256 ?= 0
 SM8X ?= 1
+SM90 ?= 0
 VCOLMAJOR ?= 0
 HDIMDIFF64 ?= 0
 HDIMDIFF192 ?= 0
@@ -57,6 +58,7 @@ export FLASH_ATTENTION_DISABLE_HDIM128 := $(call bool_false_if_on,HDIM128)
 export FLASH_ATTENTION_DISABLE_HDIM192 := $(call bool_false_if_on,HDIM192)
 export FLASH_ATTENTION_DISABLE_HDIM256 := $(call bool_false_if_on,HDIM256)
 export FLASH_ATTENTION_DISABLE_SM80 := $(call bool_false_if_on,SM8X)
+export FLASH_ATTENTION_DISABLE_SM90 := $(call bool_false_if_on,SM90)
 export FLASH_ATTENTION_ENABLE_VCOLMAJOR := $(call bool_true_if_on,VCOLMAJOR)
 export FLASH_ATTENTION_DISABLE_HDIMDIFF64 := $(call bool_false_if_on,HDIMDIFF64)
 export FLASH_ATTENTION_DISABLE_HDIMDIFF192 := $(call bool_false_if_on,HDIMDIFF192)
@@ -65,7 +67,19 @@ export FLASH_ATTENTION_DISABLE_ARBITRARY := $(call bool_false_if_on,ARBITRARY)
 export FLASH_ATTENTION_NUM_FUNC := $(NUM_FUNC)
 export DISABLE_FLEX_ATTENTION := $(call bool_false_if_on,FLEXATTN)
 
-.PHONY: install show_flags help clean fast generate tt vt fm
+.PHONY: install show_flags help clean fast generate tt vt fm check_block_mask install_block_mask
+
+# Check if create_block_mask_cuda is installed
+check_block_mask:
+	@$(PYTHON) -c "import create_block_mask_cuda" 2>/dev/null && echo "create_block_mask_cuda already installed" || $(MAKE) install_block_mask
+
+# Install create_block_mask_cuda package
+install_block_mask:
+	@echo "=============================================="
+	@echo "Installing create_block_mask_cuda..."
+	@echo "=============================================="
+	cd ../csrc/utils/create_block_mask && pip install -e . --no-build-isolation
+	@echo "create_block_mask_cuda installed successfully"
 
 # Generate kernel instantiation files
 generate:
@@ -73,14 +87,16 @@ generate:
 	$(PYTHON) generate_kernels.py -o instantiations
 
 help:
-	@echo "Flash Attention Build System"
+	@echo "Flash Attention Build System (Cutlass C++ Backend)"
 	@echo ""
 	@echo "Targets:"
-	@echo "  install      - Standard installation"
-	@echo "  fast         - Fast build with NVCC_THREADS=4"
-	@echo "  clean        - Remove build artifacts"
-	@echo "  show_flags   - Display current build flags"
-	@echo "  tt           - Run tests (default: test_flash_attn.py)"
+	@echo "  install            - Standard installation (auto-installs create_block_mask_cuda if needed)"
+	@echo "  install_block_mask - Install create_block_mask_cuda package only"
+	@echo "  check_block_mask   - Check if create_block_mask_cuda is installed"
+	@echo "  fast               - Fast build with NVCC_THREADS=4"
+	@echo "  clean              - Remove build artifacts"
+	@echo "  show_flags         - Display current build flags"
+	@echo "  tt                 - Run tests (default: test_flash_attn.py)"
 	@echo "  tt TEST_FILE=test_arbitrary_mask.py  - Run arbitrary mask tests"
 	@echo ""
 	@echo "Speed Tips:"
@@ -106,7 +122,7 @@ clean:
 	find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 	@echo "Clean complete."
 
-install: generate show_flags
+install: check_block_mask generate show_flags
 	$(PYTHON) setup.py install
 
 # Use test_arbitrary_mask.py only when both ARBITRARY=1 and ARBITRARY_TEST=1
@@ -144,6 +160,7 @@ show_flags:
 	@echo " HDIM192=$(HDIM192) -> FLASH_ATTENTION_DISABLE_HDIM192=$(FLASH_ATTENTION_DISABLE_HDIM192)"
 	@echo " HDIM256=$(HDIM256) -> FLASH_ATTENTION_DISABLE_HDIM256=$(FLASH_ATTENTION_DISABLE_HDIM256)"
 	@echo " SM8X=$(SM8X) -> FLASH_ATTENTION_DISABLE_SM80=$(FLASH_ATTENTION_DISABLE_SM80)"
+	@echo " SM90=$(SM90) -> FLASH_ATTENTION_DISABLE_SM90=$(FLASH_ATTENTION_DISABLE_SM90)"
 	@echo " VCOLMAJOR=$(VCOLMAJOR) -> FLASH_ATTENTION_ENABLE_VCOLMAJOR=$(FLASH_ATTENTION_ENABLE_VCOLMAJOR)"
 	@echo " HDIMDIFF64=$(HDIMDIFF64) -> FLASH_ATTENTION_DISABLE_HDIMDIFF64=$(FLASH_ATTENTION_DISABLE_HDIMDIFF64)"
 	@echo " HDIMDIFF192=$(HDIMDIFF192) -> FLASH_ATTENTION_DISABLE_HDIMDIFF192=$(FLASH_ATTENTION_DISABLE_HDIMDIFF192)"

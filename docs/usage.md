@@ -27,10 +27,10 @@ make tt                    # Run default test
 python tests/cute/test_arbitrary_mask.py
 ```
 
-**Run with Hopper C++ backend (for Hopper/Ampere/Ada):** 
+**Run with Cutlass C++ backend (for SM8x Ampere/Ada and SM90 Hopper in Hopper folder):** 
 ```bash
 cd flash-attention/hopper
-make install ARBITRARY=1 NUM_FUNC=3 HDIM128=1
+make install ARBITRARY=1 NUM_FUNC=3 HDIM128=1 SM8X=1 (if ampere/ada)
 make tt                    # Run test
 # or
 FLASH_ATTN_BACKEND=hopper python tests/cute/test_arbitrary_mask.py
@@ -121,6 +121,20 @@ The total valid region is the **union** of all these intervals.
 
 ### Examples
 
+> **Tip: Visualize Your Mask**
+> 
+> Use `visualize_arbitrary_mask` to verify your custom func tensor produces the expected mask pattern:
+> ```python
+> from tests.cute.test_arbitrary_mask import visualize_arbitrary_mask
+> visualize_arbitrary_mask(arbitrary_func, seqlen_q, seqlen_k)
+> ```
+> 
+> To see all examples below visualized, run:
+> ```bash
+> cd flash-attention
+> python -c "from tests.cute.test_arbitrary_mask import demo_mask_examples; demo_mask_examples()"
+> ```
+
 #### Example 1: Causal Mask
 
 For causal attention, each query at position `i` attends to keys `j ∈ [0, i+1)`.
@@ -141,16 +155,43 @@ Query 2: [0, 3) → attends to keys 0, 1, 2
 ...
 ```
 
-#### Example 2: Causal Mask with variable length
+#### Example 2: Causal Mask with Variable Length
 
-For variable length, set func for different sequences separately.
+For variable-length sequences with **separate batches**, set func for each sequence separately:
 
 ```python
-arbitrary_func = torch.zeros(b, 1, 1, seqlen_q + 256, dtype=torch.int32, device="cuda")
-for i in range(b):
+# Each batch has its own causal mask based on actual sequence length
+# actual_seqlen_q[i] is the actual length of sequence i
+arbitrary_func = torch.zeros(batch_size, 1, 1, max_seqlen_q + 256, dtype=torch.int32, device="cuda")
+for i in range(batch_size):
     for j in range(actual_seqlen_q[i]):
-        arbitrary_func[i, :, 0, j] = j + 1
+        arbitrary_func[i, :, 0, j] = j + 1  # Causal: attend to [0, j+1)
 ```
+
+We can also treat variable-length sequences as a **single packed sequence** and implement it using a mask, like this:
+
+<img src="varlen_as_fixedlen_mask.png" alt="Variable-length as fixed-length with mask" width="300">
+
+Given `cu_seqlens_qk`: cumulative sequence lengths of shape `(batch_size + 1,)`, each token only attends to tokens within the same sequence with causal masking:
+
+```python
+# Pack multiple batch_size into one, each with causal attention within its boundaries
+total_seqlen = cu_seqlens_qk[-1]
+batch_size = len(cu_seqlens_qk) - 1
+
+arbitrary_func = torch.zeros(1, 1, 3, total_seqlen + 256, dtype=torch.int32, device="cuda")
+for i in range(batch_size):
+    seq_start = cu_seqlens_qk[i]
+    seq_end = cu_seqlens_qk[i + 1]
+    for s in range(seq_end - seq_start):
+        q_token = seq_start + s
+        # Causal within sequence: attend to [seq_start, q_token + 1)
+        # Using nFunc=3: [0, F0) ∪ [F1, F2) = [0, 0) ∪ [seq_start, q_token + 1)
+        arbitrary_func[0, 0, 0, q_token] = 0           # F0: base interval is empty
+        arbitrary_func[0, 0, 1, q_token] = seq_start   # F1: sequence start
+        arbitrary_func[0, 0, 2, q_token] = q_token + 1 # F2: current position + 1 (exclusive)
+```
+
 
 #### Example 3: Sink + Local Window
 
@@ -179,6 +220,44 @@ def create_sink_local_func(seqlen_q, seqlen_k, sink_width, window_left, window_r
             arbitrary_func[:, :, 2, i] = min(i + 1 + window_right, seqlen_k)  # Local end
     return arbitrary_func
 ```
+
+#### Example 4: HSTU - Causal + Context + Target
+
+Mask pattern for Generative Recommendation scenarios (e.g., HSTU model). The sequence is divided into three parts:
+- **Context tokens**: Can attend to all context tokens (full attention within context)
+- **Causal tokens**: Causal attention (can see context + previous causal tokens)
+- **Target tokens**: Can attend to context + itself (no cross-attention between targets)
+
+<img src="hstu_causal_context_target.png" alt="HSTU: Causal + Context + Target" width="300">
+
+```python
+# Sequence structure: [context (kv_context)] [causal (q_causal)] [target (q_target)]
+# kv_context: number of context tokens in K/V
+# q_context: number of context tokens in Q (typically equals kv_context)
+# q_causal: number of causal tokens
+# q_target: number of target tokens
+
+seqlen_q = q_context + q_causal + q_target
+arbitrary_func = torch.zeros(1, 1, 3, seqlen_q + 256, dtype=torch.int32, device="cuda")
+
+# Context tokens: attend to all context [0, kv_context)
+for c in range(q_context):
+    arbitrary_func[:, :, 0, c] = kv_context  # [0, kv_context)
+
+# Causal tokens: attend to context + previous causal [0, current_pos + 1)
+for ca in range(q_causal):
+    pos = q_context + ca
+    arbitrary_func[:, :, 0, pos] = pos + 1  # [0, pos + 1) includes context and causal up to current
+
+# Target tokens: attend to context + itself [0, kv_context) ∪ [pos, pos + 1)
+for t in range(q_target):
+    pos = q_context + q_causal + t
+    # Using nFunc=3: [0, F0) ∪ [F1, F2) = [0, kv_context) ∪ [pos, pos + 1)
+    arbitrary_func[:, :, 0, pos] = kv_context  # F0: attend to context
+    arbitrary_func[:, :, 1, pos] = pos         # F1: self position start
+    arbitrary_func[:, :, 2, pos] = pos + 1     # F2: self position end
+```
+
 
 ## Block Sparsity
 
@@ -224,7 +303,7 @@ This requires two separate block sparsity structures:
 | Backend | Forward Tile Size | Backward Tile Size | Source |
 |---------|-------------------|-------------------|--------|
 | **CUTE DSL** | (128, 128) SM90 / (256, 128) SM100 | (64, 128) SM90 / (128, 128) SM100 | `interface.py` |
-| **Hopper C++** | Varies by headdim | Varies by headdim | `tile_size.h` |
+| **Cutlass C++** (`hopper/`) | Varies by headdim | Varies by headdim | `tile_size.h` |
 
 Use the appropriate function based on your backend:
 
@@ -268,7 +347,7 @@ bwd_q, bwd_kv = get_tile_sizes_by_backend(
 |-------------|---------|-----------------|----------------|-------|
 | Blackwell (SM100) | CUTE DSL | 64, 128 | MHA, GQA, MQA | Recommended |
 | Hopper (SM90) | CUTE DSL | ≤128 | **MHA only** | GQA/MQA not supported |
-| Hopper (SM90) | C++ | 64, 128, 256 | MHA, GQA, MQA | Full feature support |
+| SM8x/SM90 | Cutlass C++ | 64, 128, 256 | MHA, GQA, MQA | Full feature support |
 | Ampere/Ada (SM8x) | C++ | 64, 128, 256 | MHA, GQA, MQA | Requires `SM8X=1` in Compile |
 
 ## Installation
@@ -318,20 +397,81 @@ make install SM8X=1
 
 ### Makefile Configuration (hopper/Makefile)
 
-For faster compilation, the Makefile disables some features by default. Enable as needed:
+The Makefile uses `FLAG=1` to enable and `FLAG=0` to disable features. 
 
-| Flag | Description | Example |
-|------|-------------|---------|
-| `ARBITRARY` | Enable arbitrary mask support | `ARBITRARY=1` |
-| `NUM_FUNC` | Compile kernels for specific nFunc values (odd numbers 1-33) | `NUM_FUNC=3` or `NUM_FUNC=3,5,9` |
-| `HDIM64/HDIM128/HDIM256` | Enable specific head dimensions | `HDIM128=1` |
-| `BACKWARD` | Enable backward pass kernels | `BACKWARD=1` |
-| `SM8X` | Enable Ampere/Ada support | `SM8X=1` |
+> **Compilation Time Tip**: Each enabled feature generates additional kernel templates. To minimize compilation time, **only enable features you actually need**. A minimal build can complete in minutes, while a full build may take hours.
 
-**Example**: Compile with arbitrary mask support for nFunc=3 and nFunc=5:
+#### Core Features
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `BACKWARD` | **1** | Backward pass kernels. Required for training. Set `=0` for inference-only builds. |
+| `ARBITRARY` | **1** | Arbitrary mask / block sparsity support. |
+| `NUM_FUNC` | **3** | nFunc values to compile (odd numbers 1-33). Use comma-separated list: `NUM_FUNC=3,5,9`. More values = slower compile. |
+
+#### Attention Variants (default: disabled)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `SPLIT` | 0 | Split-KV attention for short q seq and long kv seq in inference. |
+| `PAGEDKV` | 0 | Paged KV cache for inference. |
+| `APPENDKV` | 0 | Append KV mode for incremental decoding. |
+| `LOCAL` | 0 | Local (sliding window) attention. |
+| `SOFTCAP` | 0 | Softmax capping (used by Gemma 2, etc.). |
+| `PACKGQA` | 0 | Packed GQA implementation. |
+| `VARLEN` | 0 | Variable-length sequence support (via cu_seqlens). |
+| `CLUSTER` | 0 | Hopper cluster feature (SM90+ TMA multicast). |
+
+#### Data Types (default: BF16 only)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `FP16` | 0 | Enable FP16 (float16) support. |
+| `FP8` | 0 | Enable FP8 (float8_e4m3fn) support. |
+
+#### Head Dimensions
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `HDIM64` | 0 | Enable head_dim=64. |
+| `HDIM96` | 0 | Enable head_dim=96. |
+| `HDIM128` | **1** | Enable head_dim=128 (most common). |
+| `HDIM192` | 0 | Enable head_dim=192. |
+| `HDIM256` | 0 | Enable head_dim=256. |
+| `HDIMDIFF64` | 0 | Enable head_dim_k ≠ head_dim_v with dim=64. |
+| `HDIMDIFF192` | 0 | Enable head_dim_k ≠ head_dim_v with dim=192. |
+
+#### GPU Architecture
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `SM8X` | **1** | SM80/86/89 (Ampere A100, Ada L40, RTX 4090, etc.). Set `=0` for SM90-only builds. |
+| `SM90` | **1** | SM90 (Hopper H100). Set `=0` for SM8x-only builds. |
+
+> **Note**: At least one of `SM8X` or `SM90` must be enabled. Disabling the architecture you don't have can reduce compilation time by ~50%.
+
+#### Advanced Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `VCOLMAJOR` | 0 | V tensor column-major layout. |
+
+#### Build Examples
+
 ```bash
 cd hopper
-make install ARBITRARY=1 NUM_FUNC=3,5 HDIM128=1
+
+# View current build configuration
+make show_flags
+
+# SM8x only (A100, L40/20, etc.) - skip Hopper kernels
+make install SM90=0
+# SM90 only (H100) - skip Ampere/Ada kernels  
+make install SM8X=0
+
+# Training with arbitrary mask
+make install BACKWARD=1 ARBITRARY=1 NUM_FUNC=3,5 SM8X=1 SM90=1
+
 ```
 
 ### Build Only Block Mask Utility
@@ -539,89 +679,77 @@ out.backward(dout)
 print(f"dQ shape: {q.grad.shape}, dK shape: {k.grad.shape}, dV shape: {v.grad.shape}")
 ```
 
-### Complete Workflow (Hopper C++ Backend)
+### Cutlass C++ Backend (`hopper/`)
 
-> **Prerequisite**: Before running this example, you must first compile and install the C++ backend:
+> **Location**: `flash-attention/hopper/` directory
+> **Supported architectures**: SM8x (Ampere/Ada) and SM90 (Hopper)
+
+> **Prerequisite**: Before running these examples, compile and install the Cutlass C++ backend:
 > ```bash
 > cd flash-attention/hopper
 > make install ARBITRARY=1 NUM_FUNC=3 HDIM128=1 BACKWARD=1
+> # Add SM8X=1 for Ampere/Ada support
 > ```
+
+#### Usage (Arbitrary Mask + Block Sparsity)
+
+For custom masking patterns with block sparsity:
 
 ```python
 import sys
-sys.path.insert(0, "hopper")  # Add hopper directory to path
+sys.path.insert(0, "hopper")
 
 import torch
 import math
-from flash_attn_interface import flash_attn_forward, flash_attn_func
+from flash_attn_interface import flash_attn_func, LinearBlockSparseTensors
 from flash_attn.utils.tile_size import get_fwd_tile_sizes, get_bwd_tile_sizes, get_arch
 from flash_attn.cute.mask_definitions import arbitrary_func_tensor
 import create_block_mask_cuda
-from typing import NamedTuple, Optional
-
-# LinearBlockSparseTensors for C++ backend
-class LinearBlockSparseTensors(NamedTuple):
-    mask_block_cnt: torch.Tensor
-    mask_block_offset: torch.Tensor
-    mask_block_idx: torch.Tensor
-    full_block_cnt: Optional[torch.Tensor] = None
-    full_block_offset: Optional[torch.Tensor] = None
-    full_block_idx: Optional[torch.Tensor] = None
 
 # Configuration
 batch_size, seqlen_q, seqlen_k = 1, 8192, 8192
 nheads, nheads_kv, headdim = 32, 32, 128
 dtype = torch.bfloat16
-n_func = 3
+n_func = 3  # Must be odd
 
 # Create tensors
-q = torch.randn(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype).requires_grad_(True)
-k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype).requires_grad_(True)
-v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype).requires_grad_(True)
+q = torch.randn(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype, requires_grad=True)
+k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype, requires_grad=True)
+v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype, requires_grad=True)
 softmax_scale = 1.0 / math.sqrt(headdim)
 
 # Create arbitrary func tensor (causal pattern)
 arbitrary_func = arbitrary_func_tensor(1, 1, n_func, seqlen_q, seqlen_k, device="cuda", pattern="causal")
 
-# Get tile sizes
+# Get tile sizes for block sparsity
 arch = get_arch()
 fwd_q_block, fwd_kv_block = get_fwd_tile_sizes(arch=arch, headdim=headdim, is_arbitrary=True)
 bwd_q_block, bwd_kv_block = get_bwd_tile_sizes(arch=arch, headdim=headdim, is_arbitrary=True)
 
-# Generate block sparsity
+# Generate Q2K block sparsity (for forward pass)
 (k_mask_cnt, k_mask_offset, k_mask_idx, k_full_cnt, k_full_offset, k_full_idx) = \
     create_block_mask_cuda.create_q2k_csr_sparse_from_func(
         arbitrary_func, seqlen_q, seqlen_k,
         Q_BLOCK_SIZE=fwd_q_block, KV_BLOCK_SIZE=fwd_kv_block, check_q_boundary=True
     )
-linear_k = LinearBlockSparseTensors(k_mask_cnt, k_mask_offset, k_mask_idx, k_full_cnt, k_full_offset, k_full_idx)
+q2k_sparse = LinearBlockSparseTensors(k_mask_cnt, k_mask_offset, k_mask_idx, k_full_cnt, k_full_offset, k_full_idx)
 
+# Generate K2Q block sparsity (for backward pass)
 (q_mask_cnt, q_mask_offset, q_mask_idx, q_full_cnt, q_full_offset, q_full_idx) = \
     create_block_mask_cuda.create_k2q_csr_sparse_from_func(
         arbitrary_func, seqlen_q, seqlen_k,
         Q_BLOCK_SIZE=bwd_q_block, KV_BLOCK_SIZE=bwd_kv_block
     )
-linear_q = LinearBlockSparseTensors(q_mask_cnt, q_mask_offset, q_mask_idx, q_full_cnt, q_full_offset, q_full_idx)
+k2q_sparse = LinearBlockSparseTensors(q_mask_cnt, q_mask_offset, q_mask_idx, q_full_cnt, q_full_offset, q_full_idx)
 
-# Run attention (forward only)
-out, lse, _, _ = flash_attn_forward(
-    q=q, k=k, v=v,
-    softmax_scale=softmax_scale,
-    causal=False,
-    block_sparse=linear_k,
-    k2q_block_sparse=linear_q,
-    arbitrary_func=arbitrary_func,
-)
-
-# Or use flash_attn_func for forward + backward
+# Run attention with block sparsity (forward + backward)
 out = flash_attn_func(
-    q=q, k=k, v=v,
+    q, k, v,
     softmax_scale=softmax_scale,
-    causal=False,
-    window_size=(-1, -1),
-    block_sparse=linear_k,
-    k2q_block_sparse=linear_q,
+    causal=False,  # Using arbitrary_func instead
     arbitrary_func=arbitrary_func,
+    q2k_block_sparse=q2k_sparse,
+    k2q_block_sparse=k2q_sparse,
 )
 out.sum().backward()
 ```
@@ -634,7 +762,7 @@ out.sum().backward()
 | GQA | Grouped Query Attention | `nheads_kv = nheads // group_size` | ✗ | ✓ | ✓ |
 | MQA | Multi-Query Attention | `nheads_kv = 1` | ✗ | ✓ | ✓ |
 
-**Note**: DSL backend on SM90 only supports MHA mode. Use C++ backend for GQA/MQA on Hopper.
+**Note**: DSL backend on SM90 only supports MHA mode. Use Cutlass C++ backend (`hopper/`) for GQA/MQA on SM8x/SM90.
 
 ## API Reference
 
@@ -689,7 +817,7 @@ arch = get_arch()  # Returns: 80, 86, 89, 90, or 100
 fwd_q, fwd_kv = get_fwd_tile_sizes_dsl(arch=arch)  # (128, 128) SM90 / (256, 128) SM100
 bwd_q, bwd_kv = get_bwd_tile_sizes_dsl(arch=arch, is_arbitrary=True)  # (64, 128) SM90 / (128, 128) SM100
 
-# ===== C++ Backend (Hopper/Ampere) =====
+# ===== Cutlass C++ Backend (hopper/, SM8x/SM90) =====
 # Tile sizes vary by architecture and headdim
 fwd_q_block, fwd_kv_block = get_fwd_tile_sizes(
     arch=arch, headdim=128, is_arbitrary=True
@@ -701,7 +829,7 @@ bwd_q_block, bwd_kv_block = get_bwd_tile_sizes(
 # ===== Unified API =====
 # Auto-select based on backend parameter
 fwd_q, fwd_kv = get_tile_sizes_by_backend(
-    backend="cute",  # "cute" for DSL, "hopper" for C++
+    backend="cute",  # "cute" for DSL, "hopper" for Cutlass C++
     pass_type="forward",
     arch=arch, headdim=128, is_arbitrary=True
 )
@@ -713,4 +841,4 @@ fwd_q, fwd_kv = get_tile_sizes_by_backend(
 - **CUDA kernel source**: `csrc/utils/create_block_mask/` - Block sparsity generation
 - **Mask definitions**: `flash_attn/cute/mask_definitions.py` - Helper functions for creating Func Tensors
 - **Tile size utility**: `flash_attn/utils/tile_size.py` - Automatic tile size detection
-- **C++ tile sizes**: `hopper/tile_size.h` - Single source of truth for tile sizes
+- **Cutlass C++ tile sizes**: `hopper/tile_size.h` - Single source of truth for tile sizes

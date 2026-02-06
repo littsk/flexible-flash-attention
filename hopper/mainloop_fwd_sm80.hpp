@@ -746,7 +746,12 @@ struct CollectiveMainloopFwdSm80 {
                 clear(tSrS);
                 sync();
                 auto load_V_cur = [&] {
-                    load_V(n_block, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
+                    // The first iteration processes the highest n_block (boundary block) which may
+                    // have rows beyond seqlen_k. V must use Seqlenk_mask=true to zero-fill those
+                    // out-of-bounds rows via cp.async ZFILL, because IEEE 754: 0 * NaN = NaN
+                    // would corrupt the output even though softmax gives 0 attention weight.
+                    // Subsequent blocks have lower n_block indices and are fully within seqlen_k.
+                    load_V(n_block, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter>{} /*Seqlenk_mask*/);
                     cute::cp_async_fence();
                 };
                 Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma.partition_fragment_A(sQ));

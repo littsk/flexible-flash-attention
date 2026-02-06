@@ -61,6 +61,7 @@ DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
+DISABLE_SM90 = os.getenv("FLASH_ATTENTION_DISABLE_SM90", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
@@ -122,6 +123,7 @@ def create_build_config_file():
             "FLASHATTENTION_DISABLE_HDIM192": DISABLE_HDIM192,
             "FLASHATTENTION_DISABLE_HDIM256": DISABLE_HDIM256,
             "FLASHATTENTION_DISABLE_SM8x": DISABLE_SM8x,
+            "FLASHATTENTION_DISABLE_SM90": DISABLE_SM90,
             "FLASHATTENTION_ENABLE_VCOLMAJOR": ENABLE_VCOLMAJOR,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF64": DISABLE_HDIMDIFF64,
             "FLASH_ATTENTION_DISABLE_HDIMDIFF192": DISABLE_HDIMDIFF192,
@@ -208,7 +210,11 @@ def _write_ninja_file(path,
     if with_cuda:
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
-        cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
+        # Fix: ensure SM80 arch flag is correctly set when DISABLE_SM90=TRUE (only compiling SM80)
+        if 'arch=compute_90a,code=sm_90a' in cuda_post_cflags:
+            cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
+        else:
+            cuda_post_cflags_sm80 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
         flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
         cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
@@ -453,6 +459,10 @@ if not SKIP_CUDA_BUILD:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
+    # Validate architecture selection
+    if DISABLE_SM8x and DISABLE_SM90:
+        raise RuntimeError("Cannot disable both SM8x and SM90. At least one architecture must be enabled.")
+
     # Auto-generate kernel instantiation files if they don't exist or are empty
     instantiations_dir = Path(this_dir) / "instantiations"
     if not instantiations_dir.exists() or not any(instantiations_dir.glob("*.cu")):
@@ -511,8 +521,9 @@ if not SKIP_CUDA_BUILD:
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_90a,code=sm_90a")
+    if not DISABLE_SM90:
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_90a,code=sm_90a")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -541,6 +552,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
+        + (["-DFLASHATTENTION_DISABLE_SM90"] if DISABLE_SM90 else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
@@ -617,8 +629,8 @@ if not SKIP_CUDA_BUILD:
 
     sources = (
         [flash_api_source]
-        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
+        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + (sources_fwd_sm90 if not DISABLE_SM90 else [])
+        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + (sources_bwd_sm90 if not DISABLE_SM90 else [])
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]

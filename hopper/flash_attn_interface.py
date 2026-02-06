@@ -886,10 +886,6 @@ class FlashAttnFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
-    """
-    Note: FlashAttnVarlenFunc does NOT support arbitrary_func and block_sparse.
-    Use FlashAttnFunc or FlashAttnQKVPackedFunc for arbitrary mask and block sparse support.
-    """
 
     @staticmethod
     def forward(
@@ -915,9 +911,30 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
+        # Arbitrary mask and block sparse support
+        arbitrary_func=None,  # [batch, head_q, func_num, seqlen_q+256], supports broadcasting
+        q2k_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
+        k2q_block_sparse=None,  # LinearBlockSparseTensors or tuple of 6 tensors
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        
+        # Extract q2k block sparse tensors for forward
+        q2k_mask_cnt, q2k_mask_offset, q2k_mask_idx = None, None, None
+        q2k_full_cnt, q2k_full_offset, q2k_full_idx = None, None, None
+        if q2k_block_sparse is not None:
+            if hasattr(q2k_block_sparse, 'mask_block_cnt'):
+                # LinearBlockSparseTensors object
+                q2k_mask_cnt = q2k_block_sparse.mask_block_cnt
+                q2k_mask_offset = q2k_block_sparse.mask_block_offset
+                q2k_mask_idx = q2k_block_sparse.mask_block_idx
+                q2k_full_cnt = q2k_block_sparse.full_block_cnt
+                q2k_full_offset = q2k_block_sparse.full_block_offset
+                q2k_full_idx = q2k_block_sparse.full_block_idx
+            else:
+                # Tuple of 6 tensors
+                (q2k_mask_cnt, q2k_mask_offset, q2k_mask_idx,
+                 q2k_full_cnt, q2k_full_offset, q2k_full_idx) = q2k_block_sparse
         
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
         out, softmax_lse, *rest = _flash_attn_forward(
@@ -946,6 +963,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
+            # Q2K block sparse for forward
+            block_sparse_mask_cnt=q2k_mask_cnt,
+            block_sparse_mask_offset=q2k_mask_offset,
+            block_sparse_mask_idx=q2k_mask_idx,
+            block_sparse_full_cnt=q2k_full_cnt,
+            block_sparse_full_offset=q2k_full_offset,
+            block_sparse_full_idx=q2k_full_idx,
+            arbitrary_func=arbitrary_func,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -958,6 +983,22 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        # Save arbitrary_func for backward
+        ctx.arbitrary_func = arbitrary_func
+        # Save k2q block sparse for backward
+        if k2q_block_sparse is not None:
+            if hasattr(k2q_block_sparse, 'mask_block_cnt'):
+                # LinearBlockSparseTensors object
+                ctx.k2q_mask_cnt = k2q_block_sparse.mask_block_cnt
+                ctx.k2q_mask_offset = k2q_block_sparse.mask_block_offset
+                ctx.k2q_mask_idx = k2q_block_sparse.mask_block_idx
+                ctx.k2q_full_cnt = k2q_block_sparse.full_block_cnt
+                ctx.k2q_full_offset = k2q_block_sparse.full_block_offset
+                ctx.k2q_full_idx = k2q_block_sparse.full_block_idx
+            else:
+                # Tuple of 6 tensors
+                (ctx.k2q_mask_cnt, ctx.k2q_mask_offset, ctx.k2q_mask_idx,
+                 ctx.k2q_full_cnt, ctx.k2q_full_offset, ctx.k2q_full_idx) = k2q_block_sparse
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
@@ -988,8 +1029,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
-            None,  # arbitrary_func (not supported in Varlen)
-            None, None, None, None, None, None,  # k2q block sparse (not supported in Varlen)
+            ctx.arbitrary_func if hasattr(ctx, 'arbitrary_func') else None,
+            # k2q block sparse (for backward)
+            ctx.k2q_mask_cnt if hasattr(ctx, 'k2q_mask_cnt') else None,
+            ctx.k2q_mask_offset if hasattr(ctx, 'k2q_mask_offset') else None,
+            ctx.k2q_mask_idx if hasattr(ctx, 'k2q_mask_idx') else None,
+            ctx.k2q_full_cnt if hasattr(ctx, 'k2q_full_cnt') else None,
+            ctx.k2q_full_offset if hasattr(ctx, 'k2q_full_offset') else None,
+            ctx.k2q_full_idx if hasattr(ctx, 'k2q_full_idx') else None,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -997,8 +1044,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # Return gradients for: q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
         # max_seqlen_q, max_seqlen_k, softmax_scale, causal, qv, q_descale, k_descale, v_descale,
         # window_size, attention_chunk, softcap, num_splits, pack_gqa, deterministic, sm_margin,
-        # return_softmax (total 23)
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # return_softmax, arbitrary_func, q2k_block_sparse, k2q_block_sparse (total 26)
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1013,6 +1060,9 @@ def flash_attn_qkvpacked_func(
     num_heads_q=None,
     sm_margin=0,
     return_attn_probs=False,
+    arbitrary_func: Optional[torch.Tensor] = None,
+    q2k_block_sparse: Optional[LinearBlockSparseTensors] = None,  # Q2K direction for forward
+    k2q_block_sparse: Optional[LinearBlockSparseTensors] = None,  # K2Q direction for backward
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -1039,6 +1089,10 @@ def flash_attn_qkvpacked_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        arbitrary_func: Optional[torch.Tensor]. Func tensor for arbitrary mask support.
+            Shape: [batch, head_q, func_num, seqlen_q+256], supports broadcasting (batch/head_q can be 1).
+        q2k_block_sparse: Optional[LinearBlockSparseTensors]. Block sparse pattern for Q2K direction (forward).
+        k2q_block_sparse: Optional[LinearBlockSparseTensors]. Block sparse pattern for K2Q direction (backward).
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -1060,6 +1114,9 @@ def flash_attn_qkvpacked_func(
         num_heads_q,
         sm_margin,
         return_attn_probs,
+        arbitrary_func,
+        q2k_block_sparse,
+        k2q_block_sparse,
     )
 
 
@@ -1079,8 +1136,13 @@ def flash_attn_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    # Arbitrary mask and block sparse support
+    arbitrary_func: Optional[torch.Tensor] = None,
+    q2k_block_sparse: Optional[LinearBlockSparseTensors] = None,  # Q2K direction for forward
+    k2q_block_sparse: Optional[LinearBlockSparseTensors] = None,  # K2Q direction for backward
 ):
-    """dropout_p should be set to 0.0 during evaluation
+    """Flash Attention with optional arbitrary mask and block sparsity support.
+    
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
@@ -1106,19 +1168,20 @@ def flash_attn_func(
         q: (batch_size, seqlen, nheads, headdim)
         k: (batch_size, seqlen, nheads_k, headdim)
         v: (batch_size, seqlen, nheads_k, headdim)
-        dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        arbitrary_func: Optional tensor for arbitrary mask function.
+            Shape: [batch, head_q, func_num, seqlen_q+256], supports broadcasting (batch/head_q can be 1)
+        q2k_block_sparse: Optional LinearBlockSparseTensors for Q2K block sparsity (forward pass).
+        k2q_block_sparse: Optional LinearBlockSparseTensors for K2Q block sparsity (backward pass).
+    
     Return:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -1141,6 +1204,9 @@ def flash_attn_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        arbitrary_func,
+        q2k_block_sparse,
+        k2q_block_sparse,
     )
 
 
@@ -1166,7 +1232,36 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
+    # Arbitrary mask and block sparse support
+    arbitrary_func: Optional[torch.Tensor] = None,
+    q2k_block_sparse: Optional[LinearBlockSparseTensors] = None,  # Q2K direction for forward
+    k2q_block_sparse: Optional[LinearBlockSparseTensors] = None,  # K2Q direction for backward
 ):
+    """Flash Attention for variable-length sequences with optional arbitrary mask and block sparsity.
+    
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = sum of seqlen_q for all sequences
+        k: (total_k, nheads_k, headdim), where total_k = sum of seqlen_k for all sequences
+        v: (total_k, nheads_k, headdim)
+        cu_seqlens_q: (batch_size + 1,), cumulative sequence lengths for Q
+        cu_seqlens_k: (batch_size + 1,), cumulative sequence lengths for K/V
+        max_seqlen_q: Maximum sequence length for Q
+        max_seqlen_k: Maximum sequence length for K/V
+        seqused_q: (batch_size,), optional, actual sequence lengths for Q
+        seqused_k: (batch_size,), optional, actual sequence lengths for K/V
+        softmax_scale: float. Default to 1 / sqrt(headdim)
+        causal: bool. Whether to apply causal attention mask
+        window_size: (left, right). Sliding window local attention
+        deterministic: bool. Use deterministic backward pass
+        return_attn_probs: bool. Return softmax_lse
+        arbitrary_func: Optional tensor for arbitrary mask function
+        q2k_block_sparse: Optional LinearBlockSparseTensors for Q2K block sparsity (forward)
+        k2q_block_sparse: Optional LinearBlockSparseTensors for K2Q block sparsity (backward)
+    
+    Return:
+        out: (total_q, nheads, headdim)
+        softmax_lse [optional]: (batch_size, nheads, max_seqlen_q)
+    """
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -1189,6 +1284,9 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         return_attn_probs,
+        arbitrary_func,
+        q2k_block_sparse,
+        k2q_block_sparse,
     )
 
 
@@ -1227,6 +1325,9 @@ def flash_attn_with_kvcache(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
+    # Arbitrary mask and block sparse support (forward only, no backward)
+    arbitrary_func: Optional[torch.Tensor] = None,
+    q2k_block_sparse: Optional[LinearBlockSparseTensors] = None,  # Q2K direction for forward
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1322,6 +1423,24 @@ def flash_attn_with_kvcache(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
+    
+    # Extract q2k block sparse tensors for forward
+    q2k_mask_cnt, q2k_mask_offset, q2k_mask_idx = None, None, None
+    q2k_full_cnt, q2k_full_offset, q2k_full_idx = None, None, None
+    if q2k_block_sparse is not None:
+        if hasattr(q2k_block_sparse, 'mask_block_cnt'):
+            # LinearBlockSparseTensors object
+            q2k_mask_cnt = q2k_block_sparse.mask_block_cnt
+            q2k_mask_offset = q2k_block_sparse.mask_block_offset
+            q2k_mask_idx = q2k_block_sparse.mask_block_idx
+            q2k_full_cnt = q2k_block_sparse.full_block_cnt
+            q2k_full_offset = q2k_block_sparse.full_block_offset
+            q2k_full_idx = q2k_block_sparse.full_block_idx
+        else:
+            # Tuple of 6 tensors
+            (q2k_mask_cnt, q2k_mask_offset, q2k_mask_idx,
+             q2k_full_cnt, q2k_full_offset, q2k_full_idx) = q2k_block_sparse
+    
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,
@@ -1355,6 +1474,14 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        # Q2K block sparse for forward
+        block_sparse_mask_cnt=q2k_mask_cnt,
+        block_sparse_mask_offset=q2k_mask_offset,
+        block_sparse_mask_idx=q2k_mask_idx,
+        block_sparse_full_cnt=q2k_full_cnt,
+        block_sparse_full_offset=q2k_full_offset,
+        block_sparse_full_idx=q2k_full_idx,
+        arbitrary_func=arbitrary_func,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -1403,165 +1530,3 @@ def get_scheduler_metadata(
     return scheduler_metadata
 
 
-# ============================================================================
-# High-level API with Block Sparsity Support
-# ============================================================================
-
-def flash_attn_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: Optional[float] = None,
-    causal: bool = False,
-    window_size: Tuple[int, int] = (-1, -1),
-    attention_chunk: int = 0,
-    softcap: float = 0.0,
-    num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
-    sm_margin: int = 0,
-    # Block sparsity (accepts LinearBlockSparseTensors structure)
-    block_sparse: Optional[LinearBlockSparseTensors] = None,  # Q2K direction for forward
-    # K2Q block sparse (for backward, K2Q direction)
-    k2q_block_sparse: Optional[LinearBlockSparseTensors] = None,
-    # Arbitrary mask function tensor
-    arbitrary_func: Optional[torch.Tensor] = None,
-    # Additional optional parameters
-    k_new: Optional[torch.Tensor] = None,
-    v_new: Optional[torch.Tensor] = None,
-    qv: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    cu_seqlens_k_new: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
-    page_table: Optional[torch.Tensor] = None,
-    kv_batch_idx: Optional[torch.Tensor] = None,
-    leftpad_k: Optional[torch.Tensor] = None,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    seqlens_rotary: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    rotary_interleaved: bool = True,
-    scheduler_metadata: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Flash Attention forward pass with block sparsity support.
-    
-    This is a high-level wrapper that accepts LinearBlockSparseTensors structure
-    for block sparsity, making it easier to use with PyTorch's create_block_mask.
-    
-    Args:
-        q: Query tensor (batch_size, seqlen_q, num_heads, head_dim) or (total_q, num_heads, head_dim)
-        k: Key tensor (batch_size, seqlen_k, num_heads_k, head_dim) or (total_k, num_heads_k, head_dim)
-        v: Value tensor (batch_size, seqlen_k, num_heads_k, head_dim) or (total_k, num_heads_k, head_dim)
-        softmax_scale: Scaling factor for attention scores. Default: 1/sqrt(head_dim)
-        causal: Whether to apply causal masking
-        window_size: (left, right) for sliding window attention. (-1, -1) means no window
-        attention_chunk: Chunk size for attention (0 means no chunking)
-        softcap: Softcap value for attention (0.0 means no softcap)
-        num_splits: Number of splits for the computation
-        pack_gqa: Whether to pack GQA
-        sm_margin: SM margin for scheduling
-        block_sparse: LinearBlockSparseTensors structure containing CSR-format block sparsity info
-        arbitrary_func: Arbitrary mask function tensor [batch, head_q, func_num, seqlen_q+256], supports broadcasting (batch/head_q can be 1)
-        ... (other parameters same as _flash_attn_forward)
-    
-    Returns:
-        out: Output tensor
-        softmax_lse: Log-sum-exp of softmax
-        out_accum: Accumulated output (for splits)
-        softmax_lse_accum: Accumulated LSE (for splits)
-    
-    Example:
-        >>> # Create block sparse tensors from PyTorch's create_block_mask
-        >>> block_sparse = LinearBlockSparseTensors(
-        ...     mask_block_cnt=mask_cnt.flatten(),
-        ...     mask_block_offset=mask_offset,
-        ...     mask_block_idx=mask_idx,
-        ...     full_block_cnt=full_cnt.flatten(),
-        ...     full_block_offset=full_offset,
-        ...     full_block_idx=full_idx,
-        ... )
-        >>> out, lse, _, _ = flash_attn_forward(q, k, v, block_sparse=block_sparse)
-    """
-    # Unpack Q2K block sparsity structure (for forward)
-    if block_sparse is not None:
-        mask_cnt = block_sparse.mask_block_cnt
-        mask_offset = block_sparse.mask_block_offset
-        mask_idx = block_sparse.mask_block_idx
-        full_cnt = block_sparse.full_block_cnt
-        full_offset = block_sparse.full_block_offset
-        full_idx = block_sparse.full_block_idx
-    else:
-        mask_cnt = mask_offset = mask_idx = None
-        full_cnt = full_offset = full_idx = None
-    
-    # Unpack K2Q block sparsity structure (for backward)
-    if k2q_block_sparse is not None:
-        k2q_mask_cnt = k2q_block_sparse.mask_block_cnt
-        k2q_mask_offset = k2q_block_sparse.mask_block_offset
-        k2q_mask_idx = k2q_block_sparse.mask_block_idx
-        k2q_full_cnt = k2q_block_sparse.full_block_cnt
-        k2q_full_offset = k2q_block_sparse.full_block_offset
-        k2q_full_idx = k2q_block_sparse.full_block_idx
-    else:
-        k2q_mask_cnt = k2q_mask_offset = k2q_mask_idx = None
-        k2q_full_cnt = k2q_full_offset = k2q_full_idx = None
-    
-    return _flash_attn_forward(
-        q=q,
-        k=k,
-        v=v,
-        k_new=k_new,
-        v_new=v_new,
-        qv=qv,
-        out_=out,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        cu_seqlens_k_new=cu_seqlens_k_new,
-        seqused_q=seqused_q,
-        seqused_k=seqused_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        page_table=page_table,
-        kv_batch_idx=kv_batch_idx,
-        leftpad_k=leftpad_k,
-        rotary_cos=rotary_cos,
-        rotary_sin=rotary_sin,
-        seqlens_rotary=seqlens_rotary,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=window_size[0],
-        window_size_right=window_size[1],
-        attention_chunk=attention_chunk,
-        softcap=softcap,
-        rotary_interleaved=rotary_interleaved,
-        scheduler_metadata=scheduler_metadata,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        sm_margin=sm_margin,
-        # Q2K Block sparsity parameters (for forward, unpacked)
-        block_sparse_mask_cnt=mask_cnt,
-        block_sparse_mask_offset=mask_offset,
-        block_sparse_mask_idx=mask_idx,
-        block_sparse_full_cnt=full_cnt,
-        block_sparse_full_offset=full_offset,
-        block_sparse_full_idx=full_idx,
-        # Arbitrary mask function
-        arbitrary_func=arbitrary_func,
-        # K2Q Block sparsity parameters (for backward, unpacked)
-        k2q_block_sparse_mask_cnt=k2q_mask_cnt,
-        k2q_block_sparse_mask_offset=k2q_mask_offset,
-        k2q_block_sparse_mask_idx=k2q_mask_idx,
-        k2q_block_sparse_full_cnt=k2q_full_cnt,
-        k2q_block_sparse_full_offset=k2q_full_offset,
-        k2q_block_sparse_full_idx=k2q_full_idx,
-    )
