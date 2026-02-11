@@ -11,6 +11,7 @@ void launch_magi_to_hstu(
     int seqlen_k,
     int* d_func_out,          
     int n_func,
+    int* d_max_func_idx,
     cudaStream_t stream = nullptr
 );
 

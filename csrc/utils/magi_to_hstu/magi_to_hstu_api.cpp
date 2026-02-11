@@ -18,13 +18,13 @@
  * @param seqlen_k: key sequence length
  * @param n_max_func: maximum number of functions in output (default: 5)
  * 
- * @return func_out: [n_max_func, seqlen_q], int32, function encoding
+ * @return func_out: [n_func, seqlen_q], int32, function encoding (sliced to actual usage)
+ *         n_func = max func count across all tokens, can be obtained via func_out.size(0)
  *         Function encoding rule:
  *           interval 0: [0, F0)
  *           interval 1: [F1, F2)
  *           interval 2: [F3, F4)
  *           ...
- *         -1 indicates unused slot
  */
 at::Tensor magi_to_hstu(
     const at::Tensor& q_ranges,
@@ -64,9 +64,12 @@ at::Tensor magi_to_hstu(
     // Ensure all tensors are on the same device
     at::cuda::CUDAGuard device_guard(q_ranges.device());
     
-    // Allocate output tensor, initialized to -1 (unused)
+    // Allocate output tensor, initialized to 0
     auto opts = q_ranges.options().dtype(torch::kInt32);
     at::Tensor func_out = torch::full({n_max_func, seqlen_q}, 0, opts);
+    
+    // Allocate tensor for max_func_idx, initialized to 0
+    at::Tensor max_func_tensor = torch::zeros({1}, opts);
     
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -81,16 +84,23 @@ at::Tensor magi_to_hstu(
         seqlen_k,
         func_out.data_ptr<int>(),
         n_max_func,
+        max_func_tensor.data_ptr<int>(),
         stream
     );
     
-    return func_out;
+    // Get max_func_used from device (requires sync)
+    int64_t max_func_used = max_func_tensor.item<int>();
+    
+    // Slice func_out to actual usage, return at least 1 row if max_func_used is 0
+    max_func_used = std::max(max_func_used, static_cast<int64_t>(1));
+    return func_out.slice(0, 0, max_func_used);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "CUDA Magi-to-HSTU mask conversion";
     m.def("magi_to_hstu", &magi_to_hstu, 
-          "Convert MagiAttention mask format to HSTU function encoding",
+          "Convert MagiAttention mask format to HSTU function encoding. "
+          "Returns func_out tensor sliced to actual usage (use .size(0) for n_func).",
           py::arg("q_ranges"),
           py::arg("k_ranges"),
           py::arg("mask_types"),
