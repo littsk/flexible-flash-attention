@@ -6,9 +6,9 @@ struct Interval{
     int32_t end;
 };
 
-// MAX_MAGI_ATTN_SLICES can be overridden via compile flag -DMAX_MAGI_ATTN_SLICES=N
-#ifndef MAX_MAGI_ATTN_SLICES
-#define MAX_MAGI_ATTN_SLICES 16
+// MAX_KV_INTERVALS_PER_Q_TOKEN can be overridden via compile flag -DMAX_MAGI_ATTN_SLICES=N
+#ifndef MAX_KV_INTERVALS_PER_Q_TOKEN
+#define MAX_KV_INTERVALS_PER_Q_TOKEN 16
 #endif
 
 // sort intervals for the token in ascending order by start of each interval
@@ -61,7 +61,7 @@ __global__ void magi_to_hstu_kernel(
     int func_idx = 0;  // initialize to 0 for threads outside seqlen_q
     
     if (q_idx < seqlen_q) {
-        Interval intervals[MAX_MAGI_ATTN_SLICES];
+        Interval intervals[MAX_KV_INTERVALS_PER_Q_TOKEN];
 
         // traverse all attention slices, collect the interval list for each q
         int num_intervals = 0;
@@ -88,6 +88,7 @@ __global__ void magi_to_hstu_kernel(
             if (k_interval_start >= k_interval_end) continue;
             assert(k_interval_start >= 0 && k_interval_end <= seqlen_k);
             assert(num_intervals < num_slices);
+            assert(num_intervals < MAX_KV_INTERVALS_PER_Q_TOKEN);
             intervals[num_intervals].start = k_interval_start;
             intervals[num_intervals].end = k_interval_end;
             num_intervals++;
