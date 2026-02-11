@@ -169,10 +169,10 @@ struct Flash_fwd_params : public Qkv_params {
     // mask_block: blocks requiring masking, full_block: blocks without masking
     // batch and head_q can be 1 for broadcasting
     bool use_block_sparsity;
-    int * __restrict__ block_sparse_mask_cnt;      // [batch, head_q, num_m_blocks]: count of mask blocks per m_block 
+    int * __restrict__ block_sparse_mask_cnt;      // [batch, head_q, num_m_blocks]: count of mask blocks per m_block
     int * __restrict__ block_sparse_mask_offset;   // [batch * head_q * num_m_blocks+1]: cumulative offset into mask_idx
     int * __restrict__ block_sparse_mask_idx;      // [total_mask_blocks]: n_block indices for mask blocks
-    int * __restrict__ block_sparse_full_cnt;      // [batch, head_q, num_m_blocks]: count of full blocks per m_block  
+    int * __restrict__ block_sparse_full_cnt;      // [batch, head_q, num_m_blocks]: count of full blocks per m_block
     int * __restrict__ block_sparse_full_offset;   // [batch * head_q * num_m_blocks+1]: cumulative offset into full_idx
     int * __restrict__ block_sparse_full_idx;      // [total_full_blocks]: n_block indices for full blocks
     int block_sparse_num_blocks;                   // num_m_blocks (for computing flat index)
@@ -183,7 +183,7 @@ struct Flash_fwd_params : public Qkv_params {
     // Shape: [batch or 1, head_q or 1, func_num, seqlen_q + 256] where func_num is odd, 1 for broadcasting if head_q is 1 or batch is 1
     // For each row, stores valid column ranges:
     //   col_max[0] = arbitrary_func[batch, 0, 0, row] - first valid range upper bound
-    //   col_min[i] = arbitrary_func[batch, 0, 2*i+1, row] - (i+1)th valid range lower bound  
+    //   col_min[i] = arbitrary_func[batch, 0, 2*i+1, row] - (i+1)th valid range lower bound
     //   col_max[i+1] = arbitrary_func[batch, 0, 2*i+2, row] - (i+1)th valid range upper bound
     // Arbitrary mask function tensor for element-level masking (controlled by Is_arbitrary template param)
     int * __restrict__ mask_func_ptr;              // [batch or 1, head_q or 1, func_num, seqlen_q + 256], contiguous (seq_stride = 1)
@@ -250,10 +250,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, int kNFunc>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
-template <int Arch, typename T, int kHeadDim, bool Has_softcap>
+template <int Arch, typename T, int kHeadDim, bool Has_softcap, int kNFunc>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 template <typename T, typename Tpartial, int kBlockK>
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);

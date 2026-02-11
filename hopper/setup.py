@@ -524,6 +524,11 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SM90:
         cc_flag.append("-gencode")
         cc_flag.append("arch=compute_90a,code=sm_90a")
+    elif not DISABLE_SM8x:
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_80,code=sm_80")
+    else:
+        raise RuntimeError("No SM architecture is enabled")
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -613,14 +618,28 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
-    
+
+    # Per-nfunc instantiation files for parallel compilation of arbitrary mask kernels
+    # Each nfunc value gets its own .cu file (per SM arch and direction), so they compile in parallel
+    sources_nfunc = []
+    if not DISABLE_ARBITRARY and NUM_FUNC_VALUES:
+        for nfunc_val in NUM_FUNC_VALUES:
+            if not DISABLE_SM90:
+                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm90.cu")
+                if not DISABLE_BACKWARD:
+                    sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm90.cu")
+            if not DISABLE_SM8x:
+                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm80.cu")
+                if not DISABLE_BACKWARD:
+                    sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm80.cu")
+
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
     # Can be overridden by setting FLASH_ATTENTION_FORCE_UNSTABLE_API=TRUE
     FORCE_UNSTABLE_API = os.getenv("FLASH_ATTENTION_FORCE_UNSTABLE_API", "FALSE") == "TRUE"
     torch_version = parse(torch.__version__)
     target_version = parse("2.9.0.dev20250830")
     stable_args = []
-      
+
     if torch_version >= target_version and not FORCE_UNSTABLE_API:
         flash_api_source = "flash_api_stable.cpp"
         stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
@@ -631,6 +650,7 @@ if not SKIP_CUDA_BUILD:
         [flash_api_source]
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + (sources_fwd_sm90 if not DISABLE_SM90 else [])
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + (sources_bwd_sm90 if not DISABLE_SM90 else [])
+        + sources_nfunc
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]

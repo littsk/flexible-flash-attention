@@ -35,7 +35,7 @@ from test_arbitrary_mask import (
     COMPILED_HDIMS,
     HAS_CREATE_BLOCK_MASK_CUDA,
     NATIVE_MASK_PATTERNS,
-    
+
     # Helper functions
     flex_arbitrary_mask,
     apply_arbitrary_mask_to_qk,
@@ -43,11 +43,11 @@ from test_arbitrary_mask import (
     compute_reference_arbitrary,
     compare_linear_sparse_tensors,
     bhqk_to_linear_sparse_tensors_local,
-    
+
     # Test functions
     _run_mask_test,
     test_arbitrary_mask,
-    
+
     # Benchmark function
     benchmark_arbitrary_mask,
 )
@@ -62,10 +62,10 @@ if __name__ == "__main__":
     # Set seed for reproducibility
     import torch
     torch.random.manual_seed(0)
-    
+
     print(f"Running arbitrary mask test with backend: {BACKEND}")
     print(f"Compute capability: {COMPUTE_CAPABILITY}")
-    
+
     # Test with block sparsity (causal pattern via arbitrary mask)
     print("\n" + "="*70)
     print("Test 1: Block sparsity + arbitrary mask (causal pattern, broadcast)")
@@ -84,7 +84,7 @@ if __name__ == "__main__":
         qhead_broadcast=True,
         deterministic=False,
     )
-    
+
     # Test with block sparsity (causal pattern via arbitrary mask)
     print("\n" + "="*70)
     print("Test 1: Block sparsity + arbitrary mask (causal pattern, broadcast)")
@@ -103,7 +103,7 @@ if __name__ == "__main__":
         qhead_broadcast=True,
         deterministic=False,
     )
-    
+
     # Test without broadcast
     print("\n" + "="*70)
     print("Test 2: Block sparsity + arbitrary mask (no broadcast)")
@@ -122,7 +122,7 @@ if __name__ == "__main__":
         qhead_broadcast=False,
         deterministic=False,
     )
-    
+
     # Run benchmark (use GQA mode for better compatibility)
     print("\n" + "="*70)
     print("Benchmark: fixed mask vs arbitrary mask")

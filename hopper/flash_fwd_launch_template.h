@@ -168,7 +168,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
-        params.seqlen_k, params.d, params.dv, sizeof(Element), 
+        params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         params.num_splits_dynamic_ptr,
         params.num_m_blocks_ptr,
@@ -215,27 +215,42 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-// Forward function with arbitrary mask support via NFUNC_SWITCH (similar to causal/local)
-template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+// Forward function with kNFunc as a template parameter for parallel compilation of nfunc variants.
+// NFUNC_SWITCH dispatch is done in flash_api.cpp, so each kNFunc value compiles in a separate TU.
+template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, int kNFunc>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        // Use NFUNC_SWITCH early to determine Is_arbitrary for tile_size calculation
-        NFUNC_SWITCH(params.is_arbitrary, params.arbitrary_func_num, kNFunc, [&] {
-            static constexpr bool Is_arbitrary = kNFunc > 0;
-            // Assert: compile-time kNFunc must match runtime arbitrary_func_num
-            if constexpr (Is_arbitrary) {
-                FLASH_CHECK(kNFunc == params.arbitrary_func_num,
-                    "Compile-time kNFunc (%d) must match runtime arbitrary_func_num (%d). "
-                    "Please recompile with FLASH_ATTENTION_NUM_FUNC including %d",
-                    kNFunc, params.arbitrary_func_num, params.arbitrary_func_num);
-            }
+    static constexpr bool Is_arbitrary = kNFunc > 0;
+    if constexpr (Is_arbitrary) {
+        // Assert: compile-time kNFunc must match runtime arbitrary_func_num
+        FLASH_CHECK(kNFunc == params.arbitrary_func_num,
+            "Compile-time kNFunc (%d) must match runtime arbitrary_func_num (%d). "
+            "Please recompile with FLASH_ATTENTION_NUM_FUNC including %d",
+            kNFunc, params.arbitrary_func_num, params.arbitrary_func_num);
+        VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
+            static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
+            VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
+                // Is_arbitrary is available for tile_size calculation
+                static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, false, false, Is_arbitrary, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
+                static constexpr bool Enable_cluster = false;
+                BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
+                    static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
+                    APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                        static constexpr int ClusterM = 1;
+                        // Disable PackGQA when using arbitrary mask
+                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, false, false, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA && !Is_arbitrary, Split, V_colmajor, Is_arbitrary, kNFunc>(params, stream);
+                    });
+                });
+            });
+        });
+    } else {
+        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
             VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
                 static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
                 VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                    // Now Is_arbitrary is available for tile_size calculation
+                    // Is_arbitrary is available for tile_size calculation
                     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, Is_arbitrary, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap)) : 128;
                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Is_arbitrary && !Split && !PagedKVNonTMA && !Varlen;
                     BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
@@ -252,5 +267,5 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                 });
             });
         });
-    });
+    }
 }

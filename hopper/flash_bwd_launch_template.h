@@ -322,27 +322,49 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 
-// Unified backward kernel launcher with kHeadDim as template parameter
-// Same design pattern as forward's run_flash_fwd
-template<int Arch, typename T, int kHeadDim, bool Has_softcap>
+// Unified backward kernel launcher with kHeadDim and kNFunc as template parameters.
+// NFUNC_SWITCH dispatch is done in flash_api.cpp, so each kNFunc value compiles in a separate TU.
+template<int Arch, typename T, int kHeadDim, bool Has_softcap, int kNFunc>
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream) {
-    CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
-        NFUNC_SWITCH(params.is_arbitrary, params.arbitrary_func_num, kNFunc, [&] {
-            static constexpr bool Is_arbitrary = kNFunc > 0;
-            if constexpr (Is_arbitrary) {
-                FLASH_CHECK(kNFunc == params.arbitrary_func_num,
-                    "Compile-time kNFunc (%d) must match runtime arbitrary_func_num (%d). "
-                    "Please recompile with FLASH_ATTENTION_NUM_FUNC including %d",
-                    kNFunc, params.arbitrary_func_num, params.arbitrary_func_num);
-            }
-            
+    static constexpr bool Is_arbitrary = kNFunc > 0;
+    if constexpr (Is_arbitrary) {
+        FLASH_CHECK(kNFunc == params.arbitrary_func_num,
+            "Compile-time kNFunc (%d) must match runtime arbitrary_func_num (%d). "
+            "Please recompile with FLASH_ATTENTION_NUM_FUNC including %d",
+        kNFunc, params.arbitrary_func_num, params.arbitrary_func_num);
+        // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
+        // Returns {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+        //          NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
+        static constexpr auto kConfig = Arch >= 90
+            ? tile_size_bwd_sm90(kHeadDim, false, false, Is_arbitrary, Has_softcap)
+            : tile_size_bwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, false, false, Is_arbitrary, Has_softcap);
+
+        static constexpr int kBlockM = std::get<0>(kConfig);
+        static constexpr int kBlockN = std::get<1>(kConfig);
+        static constexpr int Stages_dO = std::get<2>(kConfig);
+        static constexpr int Stages_dS = std::get<3>(kConfig);
+        static constexpr bool SdP_swapAB = std::get<4>(kConfig);
+        static constexpr bool dKV_swapAB = std::get<5>(kConfig);
+        static constexpr bool dQ_swapAB = std::get<6>(kConfig);
+        static constexpr int NumMmaWarpGroups = std::get<7>(kConfig);
+        static constexpr int AtomLayoutMSdP = std::get<8>(kConfig);
+        static constexpr int AtomLayoutNdKV = std::get<9>(kConfig);
+        static constexpr int AtomLayoutMdQ = std::get<10>(kConfig);
+        static constexpr bool V_in_regs = std::get<11>(kConfig);
+
+        run_mha_bwd_dispatch<Arch, T, kBlockM, kBlockN, kHeadDim, false, false, Has_softcap,
+            Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
+            NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+            V_in_regs, Is_arbitrary, kNFunc>(params, stream);
+    } else {
+        CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
             // Get all configuration from tile_size.h (single source of truth) - same pattern as forward
             // Returns {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
             //          NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
-            static constexpr auto kConfig = Arch >= 90 
+            static constexpr auto kConfig = Arch >= 90
                 ? tile_size_bwd_sm90(kHeadDim, Is_causal, Is_local, Is_arbitrary, Has_softcap)
                 : tile_size_bwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, Is_causal, Is_local, Is_arbitrary, Has_softcap);
-            
+
             static constexpr int kBlockM = std::get<0>(kConfig);
             static constexpr int kBlockN = std::get<1>(kConfig);
             static constexpr int Stages_dO = std::get<2>(kConfig);
@@ -355,11 +377,11 @@ void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream) {
             static constexpr int AtomLayoutNdKV = std::get<9>(kConfig);
             static constexpr int AtomLayoutMdQ = std::get<10>(kConfig);
             static constexpr bool V_in_regs = std::get<11>(kConfig);
-            
+
             run_mha_bwd_dispatch<Arch, T, kBlockM, kBlockN, kHeadDim, Is_causal, Is_local, Has_softcap,
                 Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
                 NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
                 V_in_regs, Is_arbitrary, kNFunc>(params, stream);
         });
-    });
+    }
 }
