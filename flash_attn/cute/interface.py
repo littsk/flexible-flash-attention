@@ -982,11 +982,11 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            blocksparse_tensors=cute_block_sparse_tensors,
-            aux_tensors=cute_aux_tensors,
-            mdQ_semaphore=dQ_semaphore_tensor,
-            mdK_semaphore=dK_semaphore_tensor,
-            mdV_semaphore=dV_semaphore_tensor,
+            cute_block_sparse_tensors,
+            cute_aux_tensors,
+            dQ_semaphore_tensor,
+            dK_semaphore_tensor,
+            dV_semaphore_tensor,
             options="--enable-tvm-ffi"
         )
     # Execute with torch tensors directly
