@@ -48,6 +48,18 @@ project_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 #   DISABLE_REG_CACHE=1 DISABLE_KV_RANGE_OPT=1 DISABLE_BLOCK_SIZE_TEMPLATE=1 python setup.py build_ext --inplace
 # ============================================================================
 
+import torch
+
+def get_cuda_gencode_flags():
+    """Detect current GPU architecture and return appropriate -gencode flags."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available, cannot determine target architecture")
+    capability = torch.cuda.get_device_capability()
+    arch = capability[0] * 10 + capability[1]
+    return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+
+cuda_gencode_flags = get_cuda_gencode_flags()
+
 extra_defines = []
 disable_reg_cache = os.environ.get("DISABLE_REG_CACHE")
 disable_kv_range_opt = os.environ.get("DISABLE_KV_RANGE_OPT")
@@ -89,9 +101,7 @@ setup(
                 "nvcc": [
                     "-O3",
                     "--use_fast_math",
-                    # Only compile for SM 80+ (Ampere and newer)
-                    "-gencode", "arch=compute_80,code=sm_80",
-                ] + extra_defines,
+                ] + cuda_gencode_flags + extra_defines,
             },
             include_dirs=[this_dir, project_root],  # project_root for hopper/tile_size.h
         )
