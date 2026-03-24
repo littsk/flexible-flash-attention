@@ -128,11 +128,24 @@
   #define CLUSTER_SWITCH BOOL_SWITCH
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_SM8x
+#if defined(FLASHATTENTION_DISABLE_SM8x) && defined(FLASHATTENTION_DISABLE_SM90)
+  #error "Cannot disable both SM8x and SM90. At least one architecture must be enabled."
+#elif defined(FLASHATTENTION_DISABLE_SM8x)
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
   [&] {                                                                                          \
     constexpr static int ARCH_NAME = 90;                                                         \
     return __VA_ARGS__();                                                                        \
+  }()
+#elif defined(FLASHATTENTION_DISABLE_SM90)
+  #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
+  [&] {                                                                                          \
+    if (ARCH == 86 || ARCH == 89) {                                                              \
+      constexpr static int ARCH_NAME = 86;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int ARCH_NAME = 80;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
   }()
 #else
   #define ARCH_SWITCH(ARCH, ARCH_NAME, ...)                                                      \
@@ -202,3 +215,207 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+// NFUNC_SWITCH - switch based on arbitrary_func_num value
+// Controlled by FLASH_ATTENTION_NUM_FUNC environment variable
+// Valid values are odd numbers from 1 to 33 (e.g., "1,3,5")
+// When Is_arbitrary is false, kNFunc is 0
+// When Is_arbitrary is true, kNFunc is determined by params.arbitrary_func_num
+// Each supported value generates -DFLASHATTENTION_NFUNC_X compile flag
+
+// Define NFUNC_SWITCH_CASE macros - only compile if corresponding macro is defined
+#ifdef FLASHATTENTION_NFUNC_1
+  #define NFUNC_SWITCH_CASE_1(NFUNC_VALUE, CONST_NAME, ...)                                      \
+    if ((NFUNC_VALUE) == 1) { constexpr static int CONST_NAME = 1; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_1(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_3
+  #define NFUNC_SWITCH_CASE_3(NFUNC_VALUE, CONST_NAME, ...)                                      \
+    if ((NFUNC_VALUE) == 3) { constexpr static int CONST_NAME = 3; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_3(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_5
+  #define NFUNC_SWITCH_CASE_5(NFUNC_VALUE, CONST_NAME, ...)                                      \
+    if ((NFUNC_VALUE) == 5) { constexpr static int CONST_NAME = 5; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_5(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_7
+  #define NFUNC_SWITCH_CASE_7(NFUNC_VALUE, CONST_NAME, ...)                                      \
+    if ((NFUNC_VALUE) == 7) { constexpr static int CONST_NAME = 7; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_7(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_9
+  #define NFUNC_SWITCH_CASE_9(NFUNC_VALUE, CONST_NAME, ...)                                      \
+    if ((NFUNC_VALUE) == 9) { constexpr static int CONST_NAME = 9; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_9(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_11
+  #define NFUNC_SWITCH_CASE_11(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 11) { constexpr static int CONST_NAME = 11; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_11(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_13
+  #define NFUNC_SWITCH_CASE_13(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 13) { constexpr static int CONST_NAME = 13; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_13(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_15
+  #define NFUNC_SWITCH_CASE_15(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 15) { constexpr static int CONST_NAME = 15; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_15(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_17
+  #define NFUNC_SWITCH_CASE_17(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 17) { constexpr static int CONST_NAME = 17; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_17(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_19
+  #define NFUNC_SWITCH_CASE_19(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 19) { constexpr static int CONST_NAME = 19; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_19(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_21
+  #define NFUNC_SWITCH_CASE_21(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 21) { constexpr static int CONST_NAME = 21; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_21(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_23
+  #define NFUNC_SWITCH_CASE_23(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 23) { constexpr static int CONST_NAME = 23; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_23(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_25
+  #define NFUNC_SWITCH_CASE_25(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 25) { constexpr static int CONST_NAME = 25; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_25(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_27
+  #define NFUNC_SWITCH_CASE_27(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 27) { constexpr static int CONST_NAME = 27; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_27(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_29
+  #define NFUNC_SWITCH_CASE_29(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 29) { constexpr static int CONST_NAME = 29; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_29(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_31
+  #define NFUNC_SWITCH_CASE_31(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 31) { constexpr static int CONST_NAME = 31; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_31(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+#ifdef FLASHATTENTION_NFUNC_33
+  #define NFUNC_SWITCH_CASE_33(NFUNC_VALUE, CONST_NAME, ...)                                     \
+    if ((NFUNC_VALUE) == 33) { constexpr static int CONST_NAME = 33; return __VA_ARGS__(); }
+#else
+  #define NFUNC_SWITCH_CASE_33(NFUNC_VALUE, CONST_NAME, ...)
+#endif
+
+// Default value for fallback - use the first enabled NFUNC value
+#if defined(FLASHATTENTION_NFUNC_1)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 1
+#elif defined(FLASHATTENTION_NFUNC_3)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 3
+#elif defined(FLASHATTENTION_NFUNC_5)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 5
+#elif defined(FLASHATTENTION_NFUNC_7)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 7
+#elif defined(FLASHATTENTION_NFUNC_9)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 9
+#elif defined(FLASHATTENTION_NFUNC_11)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 11
+#elif defined(FLASHATTENTION_NFUNC_13)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 13
+#elif defined(FLASHATTENTION_NFUNC_15)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 15
+#elif defined(FLASHATTENTION_NFUNC_17)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 17
+#elif defined(FLASHATTENTION_NFUNC_19)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 19
+#elif defined(FLASHATTENTION_NFUNC_21)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 21
+#elif defined(FLASHATTENTION_NFUNC_23)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 23
+#elif defined(FLASHATTENTION_NFUNC_25)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 25
+#elif defined(FLASHATTENTION_NFUNC_27)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 27
+#elif defined(FLASHATTENTION_NFUNC_29)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 29
+#elif defined(FLASHATTENTION_NFUNC_31)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 31
+#elif defined(FLASHATTENTION_NFUNC_33)
+  #define NFUNC_SWITCH_DEFAULT_VALUE 33
+#else
+  #define NFUNC_SWITCH_DEFAULT_VALUE 1
+#endif
+
+// When ARBITRARY is disabled, only generate the Is_arbitrary=false path
+#ifdef FLASHATTENTION_DISABLE_ARBITRARY
+  #define NFUNC_SWITCH(IS_ARBITRARY, NFUNC_VALUE, CONST_NAME, ...)                               \
+    [&] {                                                                                        \
+      constexpr static int CONST_NAME = 0;                                                       \
+      return __VA_ARGS__();                                                                      \
+    }()
+#else
+  #define NFUNC_SWITCH(IS_ARBITRARY, NFUNC_VALUE, CONST_NAME, ...)                               \
+    [&] {                                                                                        \
+      if (!(IS_ARBITRARY)) {                                                                     \
+        constexpr static int CONST_NAME = 0;                                                     \
+        return __VA_ARGS__();                                                                    \
+      }                                                                                          \
+      /* Check each possible value, only compile if corresponding macro is defined */            \
+      NFUNC_SWITCH_CASE_1(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                  \
+      NFUNC_SWITCH_CASE_3(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                  \
+      NFUNC_SWITCH_CASE_5(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                  \
+      NFUNC_SWITCH_CASE_7(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                  \
+      NFUNC_SWITCH_CASE_9(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                  \
+      NFUNC_SWITCH_CASE_11(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_13(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_15(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_17(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_19(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_21(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_23(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_25(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_27(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_29(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_31(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      NFUNC_SWITCH_CASE_33(NFUNC_VALUE, CONST_NAME, __VA_ARGS__)                                 \
+      /* Fallback: use default value to satisfy compiler */                                      \
+      constexpr static int CONST_NAME = NFUNC_SWITCH_DEFAULT_VALUE;                              \
+      return __VA_ARGS__();                                                                      \
+    }()
+#endif

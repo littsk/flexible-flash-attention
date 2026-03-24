@@ -156,7 +156,7 @@ public:
             Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
             Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
             bool tile_valid = mainloop.mma(params.mainloop, tdKrdK, tdVrdV, threadIdx.x,
-                                           block_coord, shared_storage);
+                                           block_coord, shared_storage, params.mainloop.block_sparse);
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {
                 epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
