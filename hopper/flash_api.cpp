@@ -1023,6 +1023,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.func_batch_stride = arbitrary_func.stride(0);
         params.func_head_stride = arbitrary_func.stride(1);
         params.func_nfunc_stride = arbitrary_func.stride(2);
+
+        // debug print shape and stride
+        // printf("arbitrary_func shape: %ld, %ld, %ld, %ld\n", arbitrary_func.size(0), arbitrary_func.size(1), arbitrary_func.size(2), arbitrary_func.size(3));
+        // printf("arbitrary_func stride: %ld, %ld, %ld, %ld\n", arbitrary_func.stride(0), arbitrary_func.stride(1), arbitrary_func.stride(2), arbitrary_func.stride(3));
     }
 
     // Set block sparsity parameters
@@ -1032,7 +1036,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                             block_sparse_full_cnt_.has_value() &&
                             block_sparse_full_offset_.has_value() &&
                             block_sparse_full_idx_.has_value();
-    params.use_block_sparsity = use_block_sparsity;
+                            params.use_block_sparsity = use_block_sparsity;
 
     if (use_block_sparsity) {
         // Block sparsity is supported on both SM80+ (Ampere) and SM90+ (Hopper)
@@ -1816,11 +1820,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
     params.dq_semaphore = dq_semaphore.data_ptr<int>();
-    at::Tensor dk_semaphore, dv_semaphore;
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
-        dk_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
-        dv_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
+        at::Tensor dk_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
+        at::Tensor dv_semaphore = torch::zeros({(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, opts.dtype(torch::kInt32));
         params.dk_semaphore = dk_semaphore.data_ptr<int>();
         params.dv_semaphore = dv_semaphore.data_ptr<int>();
     }

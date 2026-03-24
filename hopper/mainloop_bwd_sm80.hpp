@@ -426,7 +426,7 @@ struct CollectiveMainloopBwdSm80 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
         }
-
+        
         // For block sparsity, check if there are any blocks to process
         if constexpr (Use_block_sparsity) {
             BlockSparsityInfoBwd block_sparse_info;
@@ -731,7 +731,7 @@ struct CollectiveMainloopBwdSm80 {
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
             int const total_blocks = block_sparse_info.get_total_blocks();
-
+            
             // Preload first kStages blocks
             for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
                 static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
@@ -949,26 +949,26 @@ struct CollectiveMainloopBwdSm80 {
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
             int const total_blocks = block_sparse_info.get_total_blocks();
             int sparse_iter = 0;  // Current iteration index for block sparse
-
+            
             // Construct gMaskFunc tensor for arbitrary mask (only when Is_arbitrary is true)
             // mMaskFunc has shape (seqlen_q + 256, func_num, head_q or 1, batch or 1), stride (1, func_nfunc_stride, func_head_stride, func_batch_stride)
             // After local tile with batch/head/m_block, gMaskFunc has shape (kNFunc, kBlockM)
             [[maybe_unused]] auto construct_gMaskFunc = [&](int m_block) {
                 // Use kNFunc or 1 (fake) to avoid zero-size shape when Is_arbitrary is false
                 constexpr int kNFuncSafe = Is_arbitrary ? kNFunc : 1;
-                Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr),
+                Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr), 
                                                params.shape_mask_func, params.stride_mask_func);
                 // Support broadcasting: use _0{} when head/batch dimension is 1
                 // shape_mask_func: (seqlen_q + 256, func_num, head_q or 1, batch or 1)
                 int const Func_head_idx = get<2>(params.shape_mask_func) == 1 ? 0 : bidh;
                 int const Func_batch_idx = get<3>(params.shape_mask_func) == 1 ? 0 : bidb;
-                Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{},
+                Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{}, 
                                               make_coord(m_block, 0, Func_head_idx, Func_batch_idx));
-                return make_tensor(gMaskFunc.data(),
+                return make_tensor(gMaskFunc.data(), 
                                    make_layout(make_shape(Int<kNFuncSafe>{}, Int<kBlockM>{}),
                                                make_stride(get<1>(gMaskFunc.stride()), get<0>(gMaskFunc.stride()))));
             };
-
+            
             // Modified load_Q_next for block sparse (uses sparse_iter index)
             auto load_Q_next_sparse = [&] {
                 int next_idx = sparse_iter + (kStages > 1 ? kStages - 1 : 1);
@@ -978,7 +978,7 @@ struct CollectiveMainloopBwdSm80 {
                 }
                 cute::cp_async_fence();
             };
-
+            
             // Modified load_dO_next for block sparse
             auto load_dO_next_sparse = [&] {
                 int next_idx = sparse_iter + kStages_dO;
@@ -988,7 +988,7 @@ struct CollectiveMainloopBwdSm80 {
                 }
                 cute::cp_async_fence();
             };
-
+            
             // Block sparse version of bwd_step that uses sparse iteration index for preloading
             auto bwd_step_sparse = [&](int m_block, auto mask_fn) {
                 Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
@@ -1122,12 +1122,12 @@ struct CollectiveMainloopBwdSm80 {
                 smem_pipe_write_do = smem_pipe_write_do < kStages_dO - 1 ? smem_pipe_write_do + 1 : 0;
                 ++sparse_iter;  // Increment sparse iteration counter
             };
-
+            
             // Mask functions for arbitrary block sparsity:
             // - For mask_blocks: apply arbitrary mask only (Seqlenk info is already in MaskFunc, and need Seqlen_mask)
-            // - For full_blocks: no mask needed
+            // - For full_blocks: no mask needed 
             // cjerry comment this
-            // TODO: Should the handling of out-of-bounds Seqlen Q be placed in the first mblock, regardless of whether it is full or masked?
+            // TODO: Should the handling of out-of-bounds Seqlen Q be placed in the first mblock, regardless of whether it is full or masked? 
             // TODO: Currently, blocks with out-of-bounds Seqlen Q are treated as mask blocks during the backward pass.
             // TODO: Alternatively, only the first mblock performs the Seqlen_mask.
             auto arbitrary_mask_fn = [&](auto& tSrS, int m_block) {
@@ -1138,7 +1138,7 @@ struct CollectiveMainloopBwdSm80 {
             };
             // No mask function (for full_blocks)
             auto no_mask_fn = [](auto& tSrS, int m_block) { };
-
+            
             // Use block sparse consume function with the sparse version of bwd_step
             flash::consume_block_sparse_mma_bwd(
                 block_sparse_info,
@@ -1150,7 +1150,7 @@ struct CollectiveMainloopBwdSm80 {
             // ============================================================
             // Non-Block Sparse Path (original code)
             // ============================================================
-
+            
             // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
             // this helps quite a bit to not have to do causal masking for most of the iterations.
             if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {

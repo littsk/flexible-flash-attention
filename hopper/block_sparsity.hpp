@@ -32,14 +32,14 @@ struct BlockSparsityArguments {
     int const* mask_block_offset = nullptr;
     // mask_block_idx[offset]: the n_block index
     int const* mask_block_idx = nullptr;
-
+    
     // full_block_cnt[flat_idx]: number of full blocks for this m_block
     int const* full_block_cnt = nullptr;
-    // full_block_offset[flat_idx]: cumulative offset into full_block_idx
+    // full_block_offset[flat_idx]: cumulative offset into full_block_idx  
     int const* full_block_offset = nullptr;
     // full_block_idx[offset]: the n_block index
     int const* full_block_idx = nullptr;
-
+    
     // Number of m_blocks (needed for computing flat index)
     int num_blocks = 0;
     // Number of heads (needed for computing flat index, can be 1 for broadcasting)
@@ -54,7 +54,7 @@ using BlockSparsityParams = BlockSparsityArguments;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Helper struct to hold block sparsity info for a single m_block during kernel execution
-//
+// 
 // - Mask blocks are processed first, in REVERSE order (highest index first)
 // - Full blocks are processed second, in REVERSE order (highest index first)
 // - This matches the producer/consumer pipeline synchronization
@@ -80,19 +80,19 @@ struct BlockSparsityInfo {
     int full_block_offset = 0;
     int const* mask_block_idx = nullptr;
     int const* full_block_idx = nullptr;
-
+    
     CUTLASS_DEVICE
     BlockSparsityInfo() = default;
-
+    
     // Compute flat index for accessing block sparsity arrays
     CUTLASS_DEVICE
     static int compute_flat_idx(int bidb, int bidh, int m_block, int num_heads, int num_blocks) {
         return bidb * num_heads * num_blocks + bidh * num_blocks + m_block;
     }
-
+    
     // Initialize from params for a specific (bidb, bidh, m_block)
     // Supports broadcasting: when num_heads=1 or num_batches=1, all heads/batches share the same sparsity pattern
-    CUTLASS_DEVICE
+    CUTLASS_DEVICE  
     void init(BlockSparsityParams const& params, int bidb, int bidh, int m_block) {
         // Support broadcasting: use 0 when dimension is 1
         int const sparse_batch_idx = params.num_batches == 1 ? 0 : bidb;
@@ -105,17 +105,17 @@ struct BlockSparsityInfo {
         full_block_offset = params.full_block_offset[flat_idx];
         full_block_idx = params.full_block_idx;
     }
-
+    
     CUTLASS_DEVICE
     int get_total_blocks() const {
         return mask_block_cnt + full_block_cnt;
     }
-
+    
     CUTLASS_DEVICE
     bool is_empty() const {
         return get_total_blocks() == 0;
     }
-
+    
     // Get n_block at iteration position idx (REVERSE order within each block type)
     // idx=0 returns the LAST mask block, idx=mask_block_cnt-1 returns the FIRST mask block
     // idx=mask_block_cnt returns the LAST full block, etc.
@@ -132,7 +132,7 @@ struct BlockSparsityInfo {
             return full_block_idx[full_block_offset + reverse_idx];
         }
     }
-
+    
     // Get n_block at raw position (no reverse, for direct index access)
     CUTLASS_DEVICE
     int get_n_block_raw(int idx) const {
@@ -143,25 +143,25 @@ struct BlockSparsityInfo {
             return full_block_idx[full_block_offset + full_idx];
         }
     }
-
+    
     // Check if iteration position idx is a mask block (requires masking with mask_mod/arbitrary mask)
     CUTLASS_DEVICE
     bool is_mask_block(int idx) const {
         return idx < mask_block_cnt;
     }
-
+    
     // Check if this is the first block being processed (for softmax is_first initialization)
     CUTLASS_DEVICE
     bool is_first_block(int idx) const {
         return idx == 0;
     }
-
+    
     // Check if this is the first full block (transition from mask to full blocks)
     CUTLASS_DEVICE
     bool is_first_full_block(int idx) const {
         return idx == mask_block_cnt && full_block_cnt > 0;
     }
-
+    
     // Check if mask_seqlen should be true for this iteration
     // mask_seqlen is true for:
     //   1. The very first block (idx == 0)
@@ -170,7 +170,7 @@ struct BlockSparsityInfo {
     bool needs_seqlen_mask(int idx) const {
         return is_first_block(idx) || is_first_full_block(idx);
     }
-
+    
     // Check if mask_mod (arbitrary mask) should be applied for this iteration
     // mask_mod is only applied for mask blocks, not full blocks
     CUTLASS_DEVICE
@@ -186,79 +186,79 @@ struct BlockSparsityInfo {
 struct BlockSparsityIterator {
     BlockSparsityInfo const& info;
     int current_idx = 0;  // iteration index (0 = first to process = last mask block)
-
+    
     CUTLASS_DEVICE
     BlockSparsityIterator(BlockSparsityInfo const& info_, int start_idx = 0)
         : info(info_), current_idx(start_idx) {}
-
+    
     // Returns the n_block index for the current position
     CUTLASS_DEVICE
     int get_n_block() const {
         return info.get_n_block(current_idx);
     }
-
+    
     // Returns whether current block is a mask (partial) block that needs mask_mod
     CUTLASS_DEVICE
     bool is_mask_block() const {
         return info.is_mask_block(current_idx);
     }
-
+    
     // Returns whether current block is a full block (no mask_mod needed)
     CUTLASS_DEVICE
     bool is_full_block() const {
         return !is_mask_block();
     }
-
+    
     // Check if this is the first block being processed (for softmax is_first)
     CUTLASS_DEVICE
     bool is_first() const {
         return info.is_first_block(current_idx);
     }
-
+    
     // Check if this is the first full block (boundary between mask and full)
     CUTLASS_DEVICE
     bool is_first_full() const {
         return info.is_first_full_block(current_idx);
     }
-
+    
     // Check if mask_seqlen should be true for current iteration
     // True for: first block overall OR first full block
     CUTLASS_DEVICE
     bool needs_seqlen_mask() const {
         return info.needs_seqlen_mask(current_idx);
     }
-
+    
     // Check if mask_mod (arbitrary mask) should be applied for current iteration
     // Only true for mask blocks, not full blocks
     CUTLASS_DEVICE
     bool needs_mask_mod() const {
         return info.needs_mask_mod(current_idx);
     }
-
+    
     // Check if iterator is valid (more blocks to process)
     CUTLASS_DEVICE
     bool is_valid() const {
         return current_idx < info.get_total_blocks();
     }
-
+    
     // Advance to next block
     CUTLASS_DEVICE
     void advance() {
         ++current_idx;
     }
-
+    
     // Get number of remaining blocks (including current)
     CUTLASS_DEVICE
     int remaining() const {
         return info.get_total_blocks() - current_idx;
     }
-
+    
     // Get current iteration index
     CUTLASS_DEVICE
     int get_idx() const {
         return current_idx;
     }
-
+    
     // Get total number of blocks
     CUTLASS_DEVICE
     int get_total() const {
@@ -278,7 +278,7 @@ struct BlockSparsity {
     using Params = BlockSparsityParams;
     using Info = BlockSparsityInfo;
     using Iterator = BlockSparsityIterator;
-
+    
     // Convert Arguments to Params (identity for now, can be optimized later)
     static Params
     to_underlying_arguments(Arguments const& args) {
@@ -317,8 +317,8 @@ void finish_overlap_v_load(
         // First index = last block in reverse order
         int n_block_last = block_idx[block_offset];
         if constexpr (!Transpose_V) {
-            if (should_load_KV) {
-                load_V(n_block_last, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+            if (should_load_KV) { 
+                load_V(n_block_last, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); 
             }
         }
         ++smem_pipe_write;
@@ -363,10 +363,10 @@ void load_block_list(
     bool should_load_KV
 ) {
     if (block_count <= 0) return;
-
+    
     // Reverse iteration: from block_count-1 to 0
     int n_block_first = block_idx[block_offset + block_count - 1];
-
+    
     if constexpr (!IntraWGOverlap) {
         // ============================================================
         // Non-overlap path: sequential K, V loads
@@ -378,8 +378,8 @@ void load_block_list(
                 } else {
                     paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block_first);
                 }
-                if constexpr (Transpose_V) {
-                    load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+                if constexpr (Transpose_V) { 
+                    load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); 
                 }
                 load_K(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             }
@@ -388,13 +388,13 @@ void load_block_list(
             }
         }
         if constexpr (!Transpose_V) {
-            if (should_load_KV) {
-                load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+            if (should_load_KV) { 
+                load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); 
             }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
-
+        
         // Remaining iterations
         for (int i = 1; i < block_count; ++i) {
             int n_block = block_idx[block_offset + block_count - 1 - i];
@@ -404,8 +404,8 @@ void load_block_list(
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) {
-                    load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                if constexpr (Transpose_V) { 
+                    load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); 
                 }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
@@ -426,8 +426,8 @@ void load_block_list(
                 } else {
                     paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block_first);
                 }
-                if constexpr (Transpose_V) {
-                    load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
+                if constexpr (Transpose_V) { 
+                    load_V(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); 
                 }
                 load_K(n_block_first, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             }
@@ -436,23 +436,23 @@ void load_block_list(
             }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
-
+        
         // Interleaved K[i+1] and V[i] loads
         for (int i = 0; i < block_count - 1; ++i) {
             int n_block_prev = block_idx[block_offset + block_count - 1 - i];
             int n_block = block_idx[block_offset + block_count - 2 - i];
-
+            
             PipelineState smem_pipe_write_prev = smem_pipe_write;
             ++smem_pipe_write;
-
+            
             if (should_load_KV) {
                 if constexpr (PagedKVNonTMA) {
                     paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) {
-                    load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+                if constexpr (Transpose_V) { 
+                    load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); 
                 }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
@@ -489,18 +489,18 @@ void bridge_mask_to_full(
     int n_block_mask_last = info.mask_block_idx[info.mask_block_offset];
     // First full block (last in stored order due to reverse iteration)
     int n_block_full_first = info.full_block_idx[info.full_block_offset + info.full_block_cnt - 1];
-
+    
     PipelineState smem_pipe_write_prev = smem_pipe_write;
     ++smem_pipe_write;
-
+    
     if (should_load_KV) {
         if constexpr (PagedKVNonTMA) {
             paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block_full_first);
         } else {
             paged_kv_manager.load_page_table_TMA(n_block_full_first);
         }
-        if constexpr (Transpose_V) {
-            load_V(n_block_full_first, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
+        if constexpr (Transpose_V) { 
+            load_V(n_block_full_first, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); 
         }
         load_K(n_block_full_first, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
         if constexpr (!Transpose_V) {
@@ -556,7 +556,7 @@ void produce_block_sparse_loads(
             load_K, load_V, load_Q_fn, copy_Vt_to_V,
             paged_kv_manager, smem_pipe_write, should_load_KV
         );
-
+        
         if constexpr (IntraWGOverlap) {
             finish_overlap_v_load<Transpose_V>(
                 info.full_block_idx,
@@ -578,7 +578,7 @@ void produce_block_sparse_loads(
             load_K, load_V, load_Q_fn, copy_Vt_to_V,
             paged_kv_manager, smem_pipe_write, should_load_KV
         );
-
+        
         if (full_empty) {
             // No full blocks: just finish the mask list
             if constexpr (IntraWGOverlap) {
@@ -597,7 +597,7 @@ void produce_block_sparse_loads(
                     info, load_K, load_V, copy_Vt_to_V,
                     paged_kv_manager, smem_pipe_write, should_load_KV
                 );
-
+                
                 // Continue with full list (first K already loaded)
                 load_block_list<IntraWGOverlap, Transpose_V, PagedKVNonTMA>(
                     info.full_block_idx,
@@ -608,7 +608,7 @@ void produce_block_sparse_loads(
                     load_K, load_V, load_Q_fn, copy_Vt_to_V,
                     paged_kv_manager, smem_pipe_write, should_load_KV
                 );
-
+                
                 // Finish last V of full list
                 finish_overlap_v_load<Transpose_V>(
                     info.full_block_idx,
@@ -644,7 +644,7 @@ void produce_block_sparse_loads(
  *
  * masking logic for block sparsity:
  *   - mask_blocks: apply arbitrary mask (MaskFunc already contains Seqlenk info), check_inf=true
- *   - full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't need mask
+ *   - full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't need mask 
  *                  as out-of-bound won't be written back in epilogue), check_inf=false
  *
  * Iteration order (REVERSE within each block type to match producer):
@@ -682,35 +682,35 @@ void consume_block_sparse_loads(
     int const curr_mask_offset = info.mask_block_offset;
     int const curr_full_cnt = info.full_block_cnt;
     int const curr_full_offset = info.full_block_offset;
-
+    
     if constexpr (!IntraWGOverlap) {
         // ============================================================
         // Non-overlap path
         // ============================================================
-
+        
         // Process mask_blocks (need arbitrary mask, check_inf=true)
         if (curr_mask_cnt > 0) {
             // First mask_block: is_first=true, check_inf=true
             int n_block = info.mask_block_idx[curr_mask_offset + curr_mask_cnt - 1];
             warp_scheduler_barrier_sync();
             fwd_step(n_block, arbitrary_mask_fn, cute::true_type{} /*is_first*/, cute::true_type{} /*check_inf*/);
-
+            
             // Subsequent mask_blocks: is_first=false, check_inf=true
             CUTLASS_PRAGMA_NO_UNROLL
             for (int i = 1; i < curr_mask_cnt; ++i) {
                 n_block = info.mask_block_idx[curr_mask_offset + curr_mask_cnt - 1 - i];
                 fwd_step(n_block, arbitrary_mask_fn, cute::false_type{} /*is_first*/, cute::true_type{} /*check_inf*/);
             }
-
+            
             if (curr_full_cnt == 0) {
                 warp_scheduler_barrier_arrive();
             }
         }
-
+        
         // Process full_blocks (no mask, check_inf=false)
         if (curr_full_cnt > 0) {
             int n_block = info.full_block_idx[curr_full_offset + curr_full_cnt - 1];
-
+            
             if (curr_mask_cnt == 0) {
                 // No mask_blocks: first full_block is_first=true
                 warp_scheduler_barrier_sync();
@@ -719,7 +719,7 @@ void consume_block_sparse_loads(
                 // Has mask_blocks: is_first=false
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first*/, cute::false_type{} /*check_inf*/);
             }
-
+            
             // Subsequent full_blocks: is_first=false, check_inf=false
             CUTLASS_PRAGMA_NO_UNROLL
             for (int i = 1; i < curr_full_cnt; ++i) {
@@ -728,18 +728,18 @@ void consume_block_sparse_loads(
             }
             warp_scheduler_barrier_arrive();
         }
-
+        
     } else {
         // ============================================================
         // Overlap path (IntraWGOverlap)
         // ============================================================
-
+        
         // Process mask_blocks (need arbitrary mask, check_inf=true)
         if (curr_mask_cnt > 0) {
             // First mask_block: process_first_half_block
             int n_block = info.mask_block_idx[curr_mask_offset + curr_mask_cnt - 1];
             process_first_half_block(n_block, arbitrary_mask_fn);
-
+            
             // Subsequent mask_blocks: fwd_step with check_inf=true
             CUTLASS_PRAGMA_NO_UNROLL
             for (int i = 1; i < curr_mask_cnt; ++i) {
@@ -747,11 +747,11 @@ void consume_block_sparse_loads(
                 fwd_step(n_block, arbitrary_mask_fn, cute::true_type{} /*check_inf*/);
             }
         }
-
+        
         // Process full_blocks (no mask, check_inf=false)
         if (curr_full_cnt > 0) {
             int n_block = info.full_block_idx[curr_full_offset + curr_full_cnt - 1];
-
+            
             if (curr_mask_cnt == 0) {
                 // No mask_blocks: first full_block needs process_first_half_block
                 process_first_half_block(n_block, no_mask_fn);
@@ -759,7 +759,7 @@ void consume_block_sparse_loads(
                 // Has mask_blocks: use fwd_step
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
             }
-
+            
             // Subsequent full_blocks: check_inf=false
             CUTLASS_PRAGMA_NO_UNROLL
             for (int i = 1; i < curr_full_cnt; ++i) {
@@ -767,7 +767,7 @@ void consume_block_sparse_loads(
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
             }
         }
-
+        
         // Last half block - always called since empty case is handled at function entry
         process_last_half_block();
     }
@@ -797,13 +797,13 @@ struct BlockSparsityInfoBwd {
     int full_block_offset = 0;
     int const* mask_block_idx = nullptr;
     int const* full_block_idx = nullptr;
-
+    
     CUTLASS_DEVICE
     BlockSparsityInfoBwd() = default;
-
+    
     // Initialize from params for a specific (bidb, bidh, n_block)
     // Note: For backward, the block index is n_block (K block), not m_block
-    CUTLASS_DEVICE
+    CUTLASS_DEVICE  
     void init(BlockSparsityParams const& params, int bidb, int bidh, int n_block) {
         // Support broadcasting: use 0 when dimension is 1
         int const sparse_batch_idx = params.num_batches == 1 ? 0 : bidb;
@@ -816,17 +816,17 @@ struct BlockSparsityInfoBwd {
         full_block_offset = params.full_block_offset[flat_idx];
         full_block_idx = params.full_block_idx;
     }
-
+    
     CUTLASS_DEVICE
     int get_total_blocks() const {
         return mask_block_cnt + full_block_cnt;
     }
-
+    
     CUTLASS_DEVICE
     bool is_empty() const {
         return get_total_blocks() == 0;
     }
-
+    
     // Get m_block at iteration position idx (FORWARD order)
     // For mask blocks: idx=0 -> first mask block, idx=mask_block_cnt-1 -> last mask block
     // For full blocks: idx=0 -> first full block after mask blocks
@@ -834,7 +834,7 @@ struct BlockSparsityInfoBwd {
     int get_mask_m_block(int idx) const {
         return mask_block_idx[mask_block_offset + idx];
     }
-
+    
     CUTLASS_DEVICE
     int get_full_m_block(int idx) const {
         return full_block_idx[full_block_offset + idx];
@@ -878,32 +878,32 @@ void load_block_list_bwd(
     PipelineStateDO& smem_pipe_write_do
 ) {
     if (block_count == 0) return;
-
+    
     // First m_block
     int m_block = block_indices[block_offset];
-
+    
     if (load_kv_with_first) {
         // Load K, V together with first Q, LSE
         load_KV();
     }
     load_Q_LSE(m_block, smem_pipe_write);
-
+    
     // Load dO, dPsum for first block
     PipelineStateDO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
     load_dO_dPsum(m_block, smem_pipe_write_do_cur);
-
+    
     if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
     ++smem_pipe_write;
-
+    
     // Subsequent m_blocks
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 1; i < block_count; ++i) {
         m_block = block_indices[block_offset + i];
         load_Q_LSE(m_block, smem_pipe_write);
-
+        
         smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
         load_dO_dPsum(m_block, smem_pipe_write_do_cur);
-
+        
         if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
         ++smem_pipe_write;
     }
@@ -930,7 +930,7 @@ void produce_block_sparse_loads_bwd(
 ) {
     bool const mask_empty = info.mask_block_cnt == 0;
     bool const full_empty = info.full_block_cnt == 0;
-
+    
     if (mask_empty) {
         // No mask blocks: process full blocks only (with K,V loading)
         load_block_list_bwd<Q_dO_same_stages>(
@@ -957,7 +957,7 @@ void produce_block_sparse_loads_bwd(
             smem_pipe_write,
             smem_pipe_write_do
         );
-
+        
         if (!full_empty) {
             // Process full blocks (K,V already loaded)
             load_block_list_bwd<Q_dO_same_stages>(
@@ -983,7 +983,7 @@ void produce_block_sparse_loads_bwd(
 
 /**
  * Consume block sparse MMA for backward pass.
- *
+ * 
  * Processing order (matches producer):
  * 1. Process mask blocks with arbitrary mask (mask_fn)
  * 2. Process full blocks without arbitrary mask (non_mask_fn)
@@ -1007,7 +1007,7 @@ void consume_block_sparse_mma_bwd(
         int m_block = info.get_mask_m_block(i);
         bwd_step(m_block, mask_fn);
     }
-
+    
     // Process full_blocks (no arbitrary mask)
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 0; i < info.full_block_cnt; ++i) {
@@ -1041,7 +1041,7 @@ void store_dq_block_sparse(
         int m_block = info.get_mask_m_block(i);
         store_step(m_block);
     }
-
+    
     // Process full_blocks
     CUTLASS_PRAGMA_NO_UNROLL
     for (int i = 0; i < info.full_block_cnt; ++i) {
@@ -1089,14 +1089,14 @@ void load_block_list_sm80(
     int kStages
 ) {
     if (block_count <= 0) return;
-
+    
     // First block (reverse order: block_count-1 is first to process)
     int n_block = block_idx[block_offset + block_count - 1];
-
+    
     if constexpr (PagedKV) {
         paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/>(n_block);
     }
-
+    
     if (load_first_seqlenk_mask) {
         load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         cute::cp_async_fence();
@@ -1111,15 +1111,15 @@ void load_block_list_sm80(
         cute::cp_async_fence();
     }
     smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
-
+    
     // Remaining blocks (reverse order)
     for (int i = 1; i < block_count; ++i) {
         n_block = block_idx[block_offset + block_count - 1 - i];
-
+        
         if constexpr (PagedKV) {
             paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(n_block);
         }
-
+        
         load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
         cute::cp_async_fence();
         load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
@@ -1154,7 +1154,7 @@ void produce_block_sparse_loads_sm80(
 ) {
     bool const mask_empty = (info.mask_block_cnt == 0);
     bool const full_empty = (info.full_block_cnt == 0);
-
+    
     if (mask_empty) {
         // No mask blocks: load full blocks only
         load_block_list_sm80<PagedKV>(
@@ -1175,7 +1175,7 @@ void produce_block_sparse_loads_sm80(
             load_K, load_V,
             paged_kv_manager, smem_pipe_write, kStages
         );
-
+        
         // Then load full blocks (no need for first seqlenk mask)
         if (!full_empty) {
             load_block_list_sm80<PagedKV>(
@@ -1212,7 +1212,7 @@ void consume_block_sparse_loads_sm80(
     int const curr_mask_offset = info.mask_block_offset;
     int const curr_full_cnt = info.full_block_cnt;
     int const curr_full_offset = info.full_block_offset;
-
+    
     // Helper to get next block index
     auto get_next_n_block = [&](int curr_idx_in_mask, int curr_idx_in_full, bool in_mask_blocks) -> int {
         if (in_mask_blocks) {
@@ -1233,14 +1233,14 @@ void consume_block_sparse_loads_sm80(
         }
         return -1;  // No next block
     };
-
+    
     // Process mask_blocks (need arbitrary mask, check_inf=true)
     if (curr_mask_cnt > 0) {
         // First mask_block: is_first=true, check_inf=true
         int n_block = info.mask_block_idx[curr_mask_offset + curr_mask_cnt - 1];
         int next_n_block = get_next_n_block(0, 0, true);
         fwd_step(n_block, next_n_block, arbitrary_mask_fn, cute::true_type{} /*is_first*/, cute::true_type{} /*check_inf*/);
-
+        
         // Subsequent mask_blocks: is_first=false, check_inf=true
         CUTLASS_PRAGMA_NO_UNROLL
         for (int i = 1; i < curr_mask_cnt; ++i) {
@@ -1249,12 +1249,12 @@ void consume_block_sparse_loads_sm80(
             fwd_step(n_block, next_n_block, arbitrary_mask_fn, cute::false_type{} /*is_first*/, cute::true_type{} /*check_inf*/);
         }
     }
-
+    
     // Process full_blocks (no mask, check_inf=false)
     if (curr_full_cnt > 0) {
         int n_block = info.full_block_idx[curr_full_offset + curr_full_cnt - 1];
         int next_n_block = get_next_n_block(0, 0, false);
-
+        
         if (curr_mask_cnt == 0) {
             // No mask_blocks: first full_block is_first=true
             fwd_step(n_block, next_n_block, no_mask_fn, cute::true_type{} /*is_first*/, cute::false_type{} /*check_inf*/);
@@ -1262,7 +1262,7 @@ void consume_block_sparse_loads_sm80(
             // Has mask_blocks: is_first=false
             fwd_step(n_block, next_n_block, no_mask_fn, cute::false_type{} /*is_first*/, cute::false_type{} /*check_inf*/);
         }
-
+        
         // Subsequent full_blocks: is_first=false, check_inf=false
         CUTLASS_PRAGMA_NO_UNROLL
         for (int i = 1; i < curr_full_cnt; ++i) {

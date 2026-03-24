@@ -18,7 +18,7 @@ HDIM128 ?= 1
 HDIM192 ?= 0
 HDIM256 ?= 0
 SM8X ?= 1
-SM90 ?= 1
+SM90 ?= 0
 VCOLMAJOR ?= 0
 HDIMDIFF64 ?= 0
 HDIMDIFF192 ?= 0
@@ -113,9 +113,9 @@ clean:
 	rm -rf build/
 	rm -rf dist/
 	rm -rf *.egg-info/
-	rm -rf flash_attn_3.egg-info/
+	rm -rf ffa_fa3.egg-info/
 	rm -f *.so
-	rm -f flash_attn_3/_C*.so
+	rm -f flash_attn_cute/ffa_fa3/_C*.so
 	rm -rf __pycache__/
 	rm -rf .eggs/
 	find . -name "*.pyc" -delete
@@ -168,3 +168,6 @@ show_flags:
 	@echo " ARBITRARY=$(ARBITRARY) -> FLASH_ATTENTION_DISABLE_ARBITRARY=$(FLASH_ATTENTION_DISABLE_ARBITRARY)"
 	@echo " NUM_FUNC=$(NUM_FUNC) -> FLASH_ATTENTION_NUM_FUNC=$(FLASH_ATTENTION_NUM_FUNC)"
 	@echo " FLEXATTN=$(FLEXATTN) -> DISABLE_FLEX_ATTENTION=$(DISABLE_FLEX_ATTENTION)"
+
+
+

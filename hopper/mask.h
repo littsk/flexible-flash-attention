@@ -51,10 +51,10 @@ struct Mask {
 
     // Full version with gMaskFunc for arbitrary mask support
     template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
-        bool Arbitrary_mask=false, int kNFunc=0,
+        bool Arbitrary_mask=false, int kNFunc=0, 
         typename Engine, typename Layout, typename MaskFuncTensor>
     CUTLASS_DEVICE
-    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
+    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block, 
                MaskFuncTensor const* gMaskFunc) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
         static_assert(!(Arbitrary_mask && (Causal_mask || Local_mask)), "Arbitrary_mask cannot be combined with Causal_mask or Local_mask");
@@ -91,7 +91,7 @@ struct Mask {
             //   gMaskFunc has shape (kNFunc, kBlockM), where kNFunc is odd
             //   For each row, stores valid column ranges:
             //   col_max[0]   = gMaskFunc(0, row_idx_local) - first valid range upper bound
-            //   col_min[i]   = gMaskFunc(2*i+1, row_idx_local) - (i+1)th valid range lower bound
+            //   col_min[i]   = gMaskFunc(2*i+1, row_idx_local) - (i+1)th valid range lower bound  
             //   col_max[i+1] = gMaskFunc(2*i+2, row_idx_local) - (i+1)th valid range upper bound
             static constexpr int kNumIntervals = kNFunc / 2;  // Number of additional intervals
             #pragma unroll

@@ -38,38 +38,6 @@ PACKGQA = [False, True]
 # All possible NFUNC values (odd numbers 1-33) for generating per-nfunc instantiation files
 NFUNC_VALUES = list(range(1, 34, 2))  # [1, 3, 5, 7, ..., 33]
 
-
-def _kernel_disable_guards(kernel) -> List[str]:
-    """Build flag guards that can remove unused nfunc instantiations early."""
-    guards = []
-    if kernel.dtype == "fp16":
-        guards.append("FLASHATTENTION_DISABLE_FP16")
-    elif kernel.dtype == "e4m3":
-        guards.append("FLASHATTENTION_DISABLE_FP8")
-    if kernel.head_dim != kernel.head_dim_v:
-        if kernel.head_dim == 64:
-            guards.append("FLASHATTENTION_DISABLE_HDIMDIFF64")
-        elif kernel.head_dim == 192 and kernel.head_dim_v == 128:
-            guards.append("FLASHATTENTION_DISABLE_HDIMDIFF192")
-    guards.append(f"FLASHATTENTION_DISABLE_HDIM{kernel.head_dim}")
-    if kernel.split:
-        guards.append("FLASHATTENTION_DISABLE_SPLIT")
-    if kernel.paged_kv:
-        guards.append("FLASHATTENTION_DISABLE_PAGEDKV")
-    if kernel.softcap:
-        guards.append("FLASHATTENTION_DISABLE_SOFTCAP")
-    if kernel.packgqa:
-        guards.append("FLASHATTENTION_DISABLE_PACKGQA")
-    return guards
-
-
-def _append_guarded(lines: List[str], guards: List[str], body: List[str]) -> None:
-    for guard in guards:
-        lines.append(f"#ifndef {guard}")
-    lines.extend(body)
-    for guard in reversed(guards):
-        lines.append(f"#endif // {guard}")
-
 KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
@@ -210,68 +178,38 @@ def batch_softcap(kernels_all) -> List[KERNEL_BATCH]:
             yield KERNEL_BATCH(template, filename)
 
 
-def nfunc_fwd_filename(nfunc, sm, dtype, head_dim, head_dim_v) -> str:
-    hdim = f"hdim{head_dim}{f'_{head_dim_v}' if head_dim_v != head_dim else ''}"
-    return f"flash_fwd_nfunc{nfunc}_{hdim}_{dtype}_sm{sm}.cu"
-
-
-def generate_nfunc_fwd_instantiation(nfunc, sm, dtype, head_dim, head_dim_v, kernels_all) -> KERNEL_BATCH:
-    """Generate forward instantiations for one nfunc, arch, dtype, and head dimension.
-
-    Keeping each file shape-scoped preserves the API-level nfunc dispatch from
-    64bc5f7 without feeding ptxas one very large SM80 translation unit.
-    """
+def generate_nfunc_fwd_instantiation(nfunc, sm, kernels_all) -> str:
+    """Generate all forward instantiations for a given nfunc value and SM arch."""
     lines = ['#include "flash_fwd_launch_template.h"', '',
              '#ifndef FLASHATTENTION_DISABLE_ARBITRARY',
              f'#ifdef FLASHATTENTION_NFUNC_{nfunc}']
 
     for k in kernels_all:
-        if (
-            k.direction != "fwd"
-            or k.sm != sm
-            or k.dtype != dtype
-            or k.head_dim != head_dim
-            or k.head_dim_v != head_dim_v
-        ):
+        if k.direction != "fwd" or k.sm != sm:
             continue
         dtype_cpp = DTYPE_MAP.get(k.dtype, DTYPE_MAP_FWD_SM8x.get(k.dtype))
         if dtype_cpp is None:
             continue
         if sm == 90:
             packgqa = k.packgqa or k.paged_kv or k.split
-            _append_guarded(
-                lines,
-                _kernel_disable_guards(k),
-                [
-                    f'template void run_mha_fwd_<{sm}, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, {str(packgqa).lower()}, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);'
-                ],
-            )
+            hdim_guard = k.head_dim if k.head_dim == k.head_dim_v else k.head_dim
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{hdim_guard}')
+            lines.append(f'template void run_mha_fwd_<{sm}, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, {str(packgqa).lower()}, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
         else:
             # SM8x
             if k.dtype not in DTYPE_MAP_FWD_SM8x:
                 continue
-            guards = ["FLASHATTENTION_DISABLE_SM8x", *_kernel_disable_guards(k)]
-            _append_guarded(
-                lines,
-                guards,
-                [
-                    f'template void run_mha_fwd_<80, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);'
-                ],
-            )
-            _append_guarded(
-                lines,
-                guards,
-                [
-                    f'template void run_mha_fwd_<86, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);'
-                ],
-            )
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_SM8x')
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_fwd_<80, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'template void run_mha_fwd_<86, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+            lines.append(f'#endif')
 
     lines.append(f'#endif // FLASHATTENTION_NFUNC_{nfunc}')
     lines.append('#endif // FLASHATTENTION_DISABLE_ARBITRARY')
-    return KERNEL_BATCH(
-        '\n'.join(lines),
-        nfunc_fwd_filename(nfunc, sm, dtype, head_dim, head_dim_v),
-    )
+    return '\n'.join(lines)
 
 
 def generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all) -> str:
@@ -288,29 +226,16 @@ def generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all) -> str:
         if dtype_cpp is None:
             continue
         if sm == 90:
-            _append_guarded(
-                lines,
-                _kernel_disable_guards(k),
-                [
-                    f'template void run_mha_bwd_<{sm}, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);'
-                ],
-            )
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_bwd_<{sm}, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
         else:
-            guards = ["FLASHATTENTION_DISABLE_SM8x", *_kernel_disable_guards(k)]
-            _append_guarded(
-                lines,
-                guards,
-                [
-                    f'template void run_mha_bwd_<80, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);'
-                ],
-            )
-            _append_guarded(
-                lines,
-                guards,
-                [
-                    f'template void run_mha_bwd_<86, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);'
-                ],
-            )
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_SM8x')
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_bwd_<80, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'template void run_mha_bwd_<86, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+            lines.append(f'#endif')
 
     lines.append(f'#endif // FLASHATTENTION_NFUNC_{nfunc}')
     lines.append('#endif // FLASHATTENTION_DISABLE_BACKWARD')
@@ -321,23 +246,18 @@ def generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all) -> str:
 def generate_nfunc_files(kernels_all) -> List[KERNEL_BATCH]:
     """Generate per-nfunc instantiation files.
 
-    Creates shape-scoped forward files and arch-scoped backward files.
+    Creates one file per (nfunc_value, direction, arch) combination.
     Each file is guarded by #ifdef FLASHATTENTION_NFUNC_X so it only compiles
-    when that specific nfunc value is enabled. The forward files are split by
-    dtype/head dimension to avoid pathological SM80 code generation from a
-    single large flash_fwd_nfunc*_sm80.cu translation unit.
+    when that specific nfunc value is enabled. This allows different nfunc values
+    to compile in parallel across separate translation units.
     """
     for nfunc in NFUNC_VALUES:
         for sm in SM:
-            fwd_groups = sorted({
-                (k.dtype, k.head_dim, k.head_dim_v)
-                for k in kernels_all
-                if k.direction == "fwd" and k.sm == sm
-            })
-            for dtype, head_dim, head_dim_v in fwd_groups:
-                yield generate_nfunc_fwd_instantiation(
-                    nfunc, sm, dtype, head_dim, head_dim_v, kernels_all
-                )
+            # Forward
+            content = generate_nfunc_fwd_instantiation(nfunc, sm, kernels_all)
+            filename = f"flash_fwd_nfunc{nfunc}_sm{sm}.cu"
+            yield KERNEL_BATCH(content, filename)
+            # Backward
             content = generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all)
             filename = f"flash_bwd_nfunc{nfunc}_sm{sm}.cu"
             yield KERNEL_BATCH(content, filename)

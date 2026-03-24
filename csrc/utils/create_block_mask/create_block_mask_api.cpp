@@ -4,11 +4,15 @@
 
 #include "create_block_mask.h"
 
+// Single source of truth for tile sizes
+// This ensures tile sizes stay in sync with the attention kernels implementation
+#include "hopper/tile_size.h"
+
 #define DIVUP(x, y) (((x) + (y) - 1) / (y))
 
 // ============================================================================
 // Tile size computation helpers
-// Mirrors the current CuTe FA4 Python tile-size selection in flash_attn/cute/interface.py.
+// Using hopper/tile_size.h as the SINGLE SOURCE OF TRUTH
 // ============================================================================
 
 /**
@@ -24,14 +28,14 @@ inline int get_gpu_arch() {
 
 /**
  * Get forward pass tile sizes based on architecture.
- * Mirrors current CuTe FA4 Python tile-size selection.
- *
+ * Calls hopper/tile_size.h functions (SINGLE SOURCE OF TRUTH).
+ * 
  * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
  * @param headdim Head dimension
  * @param is_causal Whether using causal attention
  * @param is_local Whether using local attention
  * @param is_arbitrary Whether using arbitrary mask
- *
+ * 
  * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for forward pass
  */
 inline std::pair<int, int> get_fwd_tile_sizes(
@@ -46,40 +50,38 @@ inline std::pair<int, int> get_fwd_tile_sizes(
     if (arch < 0) {
         arch = get_gpu_arch();
     }
-
+    
+    int headdim_v = headdim;  // Assume same for simplicity
+    
     if (arch >= 100) {
-        return {128, 128};
+        // Use tile_size.h SM100 function
+        auto [kBlockM, kBlockN] = tile_size_fwd_sm100(); // fake function
+        return {kBlockM, kBlockN};
     } else if (arch >= 90) {
-        if (headdim <= 64) {
-            return {192, 128};
-        } else if (headdim <= 96) {
-            return {192, (is_causal || is_local) ? 128 : 144};
-        } else if (headdim <= 128) {
-            return {128, 128};
-        } else if (headdim <= 192) {
-            return {128, is_local ? 96 : 112};
-        } else {
-            return {128, is_local ? 64 : 80};
-        }
+        // Use tile_size.h SM90 function - returns {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
+        auto tile_config = tile_size_fwd_sm90(headdim, headdim_v, is_causal, is_local, is_arbitrary, 
+                                               /*element_size=*/2, /*v_colmajor=*/false, paged_kv);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
     } else {
-        (void)is_arbitrary;
-        (void)paged_kv;
-        (void)varlen_and_split;
-        return {128, 64};
+        // Use tile_size.h SM8x function - returns {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
+        bool sm86_or_89 = (arch == 86) || (arch == 89);
+        auto tile_config = tile_size_fwd_sm8x(sm86_or_89, headdim, headdim_v, is_causal, is_local, is_arbitrary,
+                                               /*element_size=*/2, paged_kv, varlen_and_split);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
     }
 }
 
 /**
  * Get backward pass tile sizes based on architecture.
- * Mirrors current CuTe FA4 Python tile-size selection.
- *
+ * Calls hopper/tile_size.h functions (SINGLE SOURCE OF TRUTH).
+ * 
  * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
  * @param headdim Head dimension
  * @param is_causal Whether using causal attention
  * @param is_local Whether using local attention
  * @param is_arbitrary Whether using arbitrary mask
  * @param has_softcap Whether using softcap
- *
+ * 
  * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for backward pass
  */
 inline std::pair<int, int> get_bwd_tile_sizes(
@@ -93,41 +95,36 @@ inline std::pair<int, int> get_bwd_tile_sizes(
     if (arch < 0) {
         arch = get_gpu_arch();
     }
-
+    
     if (arch >= 100) {
-        return {128, 128};
+        // Use tile_size.h SM100 function
+        auto [kBlockM, kBlockN] = tile_size_bwd_sm100(); // fake function
+        return {kBlockM, kBlockN};
     } else if (arch >= 90) {
-        if (headdim <= 64) {
-            return {128, 128};
-        } else if (headdim <= 96) {
-            return {64, 128};
-        } else if (headdim <= 128) {
-            return {(is_causal || is_local) ? 64 : 80, 128};
-        } else if (headdim <= 192) {
-            return {64, 96};
-        } else {
-            return {64, 64};
-        }
+        // Use tile_size.h SM90 function - returns full config tuple
+        auto tile_config = tile_size_bwd_sm90(headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
     } else {
-        (void)is_arbitrary;
-        (void)has_softcap;
-        return {64, 128};
+        // Use tile_size.h SM8x function - returns full config tuple
+        bool sm86_or_89 = (arch == 86) || (arch == 89);
+        auto tile_config = tile_size_bwd_sm8x(sm86_or_89, headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
     }
 }
 
 /**
  * Q2K (Forward): Convert function encoding tensor to block sparse tensors.
- *
+ * 
  * Forward pass: fix q_block, loop kv_blocks.
- *
+ * 
  * Function encoding format (same as magi_to_hstu output):
  *   interval 0: [0, F0)       - valid range (no mask needed)
  *   interval 1: [F1, F2)      - valid range (no mask needed)
  *   interval 2: [F3, F4)      - valid range (no mask needed)
  *   ...
- *
+ * 
  * These intervals represent positions where attention scores are VALID (not masked).
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  *                     func_q_len must be >= Q_LEN + 256 (to avoid bounds checking in kernel)
  *                     n_func must be odd (e.g., 1, 3, 5, 7, ...)
@@ -139,7 +136,7 @@ inline std::pair<int, int> get_bwd_tile_sizes(
  * @param check_q_boundary: if true (FlexAttention mode), partial q_blocks cannot have FULL kv_blocks;
  *                          if false, partial q_blocks can have FULL kv_blocks (default: false)
  * @param debug: if true, initialize output tensors to -1 for debugging; if false, use uninitialized memory (default: false)
- *
+ * 
  * @return tuple of (mask_block_cnt, full_block_cnt, block_idx)
  *         mask_block_cnt: [B, H, num_q_blocks], int32 - number of partial kv_blocks per q_block
  *         full_block_cnt: [B, H, num_q_blocks], int32 - number of full kv_blocks per q_block
@@ -177,7 +174,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_q2k_block_sparse_from_func
     int stride_q = func_tensor.stride(3);
 
     // Check that func_tensor has enough padding to avoid bounds checking in kernel
-    TORCH_CHECK(func_q_len >= Q_LEN + 256,
+    TORCH_CHECK(func_q_len >= Q_LEN + 256, 
                 "func_tensor.size(3) must be >= Q_LEN + 256 to avoid bounds checking in kernel. "
                 "Got func_tensor.size(3)=", func_q_len, ", Q_LEN=", Q_LEN);
     TORCH_CHECK(n_func % 2 == 1, "n_func must be odd (e.g., 1, 3, 5, 7, ...)");
@@ -224,17 +221,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_q2k_block_sparse_from_func
 
 /**
  * K2Q (Backward): Convert function encoding tensor to block sparse tensors.
- *
+ * 
  * Backward pass: fix kv_block, loop q_blocks.
  * Always performs boundary checking (partial q_blocks cannot have FULL status).
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  * @param Q_LEN: query sequence length
  * @param KV_LEN: key/value sequence length
  * @param Q_BLOCK_SIZE: block size for query dimension (default: 128)
  * @param KV_BLOCK_SIZE: block size for key/value dimension (default: 128)
  * @param debug: if true, initialize output tensors to -1 for debugging; if false, use uninitialized memory (default: false)
- *
+ * 
  * @return tuple of (mask_block_cnt, full_block_cnt, block_idx)
  *         mask_block_cnt: [B, H, num_kv_blocks], int32 - number of partial q_blocks per kv_block
  *         full_block_cnt: [B, H, num_kv_blocks], int32 - number of full q_blocks per kv_block
@@ -271,7 +268,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
     int stride_q = func_tensor.stride(3);
 
     // Check that func_tensor has enough padding to avoid bounds checking in kernel
-    TORCH_CHECK(func_q_len >= Q_LEN + 256,
+    TORCH_CHECK(func_q_len >= Q_LEN + 256, 
                 "func_tensor.size(3) must be >= Q_LEN + 256 to avoid bounds checking in kernel. "
                 "Got func_tensor.size(3)=", func_q_len, ", Q_LEN=", Q_LEN);
     TORCH_CHECK(n_func % 2 == 1, "n_func must be odd (e.g., 1, 3, 5, 7, ...)");
@@ -304,7 +301,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
     int* d_q_block_kv_min = nullptr;
     int* d_q_block_kv_max = nullptr;
     at::Tensor q_block_kv_min, q_block_kv_max;
-
+    
 #ifndef DISABLE_KV_RANGE_OPT
     // Default (optimization enabled):
     // - Q2K kernel uses inline kv_range computation
@@ -313,7 +310,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
     //   then K2Q kernel can skip q_blocks that don't overlap with the current kv_block
     q_block_kv_min = torch::empty({B, H, num_q_blocks}, opts);
     q_block_kv_max = torch::empty({B, H, num_q_blocks}, opts);
-
+    
     launch_compute_q_block_kv_range(
         func_tensor.data_ptr<int>(),
         stride_b, stride_h, stride_f, stride_q,
@@ -323,7 +320,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
         q_block_kv_max.data_ptr<int>(),
         stream
     );
-
+    
     d_q_block_kv_min = q_block_kv_min.data_ptr<int>();
     d_q_block_kv_max = q_block_kv_max.data_ptr<int>();
 #endif  // DISABLE_KV_RANGE_OPT
@@ -347,17 +344,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
 
 /**
  * Compact block indices from BHQK format to linear sparse format (CSR-like).
- *
+ * 
  * Converts the combined block_idx tensor to compact mask_block_idx and full_block_idx tensors
  * using prefix sum (cumulative sum) to compute offsets.
- *
+ * 
  * Input format (from create_q2k/k2q_block_sparse_from_func):
  *   - mask_block_cnt: [B, H, num_blocks], count of mask blocks per row
  *   - full_block_cnt: [B, H, num_blocks], count of full blocks per row
  *   - block_idx: [B, H, num_blocks, max_blocks], combined indices
  *       - full blocks stored left-to-right: block_idx[..., 0:full_cnt]
  *       - mask blocks stored right-to-left: block_idx[..., max_blocks-mask_cnt:max_blocks]
- *
+ * 
  * Output format (LinearBlockSparseTensorsTorch compatible):
  *   - mask_block_cnt: [B, H, num_blocks] (unchanged)
  *   - mask_block_offset: [B * H * num_blocks + 1], exclusive prefix sum (flattened, starts with 0)
@@ -365,17 +362,17 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
  *   - full_block_cnt: [B, H, num_blocks] (unchanged)
  *   - full_block_offset: [B * H * num_blocks + 1], exclusive prefix sum (flattened, starts with 0)
  *   - full_block_idx: [total_full_blocks], compact indices
- *
+ * 
  * Memory savings: O(num_blocks * max_blocks) -> O(total_mask_blocks + total_full_blocks)
- *
+ * 
  * @param mask_block_cnt: [B, H, num_blocks], int32
  * @param full_block_cnt: [B, H, num_blocks], int32
  * @param block_idx: [B, H, num_blocks, max_blocks], int32
- *
+ * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx_compact,
  *                   full_block_cnt, full_block_offset, full_block_idx_compact)
  */
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> 
 compact_block_idx(
     const at::Tensor& mask_block_cnt,
     const at::Tensor& full_block_cnt,
@@ -391,34 +388,34 @@ compact_block_idx(
     TORCH_CHECK(mask_block_cnt.dim() == 3, "mask_block_cnt must be 3D [B, H, num_blocks]");
     TORCH_CHECK(full_block_cnt.dim() == 3, "full_block_cnt must be 3D [B, H, num_blocks]");
     TORCH_CHECK(block_idx.dim() == 4, "block_idx must be 4D [B, H, num_blocks, max_blocks]");
-
+    
     // Ensure same device
     at::cuda::CUDAGuard device_guard(mask_block_cnt.device());
-
+    
     int64_t B = mask_block_cnt.size(0);
     int64_t H = mask_block_cnt.size(1);
     int64_t num_blocks = mask_block_cnt.size(2);
     int64_t max_blocks = block_idx.size(3);
-
+    
     auto opts = mask_block_cnt.options();
-
+    
     // Ensure contiguous
     at::Tensor mask_cnt = mask_block_cnt.contiguous();
     at::Tensor full_cnt = full_block_cnt.contiguous();
     at::Tensor block_idx_cont = block_idx.contiguous();
-
+    
     // Get current CUDA stream
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
+    
     // Step 1: Create offset arrays with leading 0 for exclusive prefix sum
     // offset shape: [B * H * num_blocks + 1], format: [0, c0, c0+c1, ..., total]
     int64_t n_blocks_flat = B * H * num_blocks;
     int64_t offset_size = n_blocks_flat + 1;
-
+    
     // Allocate offset tensors (uninitialized, kernel sets offset[0]=0)
     at::Tensor mask_block_offset = torch::empty({offset_size}, opts);
     at::Tensor full_block_offset = torch::empty({offset_size}, opts);
-
+    
     // Compute exclusive prefix sum: offset[0]=0, offset[i+1]=sum(cnt[0..i])
     launch_dual_inclusive_sum(
         mask_cnt.data_ptr<int>(),
@@ -428,10 +425,10 @@ compact_block_idx(
         n_blocks_flat,  // number of count elements
         stream
     );
-
+    
     // Synchronize to read total counts from the last element of offset arrays
     cudaStreamSynchronize(stream);
-
+    
     // Read total counts from the last element of offset arrays
     int total_mask = mask_block_offset[-1].item<int>();
     int total_full = full_block_offset[-1].item<int>();
@@ -439,7 +436,7 @@ compact_block_idx(
     // Allocate compact idx tensors (empty if total is 0)
     at::Tensor mask_block_idx_compact = torch::empty({total_mask}, opts);
     at::Tensor full_block_idx_compact = torch::empty({total_full}, opts);
-
+        
     // Step 2: Extract indices using CUDA kernel
     if (total_mask > 0 || total_full > 0) {
         launch_extract_compact_indices(
@@ -455,7 +452,7 @@ compact_block_idx(
             stream
         );
     }
-
+    
     // Return tensors:
     // - mask_cnt, full_cnt: [B, H, num_blocks] (unchanged)
     // - mask_block_offset, full_block_offset: [B * H * num_blocks + 1] (flattened, starts with 0)
@@ -468,16 +465,16 @@ compact_block_idx(
 
 /**
  * Q2K CSR (Forward): Convert function encoding tensor directly to CSR sparse format.
- *
+ * 
  * This is a convenience function that combines create_q2k_block_sparse_from_func and compact_block_idx.
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  * @param Q_LEN: query sequence length
  * @param KV_LEN: key/value sequence length
  * @param Q_BLOCK_SIZE: block size for query dimension (default: 256)
  * @param KV_BLOCK_SIZE: block size for key/value dimension (default: 128)
  * @param check_q_boundary: if true (FlexAttention mode), partial q_blocks cannot have FULL kv_blocks
- *
+ * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx)
  *         - mask_block_cnt: [B, H, num_q_blocks + 1], int32
@@ -497,27 +494,27 @@ create_q2k_csr_sparse_from_func(
     bool check_q_boundary = false
 ) {
     // Step 1: Create block sparse tensors
-    auto [mask_block_cnt, full_block_cnt, block_idx] =
+    auto [mask_block_cnt, full_block_cnt, block_idx] = 
         create_q2k_block_sparse_from_func(
-            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
+            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, 
             check_q_boundary, false  // debug=false for performance
         );
-
+    
     // Step 2: Compact to CSR format
     return compact_block_idx(mask_block_cnt, full_block_cnt, block_idx);
 }
 
 /**
  * K2Q CSR (Backward): Convert function encoding tensor directly to CSR sparse format.
- *
+ * 
  * This is a convenience function that combines create_k2q_block_sparse_from_func and compact_block_idx.
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  * @param Q_LEN: query sequence length
  * @param KV_LEN: key/value sequence length
  * @param Q_BLOCK_SIZE: block size for query dimension (default: 128)
  * @param KV_BLOCK_SIZE: block size for key/value dimension (default: 128)
- *
+ * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx)
  *         - mask_block_cnt: [B, H, num_kv_blocks + 1], int32
@@ -536,12 +533,12 @@ create_k2q_csr_sparse_from_func(
     int KV_BLOCK_SIZE = 128
 ) {
     // Step 1: Create block sparse tensors
-    auto [mask_block_cnt, full_block_cnt, block_idx] =
+    auto [mask_block_cnt, full_block_cnt, block_idx] = 
         create_k2q_block_sparse_from_func(
-            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE,
+            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, 
             false  // debug=false for performance
         );
-
+    
     // Step 2: Compact to CSR format
     return compact_block_idx(mask_block_cnt, full_block_cnt, block_idx);
 }
@@ -552,10 +549,10 @@ create_k2q_csr_sparse_from_func(
 
 /**
  * Q2K CSR Auto (Forward): Convert with automatic tile size detection.
- *
+ * 
  * Automatically detects GPU architecture and computes the correct tile sizes
  * based on headdim and mask configuration. Users don't need to specify tile sizes.
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  * @param Q_LEN: query sequence length
  * @param KV_LEN: key/value sequence length
@@ -564,7 +561,7 @@ create_k2q_csr_sparse_from_func(
  * @param is_local: whether using local attention
  * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
  * @param check_q_boundary: if true, partial q_blocks cannot have FULL kv_blocks
- *
+ * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx,
  *                   Q_BLOCK_SIZE, KV_BLOCK_SIZE)
@@ -588,13 +585,13 @@ create_q2k_csr_sparse_auto(
         is_local,
         is_arbitrary
     );
-
+    
     // Create CSR sparse tensors
     auto [mask_block_cnt, mask_block_offset, mask_block_idx,
-          full_block_cnt, full_block_offset, full_block_idx] =
+          full_block_cnt, full_block_offset, full_block_idx] = 
         create_q2k_csr_sparse_from_func(
             func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary);
-
+    
     return std::make_tuple(
         mask_block_cnt, mask_block_offset, mask_block_idx,
         full_block_cnt, full_block_offset, full_block_idx,
@@ -604,10 +601,10 @@ create_q2k_csr_sparse_auto(
 
 /**
  * K2Q CSR Auto (Backward): Convert with automatic tile size detection.
- *
+ * 
  * Automatically detects GPU architecture and computes the correct tile sizes
  * based on headdim and mask configuration. Users don't need to specify tile sizes.
- *
+ * 
  * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
  * @param Q_LEN: query sequence length
  * @param KV_LEN: key/value sequence length
@@ -616,7 +613,7 @@ create_q2k_csr_sparse_auto(
  * @param is_local: whether using local attention
  * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
  * @param has_softcap: whether using softcap
- *
+ * 
  * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
  *                   full_block_cnt, full_block_offset, full_block_idx,
  *                   Q_BLOCK_SIZE, KV_BLOCK_SIZE)
@@ -641,13 +638,13 @@ create_k2q_csr_sparse_auto(
         is_arbitrary,
         has_softcap
     );
-
+    
     // Create CSR sparse tensors
     auto [mask_block_cnt, mask_block_offset, mask_block_idx,
-          full_block_cnt, full_block_offset, full_block_idx] =
+          full_block_cnt, full_block_offset, full_block_idx] = 
         create_k2q_csr_sparse_from_func(
             func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE);
-
+    
     return std::make_tuple(
         mask_block_cnt, mask_block_offset, mask_block_idx,
         full_block_cnt, full_block_offset, full_block_idx,
@@ -695,11 +692,11 @@ int py_get_gpu_arch() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "CUDA kernels for creating block sparse tensors (FlexAttention/BlockSparseTensorsTorch format)";
-
+    
     // ========================================================================
     // Original functions with explicit tile sizes (for advanced users)
     // ========================================================================
-
+    
     m.def("create_q2k_block_sparse_from_func", &create_q2k_block_sparse_from_func,
           "Q2K (Forward): Convert function encoding tensor to block sparse tensors. "
           "Fix q_block, loop kv_blocks. "
@@ -714,7 +711,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("KV_BLOCK_SIZE") = 128,
           py::arg("check_q_boundary") = false,
           py::arg("debug") = false);
-
+    
     m.def("create_k2q_block_sparse_from_func", &create_k2q_block_sparse_from_func,
           "K2Q (Backward): Convert function encoding tensor to block sparse tensors. "
           "Fix kv_block, loop q_blocks. Always checks boundary. "
@@ -728,7 +725,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Q_BLOCK_SIZE") = 128,  // default: 128x128 for backward pass
           py::arg("KV_BLOCK_SIZE") = 128,
           py::arg("debug") = false);
-
+    
     m.def("compact_block_idx", &compact_block_idx,
           "Compact block indices from BHQK format to linear sparse format (CSR-like). "
           "Converts combined block_idx tensor to compact mask_block_idx and full_block_idx. "
@@ -738,7 +735,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("mask_block_cnt"),
           py::arg("full_block_cnt"),
           py::arg("block_idx"));
-
+    
     m.def("create_q2k_csr_sparse_from_func", &create_q2k_csr_sparse_from_func,
           "Q2K CSR (Forward): Convert function encoding tensor directly to CSR sparse format. "
           "Combines create_q2k_block_sparse_from_func and compact_block_idx in one call. "
@@ -752,7 +749,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Q_BLOCK_SIZE") = 256,
           py::arg("KV_BLOCK_SIZE") = 128,
           py::arg("check_q_boundary") = false);
-
+    
     m.def("create_k2q_csr_sparse_from_func", &create_k2q_csr_sparse_from_func,
           "K2Q CSR (Backward): Convert function encoding tensor directly to CSR sparse format. "
           "Combines create_k2q_block_sparse_from_func and compact_block_idx in one call. "
@@ -765,12 +762,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("KV_LEN"),
           py::arg("Q_BLOCK_SIZE") = 128,
           py::arg("KV_BLOCK_SIZE") = 128);
-
+    
     // ========================================================================
     // Auto tile size functions (RECOMMENDED)
     // These automatically detect GPU architecture and compute correct tile sizes
     // ========================================================================
-
+    
     m.def("create_q2k_csr_sparse_auto", &create_q2k_csr_sparse_auto,
           "Q2K CSR Auto (Forward): Convert with AUTOMATIC tile size detection.\n\n"
           "RECOMMENDED: This function automatically detects GPU architecture and "
@@ -785,7 +782,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("check_q_boundary") = false);
-
+    
     m.def("create_k2q_csr_sparse_auto", &create_k2q_csr_sparse_auto,
           "K2Q CSR Auto (Backward): Convert with AUTOMATIC tile size detection.\n\n"
           "RECOMMENDED: This function automatically detects GPU architecture and "
@@ -800,30 +797,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("has_softcap") = false);
-
+    
     // ========================================================================
     // Helper functions for tile size queries
     // ========================================================================
-
+    
     m.def("get_fwd_tile_sizes", &py_get_fwd_tile_sizes,
           "Get forward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "This mirrors the CuTe FA4 Python forward tile-size selection logic.",
+          "This mirrors the kernel's tile size selection logic from hopper/tile_size.h.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("arch") = -1);
-
+    
     m.def("get_bwd_tile_sizes", &py_get_bwd_tile_sizes,
           "Get backward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
-          "This mirrors the CuTe FA4 Python backward tile-size selection logic.",
+          "This mirrors the kernel's tile size selection logic from hopper/flash_bwd_launch_template.h.",
           py::arg("headdim"),
           py::arg("is_causal") = false,
           py::arg("is_local") = false,
           py::arg("is_arbitrary") = true,
           py::arg("has_softcap") = false,
           py::arg("arch") = -1);
-
+    
     m.def("get_gpu_arch", &py_get_gpu_arch,
           "Get GPU architecture as int (e.g., 80, 86, 89, 90, 100).");
 }

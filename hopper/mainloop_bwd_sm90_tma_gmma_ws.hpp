@@ -414,7 +414,7 @@ struct CollectiveMainloopBwdSm90 {
         // (1 - tanh^2) * softmax_scale / softcap_val * softcap_val = (1 - tanh^2) * softmax_scale.
         // Instead we multiply by (1 - tanh^2) and multiply dK and dV by params.softmax_scale
         // (the original softmax_scale) at the end.
-        return {args.shape_Q, args.shape_K,
+        return {args.shape_Q, args.shape_K, 
                 args.shape_V, args.shape_dO,
                 args.ptr_dQaccum, args.shape_dQaccum, args.stride_dQaccum,
                 cutlass::FastDivmod(cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K))),
@@ -464,7 +464,7 @@ struct CollectiveMainloopBwdSm90 {
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb,
             params.window_size_left, params.window_size_right, 0 /*sink_token_length*/);
-
+        
         // For block sparsity, check if there are any blocks to process
         if constexpr (Use_block_sparsity) {
             BlockSparsityInfoBwd block_sparse_info;
@@ -547,7 +547,7 @@ struct CollectiveMainloopBwdSm90 {
             // ============================================================
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
-
+            
             // Lambda to load Q and LSE
             auto load_Q_LSE = [&](int m_block, PipelineState& pipe_write) {
                 if (lane_predicate) {
@@ -558,7 +558,7 @@ struct CollectiveMainloopBwdSm90 {
                          gLSE(_, m_block), sLSE(_, pipe_write.index()));
                 }
             };
-
+            
             // Lambda to load dO and dPsum
             auto load_dO_dPsum = [&](int m_block, PipelineState_dO& pipe_write_do) {
                 if (lane_predicate) {
@@ -569,7 +569,7 @@ struct CollectiveMainloopBwdSm90 {
                          gdPsum(_, m_block), sdPsum(_, pipe_write_do.index()));
                 }
             };
-
+            
             // Lambda to load K and V
             auto load_KV = [&]() {
                 if (lane_predicate) {
@@ -578,7 +578,7 @@ struct CollectiveMainloopBwdSm90 {
                     copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
                 }
             };
-
+            
             produce_block_sparse_loads_bwd<Q_dO_same_stages>(
                 block_sparse_info,
                 load_Q_LSE,
@@ -587,10 +587,10 @@ struct CollectiveMainloopBwdSm90 {
                 smem_pipe_write,
                 smem_pipe_write_do
             );
-
+            
             scheduler_prefetch();
             if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
-
+            
         } else {
             // ============================================================
             // Non-Block Sparse Path (original code)
@@ -698,7 +698,7 @@ struct CollectiveMainloopBwdSm90 {
         auto [m_block_min, m_block_max] = BlockMN_t::get_m_block_min_max(
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
-
+        
         // For block sparsity, check if there are any blocks to process
         if constexpr (Use_block_sparsity) {
             BlockSparsityInfoBwd block_sparse_info;
@@ -728,7 +728,7 @@ struct CollectiveMainloopBwdSm90 {
         constexpr int kBlockM = get<0>(TileShape_MNK{});
         constexpr int kBlockN = get<1>(TileShape_MNK{});
         int n_block_global_max = cute::ceil_div(seqlen_info.seqlen_k, kBlockN);
-
+        
         // Lambda for storing dQ for one m_block
         auto store_dq_step = [&](int m_block) {
             if constexpr (Deterministic) {
@@ -763,9 +763,9 @@ struct CollectiveMainloopBwdSm90 {
             // ============================================================
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
-
+            
             store_dq_block_sparse(block_sparse_info, store_dq_step);
-
+            
             // For Is_local && Deterministic, we still need to handle the semaphore for remaining m_blocks
             // However, with block sparsity, the m_block iteration is non-contiguous, so we skip this
             // The deterministic mode with block sparsity may need special handling
@@ -778,7 +778,7 @@ struct CollectiveMainloopBwdSm90 {
             for (; m_block < m_block_max; ++m_block) {
                 store_dq_step(m_block);
             }
-
+            
             if constexpr (Is_local && Deterministic) {
                 int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
                 #pragma unroll 2
@@ -1136,14 +1136,14 @@ struct CollectiveMainloopBwdSm90 {
             // ============================================================
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
-
+            
             // Construct gMaskFunc tensor for arbitrary mask (only when Is_arbitrary is true)
             // mMaskFunc has shape (seqlen_q + 256, func_num, head_q or 1, batch or 1), stride (1, func_nfunc_stride, func_head_stride, func_batch_stride)
             // After local tile with batch/head/m_block, gMaskFunc has shape (kNFunc, kBlockM)
             [[maybe_unused]] auto construct_gMaskFunc = [&](int m_block) {
                 // Use kNFunc or 1 (fake) to avoid zero-size shape when Is_arbitrary is false
                 constexpr int kNFuncSafe = Is_arbitrary ? kNFunc : 1;
-                Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr),
+                Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr), 
                                                params.shape_mask_func, params.stride_mask_func);
                 // Support broadcasting: use _0{} when head/batch dimension is 1
                 // shape_mask_func: (seqlen_q + 256, func_num, head_q or 1, batch or 1)
@@ -1151,18 +1151,18 @@ struct CollectiveMainloopBwdSm90 {
                 int const Func_batch_idx = get<3>(params.shape_mask_func) == 1 ? 0 : bidb;
                 // Local tile: select batch, head, and tile by m_block
                 // gMaskFunc shape: (kBlockM, kNFunc) -> but we need (kNFunc, kBlockM) for mask.apply
-                Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{},
+                Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{}, 
                                                   make_coord(m_block, 0, Func_head_idx, Func_batch_idx));  // (kBlockM, kNFunc)
                 // Transpose to (kNFunc, kBlockM) for consistent access pattern in mask.apply
-                return make_tensor(gMaskFunc.data(),
+                return make_tensor(gMaskFunc.data(), 
                                    make_layout(make_shape(Int<kNFuncSafe>{}, Int<kBlockM>{}),
                                                make_stride(get<1>(gMaskFunc.stride()), get<0>(gMaskFunc.stride()))));
             };
-
+            
             // Mask functions for arbitrary block sparsity:
             // - For mask_blocks: apply arbitrary mask only (Seqlenk info is already in MaskFunc, and need Seqlen_mask)
-            // - For full_blocks: no mask needed
-            // TODO: Should the handling of out-of-bounds Seqlen Q be placed in the first mblock, regardless of whether it is full or masked?
+            // - For full_blocks: no mask needed 
+            // TODO: Should the handling of out-of-bounds Seqlen Q be placed in the first mblock, regardless of whether it is full or masked? 
             // TODO: Currently, blocks with out-of-bounds Seqlen Q are treated as mask blocks during the backward pass.
             // TODO: Alternatively, only the first mblock performs the Seqlen_mask.
             auto arbitrary_mask_fn = [&](auto& tSrS, int m_block) {
@@ -1172,7 +1172,7 @@ struct CollectiveMainloopBwdSm90 {
                 }
             };
             auto no_mask_fn = [](auto& tSrS, int m_block) { };
-
+            
             consume_block_sparse_mma_bwd(
                 block_sparse_info,
                 bwd_step,
@@ -1183,7 +1183,7 @@ struct CollectiveMainloopBwdSm90 {
             // ============================================================
             // Non-Block Sparse Path (original code)
             // ============================================================
-
+            
             // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
             // this helps quite a bit to not have to do causal masking for most of the iterations.
             if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {

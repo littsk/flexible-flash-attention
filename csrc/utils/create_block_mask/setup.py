@@ -4,7 +4,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-# Project root is kept on the include path for repo-local headers.
+# Project root contains hopper/tile_size.h - for determining tile sizes in sparsity blocks
 project_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 
 # ============================================================================
@@ -79,10 +79,10 @@ if enable_warp_level_opt:
 print("=" * 70)
 print("Building create_block_mask_cuda with configuration:")
 print("=" * 70)
-print(f"  [{'x' if not disable_reg_cache else ' '}] Register caching: {'enabled' if not disable_reg_cache else 'DISABLED'}")
-print(f"  [{'x' if not disable_kv_range_opt else ' '}] KV range optimization: {'enabled (Q2K inline + K2Q precompute)' if not disable_kv_range_opt else 'DISABLED'}")
-print(f"  [{'x' if not disable_block_size_template else ' '}] Block size template: {'enabled' if not disable_block_size_template else 'DISABLED'}")
-print(f"  [{' ' if not enable_warp_level_opt else 'x'}] Warp-level optimization: {'disabled' if not enable_warp_level_opt else 'ENABLED (experimental)'}")
+print(f"  [{'✓' if not disable_reg_cache else ' '}] Register caching: {'enabled' if not disable_reg_cache else 'DISABLED'}")
+print(f"  [{'✓' if not disable_kv_range_opt else ' '}] KV range optimization: {'enabled (Q2K inline + K2Q precompute)' if not disable_kv_range_opt else 'DISABLED'}")
+print(f"  [{'✓' if not disable_block_size_template else ' '}] Block size template: {'enabled' if not disable_block_size_template else 'DISABLED'}")
+print(f"  [{' ' if not enable_warp_level_opt else '✓'}] Warp-level optimization: {'disabled' if not enable_warp_level_opt else 'ENABLED (experimental)'}")
 print("=" * 70)
 
 setup(
@@ -103,8 +103,9 @@ setup(
                     "--use_fast_math",
                 ] + cuda_gencode_flags + extra_defines,
             },
-            include_dirs=[this_dir, project_root],
+            include_dirs=[this_dir, project_root],  # project_root for hopper/tile_size.h
         )
     ],
     cmdclass={"build_ext": BuildExtension},
 )
+

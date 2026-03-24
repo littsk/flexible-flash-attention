@@ -33,7 +33,8 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn_3"
+DIST_NAME = "ffa_fa3"
+PACKAGE_NAME = "flash_attn_cute.ffa_fa3"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
@@ -43,10 +44,6 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-# ROCm specific settings
-USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-if USE_TRITON_ROCM:
-    SKIP_CUDA_BUILD = True
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -453,10 +450,10 @@ exe_extension = sysconfig.get_config_var("EXE")
 
 cmdclass = {}
 ext_modules = []
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if not USE_TRITON_ROCM:
-    subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
+subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -467,15 +464,9 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_SM8x and DISABLE_SM90:
         raise RuntimeError("Cannot disable both SM8x and SM90. At least one architecture must be enabled.")
 
-    # Auto-generate kernel instantiation files if they don't exist, are empty, or
-    # were generated before forward nfunc files became shape-scoped.
+    # Auto-generate kernel instantiation files if they don't exist or are empty
     instantiations_dir = Path(this_dir) / "instantiations"
-    nfunc_split_sentinel = instantiations_dir / "flash_fwd_nfunc1_hdim128_bf16_sm80.cu"
-    if (
-        not instantiations_dir.exists()
-        or not any(instantiations_dir.glob("*.cu"))
-        or not nfunc_split_sentinel.exists()
-    ):
+    if not instantiations_dir.exists() or not any(instantiations_dir.glob("*.cu")):
         print("Generating kernel instantiation files...")
         subprocess.run([sys.executable, "generate_kernels.py", "-o", "instantiations"], cwd=this_dir, check=True)
 
@@ -629,37 +620,17 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
 
-    def nfunc_fwd_source(nfunc_val, hdim, dtype, sm):
-        return f"instantiations/flash_fwd_nfunc{nfunc_val}_hdim{hdim}_{dtype}_sm{sm}.cu"
-
-    # Per-nfunc instantiation files for arbitrary mask kernels. Forward files
-    # are split by dtype/head-dim so SM80 does not compile one very large
-    # flash_fwd_nfunc*_sm80.cu translation unit.
+    # Per-nfunc instantiation files for parallel compilation of arbitrary mask kernels
+    # Each nfunc value gets its own .cu file (per SM arch and direction), so they compile in parallel
     sources_nfunc = []
     if not DISABLE_ARBITRARY and NUM_FUNC_VALUES:
         for nfunc_val in NUM_FUNC_VALUES:
             if not DISABLE_SM90:
-                sources_nfunc += [
-                    nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
-                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90)
-                ]
-                if not DISABLE_HDIMDIFF64:
-                    sources_nfunc += [
-                        nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
-                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90)
-                    ]
-                if not DISABLE_HDIMDIFF192:
-                    sources_nfunc += [
-                        nfunc_fwd_source(nfunc_val, hdim, dtype, 90)
-                        for hdim, dtype in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90)
-                    ]
+                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm90.cu")
                 if not DISABLE_BACKWARD:
                     sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm90.cu")
             if not DISABLE_SM8x:
-                sources_nfunc += [
-                    nfunc_fwd_source(nfunc_val, hdim, dtype, 80)
-                    for hdim, dtype in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80)
-                ]
+                sources_nfunc.append(f"instantiations/flash_fwd_nfunc{nfunc_val}_sm80.cu")
                 if not DISABLE_BACKWARD:
                     sources_nfunc.append(f"instantiations/flash_bwd_nfunc{nfunc_val}_sm80.cu")
 
@@ -672,7 +643,7 @@ if not SKIP_CUDA_BUILD:
 
     if torch_version >= target_version and not FORCE_UNSTABLE_API:
         flash_api_source = "flash_api_stable.cpp"
-        stable_args = ["-DTORCH_TARGET_VERSION=0x0209000000000000"]  # Targets minimum runtime version torch 2.9.0
+        stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
     else:
         flash_api_source = "flash_api.cpp"
 
@@ -685,15 +656,6 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
-
-    missing_instantiations = [
-        src for src in sources
-        if src.startswith("instantiations/") and not (Path(this_dir) / src).exists()
-    ]
-    if missing_instantiations:
-        print(f"Generating kernel instantiation files ({len(missing_instantiations)} missing)...")
-        subprocess.run([sys.executable, "generate_kernels.py", "-o", "instantiations"], cwd=this_dir, check=True)
-
     nvcc_flags = [
         "-O3",
         "-std=c++17",
@@ -804,20 +766,10 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 setup(
-    name=PACKAGE_NAME,
+    name=DIST_NAME,
     version=get_package_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-        )
-    ),
-    py_modules=["flash_attn_interface", "flash_attn_config"],
+    packages=["flash_attn_cute.ffa_fa3"],
+    package_dir={"flash_attn_cute.ffa_fa3": "."},
     description="FlashAttention-3",
     long_description=long_description,
     long_description_content_type="text/markdown",

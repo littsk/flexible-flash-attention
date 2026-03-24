@@ -105,12 +105,11 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
 // Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
 //         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
 // Used by flash_bwd_launch_template.h run_mha_bwd_ function
-constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool> 
 tile_size_bwd_sm90(int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
     if (headdim <= 64) {
-        // hdim64 arbitrary has small 128x128 spills, but the larger tile is faster on H100.
-        // Keep causal+softcap on 96x128 to avoid its 128x128 spill regression.
-        int kBlockM = (is_causal && has_softcap) ? 96 : 128;
+        // hdim64: register spill with 128x128 when (causal && softcap) || arbitrary
+        int kBlockM = ((is_causal && has_softcap) || is_arbitrary) ? 96 : 128;
         bool dQ_swapAB = (kBlockM < 128);
         return {kBlockM, 128, /*Stages_dO=*/2, /*Stages_dS=*/2, /*SdP_swapAB=*/true, /*dKV_swapAB=*/false, dQ_swapAB,
                 /*NumMmaWarpGroups=*/2, /*AtomLayoutMSdP=*/1, /*AtomLayoutNdKV=*/2, /*AtomLayoutMdQ=*/2, /*V_in_regs=*/false};
@@ -138,7 +137,7 @@ tile_size_bwd_sm90(int headdim, bool is_causal, bool is_local, bool is_arbitrary
 // Return {kBlockM, kBlockN, Stages_dO, Stages_dS, SdP_swapAB, dKV_swapAB, dQ_swapAB,
 //         NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs}
 // Used by flash_bwd_launch_template.h run_mha_bwd_ function
-constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool>
+constexpr std::tuple<int, int, int, int, bool, bool, bool, int, int, int, int, bool> 
 tile_size_bwd_sm8x(bool sm86_or_89, int headdim, bool is_causal, bool is_local, bool is_arbitrary, bool has_softcap) {
     if (sm86_or_89) {
         // SM86/SM89 configurations - all have V_in_regs=true

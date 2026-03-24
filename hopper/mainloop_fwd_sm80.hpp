@@ -584,10 +584,10 @@ struct CollectiveMainloopFwdSm80 {
             // ============================================================
             BlockSparsityInfo block_sparse_info_prologue;
             block_sparse_info_prologue.init(block_sparse_params, bidb, bidh, m_block);
-
+            
             // For persistent, make sure all threads have finished reading smem_o
             __syncthreads();
-
+            
             // Only load K if there are blocks to process
             if (block_sparse_info_prologue.get_total_blocks() > 0) {
                 // Load the first block's K with seqlenk masking
@@ -598,7 +598,7 @@ struct CollectiveMainloopFwdSm80 {
                 load_K(first_n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
                 cute::cp_async_fence();
             }
-
+            
             preprocess_Q();
         }
 
@@ -613,7 +613,7 @@ struct CollectiveMainloopFwdSm80 {
         [[maybe_unused]] auto construct_gMaskFunc = [&]() {
             // Use kNFunc or 1 (fake) to avoid zero-size shape when Is_arbitrary is false
             constexpr int kNFuncSafe = Is_arbitrary ? kNFunc : 1;
-            Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr),
+            Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr), 
                                            params.shape_mask_func, params.stride_mask_func);
             // Support broadcasting: use _0{} when head/batch dimension is 1
             // shape_mask_func: (seqlen_q + 256, func_num, head, batch)
@@ -621,10 +621,10 @@ struct CollectiveMainloopFwdSm80 {
             int const Func_batch_idx = get<3>(params.shape_mask_func) == 1 ? 0 : bidb;
             // Local tile: select batch, head, and tile by m_block
             // gMaskFunc shape: (kBlockM, kNFunc) -> but we need (kNFunc, kBlockM) for mask.apply
-            Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{},
+            Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{}, 
                                               make_coord(m_block, 0, Func_head_idx, Func_batch_idx));  // (kBlockM, kNFunc)
             // Transpose to (kNFunc, kBlockM) for consistent access pattern in mask.apply
-            return make_tensor(gMaskFunc.data(),
+            return make_tensor(gMaskFunc.data(), 
                                make_layout(make_shape(Int<kNFuncSafe>{}, Int<kBlockM>{}),
                                            make_stride(get<1>(gMaskFunc.stride()), get<0>(gMaskFunc.stride()))));
         };
@@ -651,11 +651,7 @@ struct CollectiveMainloopFwdSm80 {
         };
 
         auto sync = [&] {
-            if constexpr (Use_block_sparsity) {
-                flash::cp_async_wait<0>();
-            } else {
-                flash::cp_async_wait<kStages * 2 - 2>();
-            }
+            flash::cp_async_wait<kStages * 2 - 2>();
             __syncthreads();
         };
 
@@ -735,11 +731,11 @@ struct CollectiveMainloopFwdSm80 {
             // ============================================================
             // Block sparse iteration path
             // ============================================================
-
+            
             // Initialize block sparsity info for this (bidb, bidh, m_block)
             BlockSparsityInfo block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, m_block);
-
+            
             // Create fwd_step for block sparsity with next_n_block prefetching
             // K is already loaded for the first block in prologue
             // Each iteration: process current K, load V, process scores, load next K
@@ -767,8 +763,8 @@ struct CollectiveMainloopFwdSm80 {
                 smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
                 scoremod_premask_fn(tSrS);
                 // For kStages == 1, load next K after sync
-                if constexpr (kStages == 1) {
-                    sync();
+                if constexpr (kStages == 1) { 
+                    sync(); 
                     if (next_n_block >= 0) {
                         if constexpr (PagedKV) {
                             paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(next_n_block);
@@ -789,7 +785,7 @@ struct CollectiveMainloopFwdSm80 {
                 Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
                 flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
                 // For kStages > 1, load next K after PV GEMM
-                if constexpr (kStages > 1) {
+                if constexpr (kStages > 1) { 
                     if (next_n_block >= 0) {
                         if constexpr (PagedKV) {
                             paged_kv_manager.template load_page_table<false /*Seqlenk_mask*/>(next_n_block);
@@ -800,7 +796,7 @@ struct CollectiveMainloopFwdSm80 {
                 }
                 smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
             };
-
+            
             // Mask functions for block sparsity
             auto arbitrary_mask_fn = [&](auto& tSrS, int n_block) {
                 if constexpr (Is_arbitrary) {
@@ -809,7 +805,7 @@ struct CollectiveMainloopFwdSm80 {
                 }
             };
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
-
+            
             // Use the helper function from block_sparsity.hpp
             flash::consume_block_sparse_loads_sm80(
                 block_sparse_info,
@@ -818,7 +814,7 @@ struct CollectiveMainloopFwdSm80 {
                 no_mask_fn
             );
         }
-
+        
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
         Tensor scores_scale = softmax.finalize(v_descale);
         softmax.rescale_o(tOrO, scores_scale);

@@ -16,15 +16,15 @@
 //    Expected speedup: ~4% on dense patterns (full, causal, random)
 //
 // 2. DISABLE_KV_RANGE_OPT - Disable kv_range optimization for both Q2K and K2Q
-//
+//    
 //    Default (not defined): Optimization ENABLED for both kernels
 //      - Q2K kernel: computes min/max kv range via block reduce, then iterates
 //        only over kv_blocks that could potentially overlap
-//      - K2Q kernel: first launches a separate kernel (precompute) to compute
+//      - K2Q kernel: first launches a separate kernel (precompute) to compute 
 //        q_block_kv_min/max, then uses these values to skip q_blocks that don't
 //        overlap with the current kv_block
 //      - Expected speedup: significant for sparse patterns (e.g., diagonal ~7x)
-//
+//    
 //    With DISABLE_KV_RANGE_OPT defined: Optimization DISABLED
 //      - Q2K kernel: iterates over all kv_blocks (0 to num_kv_blocks)
 //      - K2Q kernel: iterates over all q_blocks (no precompute kernel launched)
@@ -70,7 +70,7 @@ constexpr int WARP_SIZE_CONST = 32;
 
 /**
  * Device function to load func values from global memory into a register array.
- *
+ * 
  * @tparam N_FUNC: number of function values (must be > 0 for register caching)
  * @param func_ptr: pointer to func_tensor at position [b, h, 0, q_idx]
  * @param stride_f: stride for the n_func dimension
@@ -90,7 +90,7 @@ __device__ __forceinline__ void load_func_to_registers(
 
 /**
  * Device function to compute the min and max kv positions using register-cached func values.
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant)
  * @param func_regs: register array containing cached func values
  * @param out_min_kv: output minimum kv position (INT_MAX if no valid interval)
@@ -103,46 +103,46 @@ __device__ __forceinline__ void get_token_kv_range_from_regs(
     int& out_max_kv
 ) {
     constexpr int num_intervals = (N_FUNC + 1) / 2;
-
+    
     int min_kv = INT_MAX;
     int max_kv = 0;
-
+    
     // Check first interval: [0, F0)
     {
         int interval_start = 0;
         int interval_end = func_regs[0];  // F0
-
+        
         if (interval_end > interval_start) {
             min_kv = min(min_kv, interval_start);
             max_kv = max(max_kv, interval_end);
         }
     }
-
+    
     // Check remaining intervals: [F_{2i-1}, F_{2i}) for i = 1, 2, ...
     #pragma unroll
     for (int i = 1; i < num_intervals; i++) {
         int interval_start = func_regs[2 * i - 1];
         int interval_end = func_regs[2 * i];
-
+        
         if (interval_end > interval_start) {
             min_kv = min(min_kv, interval_start);
             max_kv = max(max_kv, interval_end);
         }
     }
-
+    
     out_min_kv = min_kv;
     out_max_kv = max_kv;
 }
 
 /**
  * Device function to compute the min and max kv positions for a q_token's valid intervals.
- *
+ * 
  * For a given q_token, compute the minimum and maximum kv positions across all valid intervals:
  *   interval 0: [0, F0)
  *   interval 1: [F1, F2)
  *   interval 2: [F3, F4)
  *   ...
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant, 0 means use runtime n_func)
  * @param func_ptr: pointer to func_tensor at position [b, h, 0, q_idx]
  * @param n_func: number of function values (only used when N_FUNC == 0)
@@ -159,54 +159,54 @@ __device__ __forceinline__ void get_token_kv_range(
     int& out_max_kv
 ) {
     const int num_intervals = (N_FUNC > 0) ? ((N_FUNC + 1) / 2) : ((n_func + 1) / 2);
-
+    
     int min_kv = INT_MAX;
     int max_kv = 0;
-
+    
     // Check first interval: [0, F0)
     {
         int interval_start = 0;
         int interval_end = func_ptr[0 * stride_f];  // F0
-
+        
         if (interval_end > interval_start) {
             min_kv = min(min_kv, interval_start);
             max_kv = max(max_kv, interval_end);
         }
     }
-
+    
     // Check remaining intervals: [F_{2i-1}, F_{2i}) for i = 1, 2, ...
     #pragma unroll
     for (int i = 1; i < num_intervals; i++) {
         int interval_start = func_ptr[(2 * i - 1) * stride_f];
         int interval_end = func_ptr[(2 * i) * stride_f];
-
+        
         if (interval_end > interval_start) {
             min_kv = min(min_kv, interval_start);
             max_kv = max(max_kv, interval_end);
         }
     }
-
+    
     out_min_kv = min_kv;
     out_max_kv = max_kv;
 }
 
 /**
  * Device function to determine the state of a (q_token, kv_block) pair.
- *
+ * 
  * For a given q_token and kv_block [kv_start, kv_end), check against
  * the valid intervals defined by func_vals:
  *   interval 0: [0, F0)
  *   interval 1: [F1, F2)
  *   interval 2: [F3, F4)
  *   ...
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant, 0 means use runtime n_func)
  * @param func_ptr: pointer to func_tensor at position [b, h, 0, q_idx]
  * @param n_func: number of function values (only used when N_FUNC == 0)
  * @param stride_f: stride for the n_func dimension
  * @param kv_start: start of kv_block (inclusive)
  * @param kv_end: end of kv_block (exclusive)
- *
+ * 
  * Returns:
  *   STATE_FULL: kv_block is completely within some valid interval
  *   STATE_MASK: kv_block partially overlaps with valid intervals
@@ -217,20 +217,20 @@ __device__ __forceinline__ int get_token_kv_block_state(
     const int* func_ptr,
     int n_func,
     int stride_f,
-    int kv_start,
+    int kv_start, 
     int kv_end
 ) {
     // Use compile-time constant if N_FUNC > 0, otherwise use runtime value
     const int num_intervals = (N_FUNC > 0) ? ((N_FUNC + 1) / 2) : ((n_func + 1) / 2);
-
+    
     bool has_any_overlap = false;
     bool is_fully_covered = false;
-
+    
     // Check first interval: [0, F0)
     {
         int interval_start = 0;
         int interval_end = func_ptr[0 * stride_f];  // F0
-
+        
         if (interval_end > interval_start) {
             // Check if kv_block is fully covered by this interval
             if (interval_start <= kv_start && interval_end >= kv_end) {
@@ -242,7 +242,7 @@ __device__ __forceinline__ int get_token_kv_block_state(
             }
         }
     }
-
+    
     // Check remaining intervals: [F_{2i-1}, F_{2i}) for i = 1, 2, ...
     // When N_FUNC is a compile-time constant, the loop can be fully unrolled
     #pragma unroll
@@ -263,7 +263,7 @@ __device__ __forceinline__ int get_token_kv_block_state(
             has_any_overlap = true;
         }
     }
-
+    
     if (is_fully_covered) {
         return STATE_FULL;
     } else if (has_any_overlap) {
@@ -275,7 +275,7 @@ __device__ __forceinline__ int get_token_kv_block_state(
 
 /**
  * Device function to determine kv_block state using register-cached func values.
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant)
  * @param func_regs: register array containing cached func values
  * @param kv_start: start of kv_block (inclusive)
@@ -284,19 +284,19 @@ __device__ __forceinline__ int get_token_kv_block_state(
 template <int N_FUNC>
 __device__ __forceinline__ int get_token_kv_block_state_from_regs(
     const int* func_regs,
-    int kv_start,
+    int kv_start, 
     int kv_end
 ) {
     constexpr int num_intervals = (N_FUNC + 1) / 2;
-
+    
     bool has_any_overlap = false;
     bool is_fully_covered = false;
-
+    
     // Check first interval: [0, F0)
     {
         int interval_start = 0;
         int interval_end = func_regs[0];  // F0
-
+        
         if (interval_end > interval_start) {
             if (interval_start <= kv_start && interval_end >= kv_end) {
                 is_fully_covered = true;
@@ -305,7 +305,7 @@ __device__ __forceinline__ int get_token_kv_block_state_from_regs(
             }
         }
     }
-
+    
     // Check remaining intervals: [F_{2i-1}, F_{2i}) for i = 1, 2, ...
     #pragma unroll
     for (int i = 1; i < num_intervals; i++) {
@@ -322,7 +322,7 @@ __device__ __forceinline__ int get_token_kv_block_state_from_regs(
             has_any_overlap = true;
         }
     }
-
+    
     if (is_fully_covered) {
         return STATE_FULL;
     } else if (has_any_overlap) {
@@ -334,11 +334,11 @@ __device__ __forceinline__ int get_token_kv_block_state_from_regs(
 
 /**
  * Block-level reduction to compute kv_block traversal range.
- *
+ * 
  * Each thread provides its q_token's min/max kv positions. This function performs
  * a block-level reduction to find the overall min/max, then computes the kv_block
  * range that needs to be traversed.
- *
+ * 
  * @param thread_min_kv: This thread's minimum kv position (INT_MAX if no valid interval)
  * @param thread_max_kv: This thread's maximum kv position (0 if no valid interval)
  * @param KV_BLOCK_SIZE: Size of each kv_block
@@ -363,52 +363,52 @@ __device__ __forceinline__ void reduce_kv_block_range(
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
     int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
+    
     // Warp-level min/max reduction
     int warp_min = __reduce_min_sync(0xFFFFFFFF, thread_min_kv);
     int warp_max = __reduce_max_sync(0xFFFFFFFF, thread_max_kv);
-
+    
     // Lane 0 of each warp writes to shared memory
     if (lane_id == 0) {
         warp_min_results[warp_id] = warp_min;
         warp_max_results[warp_id] = warp_max;
     }
     __syncthreads();
-
+    
     // Warp 0 performs final reduction and computes kv_block range
     int kv_block_start = 0;
     int kv_block_end = 0;
-
+    
     if (warp_id == 0) {
         int my_min = (lane_id < num_warps) ? warp_min_results[lane_id] : INT_MAX;
         int my_max = (lane_id < num_warps) ? warp_max_results[lane_id] : 0;
         int block_min_kv = __reduce_min_sync(0xFFFFFFFF, my_min);
         int block_max_kv = __reduce_max_sync(0xFFFFFFFF, my_max);
-
+        
         // Compute kv_block range (only lane 0's result will be used)
         if (block_max_kv > 0 && block_min_kv != INT_MAX) {
             kv_block_start = block_min_kv / KV_BLOCK_SIZE;
             kv_block_end = min(DIVUP(block_max_kv, KV_BLOCK_SIZE), num_kv_blocks);
         }
     }
-
+    
     // Broadcast result using shared memory (reuse warp_min_results)
     if (tid == 0) {
         warp_min_results[0] = kv_block_start;
         warp_max_results[0] = kv_block_end;
     }
     __syncthreads();
-
+    
     out_kv_block_start = warp_min_results[0];
     out_kv_block_end = warp_max_results[0];
 }
 
 /**
  * Block-level reduction to compute raw min/max kv positions.
- *
+ * 
  * Similar to reduce_kv_block_range but outputs raw min/max values instead of block indices.
  * Used by the K2Q preprocessing kernel.
- *
+ * 
  * @param thread_min_kv: This thread's minimum kv position (INT_MAX if no valid interval)
  * @param thread_max_kv: This thread's maximum kv position (0 if no valid interval)
  * @param warp_min_results: Shared memory array for warp-level min results [MAX_NUM_WARPS]
@@ -429,36 +429,36 @@ __device__ __forceinline__ void reduce_kv_range_raw(
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
     int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-
+    
     // Warp-level min/max reduction
     int warp_min = __reduce_min_sync(0xFFFFFFFF, thread_min_kv);
     int warp_max = __reduce_max_sync(0xFFFFFFFF, thread_max_kv);
-
+    
     // Lane 0 of each warp writes to shared memory
     if (lane_id == 0) {
         warp_min_results[warp_id] = warp_min;
         warp_max_results[warp_id] = warp_max;
     }
     __syncthreads();
-
+    
     // Warp 0 performs final reduction
     int block_min_kv = INT_MAX;
     int block_max_kv = 0;
-
+    
     if (warp_id == 0) {
         int my_min = (lane_id < num_warps) ? warp_min_results[lane_id] : INT_MAX;
         int my_max = (lane_id < num_warps) ? warp_max_results[lane_id] : 0;
         block_min_kv = __reduce_min_sync(0xFFFFFFFF, my_min);
         block_max_kv = __reduce_max_sync(0xFFFFFFFF, my_max);
     }
-
+    
     // Broadcast result using shared memory
     if (tid == 0) {
         warp_min_results[0] = block_min_kv;
         warp_max_results[0] = block_max_kv;
     }
     __syncthreads();
-
+    
     out_min_kv = warp_min_results[0];
     out_max_kv = warp_max_results[0];
 }
@@ -466,25 +466,25 @@ __device__ __forceinline__ void reduce_kv_range_raw(
 /**
  * Combine two states into one.
  * Rules:
- * - Same state -> keep same
- * - One is MASK -> MASK
- * - FULL + EMPTY -> MASK
+ * - Same state → keep same
+ * - One is MASK → MASK
+ * - FULL + EMPTY → MASK
  */
 __device__ __forceinline__ int combine_states(int state1, int state2) {
     if (state1 == state2) {
         return state1;
     }
-    // Different states -> MASK
+    // Different states → MASK
     return STATE_MASK;
 }
 
 /**
  * Convert combined state bitmask to state value.
- *
+ * 
  * Bitmask encoding: EMPTY(0)->0b001, MASK(1)->0b010, FULL(2)->0b100
- * - 0b001 (1) -> all EMPTY -> STATE_EMPTY
- * - 0b100 (4) -> all FULL -> STATE_FULL
- * - otherwise -> mixed states -> STATE_MASK
+ * - 0b001 (1) → all EMPTY → STATE_EMPTY
+ * - 0b100 (4) → all FULL → STATE_FULL
+ * - otherwise → mixed states → STATE_MASK
  */
 __device__ __forceinline__ int bitmask_to_state(unsigned int mask) {
     if (mask == 1u) return STATE_EMPTY;      // Only EMPTY present
@@ -494,15 +494,15 @@ __device__ __forceinline__ int bitmask_to_state(unsigned int mask) {
 
 /**
  * Block-level reduction to determine the final state of a block.
- *
+ * 
  * Rules:
- * - All threads FULL -> FULL block
- * - All threads EMPTY -> EMPTY block (skip)
- * - Any thread MASK, or (some FULL and some EMPTY) -> MASK block
- *
+ * - All threads FULL → FULL block
+ * - All threads EMPTY → EMPTY block (skip)
+ * - Any thread MASK, or (some FULL and some EMPTY) → MASK block
+ * 
  * Optimized with redux.sync (PTX instruction) for both warp-level and
  * cross-warp reduction, minimizing synchronization overhead.
- *
+ * 
  * Note: Inactive threads should have their state pre-set before calling:
  * - check_q_boundary=false: inactive threads contribute STATE_FULL
  * - check_q_boundary=true: inactive threads contribute STATE_EMPTY
@@ -515,30 +515,30 @@ __device__ __forceinline__ int reduce_block_state(
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
-
+    
     // Convert state to bitmask: EMPTY(0)->0b001, MASK(1)->0b010, FULL(2)->0b100
     unsigned int state_mask = 1u << thread_state;
-
+    
     // Phase 1: Warp-level reduction using redux.sync (single PTX instruction)
     unsigned int warp_mask = __reduce_or_sync(0xFFFFFFFF, state_mask);
-
+    
     // Phase 2: Lane 0 of each warp writes result to shared memory
     if (lane_id == 0) {
         warp_results[warp_id] = static_cast<int>(warp_mask);
     }
     __syncthreads();
-
+    
     // Phase 3: Warp 0 performs final reduction using redux.sync
     // Each thread in warp 0 reads one warp result, then reduce across the warp
     unsigned int final_mask = 0;
     if (warp_id == 0) {
         int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
         // Lane i reads warp_results[i] if valid, else 0 (neutral for OR)
-        unsigned int my_result = (lane_id < num_warps) ?
+        unsigned int my_result = (lane_id < num_warps) ? 
             static_cast<unsigned int>(warp_results[lane_id]) : 0u;
         final_mask = __reduce_or_sync(0xFFFFFFFF, my_result);
     }
-
+    
     // Convert bitmask back to state (only thread 0's result matters to caller)
     return bitmask_to_state(final_mask);
 }
@@ -549,7 +549,7 @@ __device__ __forceinline__ int reduce_block_state(
 
 /**
  * Warp-level only reduction for state bitmask (used when ENABLE_WARP_LEVEL_OPT is enabled).
- *
+ * 
  * @param local_state_mask: This thread's combined state bitmask
  * @return: Final state (STATE_FULL, STATE_MASK, or STATE_EMPTY)
  */
@@ -561,7 +561,7 @@ __device__ __forceinline__ int warp_reduce_state_only(unsigned int local_state_m
 /**
  * Block-level reduction for state bitmask (warp reduce + cross-warp reduce).
  * Used when ENABLE_WARP_LEVEL_OPT is NOT enabled.
- *
+ * 
  * @param local_state_mask: This thread's state bitmask
  * @param warp_results: Shared memory array for cross-warp communication
  * @return: Final state (STATE_FULL, STATE_MASK, or STATE_EMPTY)
@@ -574,25 +574,25 @@ __device__ __forceinline__ int block_reduce_state_bitmask(
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE;
     int warp_id = tid / WARP_SIZE;
-
+    
     // Phase 1: Warp-level reduction
     unsigned int warp_mask = __reduce_or_sync(0xFFFFFFFF, local_state_mask);
-
+    
     // Phase 2: Lane 0 of each warp writes result to shared memory
     if (lane_id == 0) {
         warp_results[warp_id] = static_cast<int>(warp_mask);
     }
     __syncthreads();
-
+    
     // Phase 3: Warp 0 performs final reduction
     unsigned int final_mask = 0;
     if (warp_id == 0) {
         int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-        unsigned int my_result = (lane_id < num_warps) ?
+        unsigned int my_result = (lane_id < num_warps) ? 
             static_cast<unsigned int>(warp_results[lane_id]) : 0u;
         final_mask = __reduce_or_sync(0xFFFFFFFF, my_result);
     }
-
+    
     return bitmask_to_state(final_mask);
 }
 
@@ -602,21 +602,21 @@ __device__ __forceinline__ int block_reduce_state_bitmask(
 
 /**
  * Q2K Kernel: Create block sparse tensors from function encoding.
- *
+ * 
  * Design (controlled by ENABLE_WARP_LEVEL_OPT macro):
- *
+ * 
  * Block-level mode (default):
  * - One block processes one (b, h, q_block) with Q_BLOCK_SIZE threads
  * - Each thread handles one q_token (TOKENS_PER_THREAD = 1)
  * - Uses block-level reduction (warp reduce + cross-warp reduce via shared memory)
- *
+ * 
  * Warp-level mode (ENABLE_WARP_LEVEL_OPT defined):
  * - One block processes one (b, h, q_block) with 32 threads (one warp)
  * - Each thread handles Q_BLOCK_SIZE/32 q_tokens
  * - Uses warp-level reduction only (no shared memory for state reduction)
- *
+ * 
  * Grid: dim3(num_q_blocks, H, B)
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant, 0 means use runtime n_func)
  * @tparam Q_BLOCK_SIZE_T: Q block size (compile-time constant, 0 means use runtime value)
  * @tparam KV_BLOCK_SIZE_T: KV block size (compile-time constant, 0 means use runtime value)
@@ -637,7 +637,7 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     // Use compile-time constant if available, otherwise use runtime value
     const int Q_BLOCK_SIZE = (Q_BLOCK_SIZE_T > 0) ? Q_BLOCK_SIZE_T : Q_BLOCK_SIZE_RT;
     const int KV_BLOCK_SIZE = (KV_BLOCK_SIZE_T > 0) ? KV_BLOCK_SIZE_T : KV_BLOCK_SIZE_RT;
-
+    
     // Determine if warp-level optimization is enabled AND valid for this template instantiation
     // Warp-level requires compile-time Q_BLOCK_SIZE_T > 0 and divisible by 32
 #ifdef ENABLE_WARP_LEVEL_OPT
@@ -645,17 +645,17 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
 #else
     constexpr bool USE_WARP_LEVEL = false;
 #endif
-
+    
     // TOKENS_PER_THREAD: how many q_tokens each thread processes
     // - Warp-level mode: Q_BLOCK_SIZE_T / 32 (e.g., 8 for 256, 4 for 128)
     // - Block-level mode: 1 (each thread handles 1 token)
     constexpr int TOKENS_PER_THREAD = USE_WARP_LEVEL ? (Q_BLOCK_SIZE_T / WARP_SIZE_CONST) : 1;
-
+    
     // Shared memory for block-level reduction (only needed when not using warp-level)
     __shared__ int warp_results[USE_WARP_LEVEL ? 1 : MAX_NUM_WARPS];
     __shared__ int warp_min_results[USE_WARP_LEVEL ? 1 : MAX_NUM_WARPS];
     __shared__ int warp_max_results[USE_WARP_LEVEL ? 1 : MAX_NUM_WARPS];
-
+    
     // Get block indices
     int q_block = blockIdx.x;
     int h = blockIdx.y;
@@ -668,28 +668,28 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     int q_start = q_block * Q_BLOCK_SIZE;
     int q_end = min(q_start + Q_BLOCK_SIZE, Q_LEN);
     int num_active_tokens = q_end - q_start;
-
+    
     // Check if this q_block is full (has Q_BLOCK_SIZE active tokens)
     bool is_q_block_full = (num_active_tokens == Q_BLOCK_SIZE);
-
+    
     // Base pointer for func_tensor at [b, h, 0, 0]
     const int* base_func_ptr = func_tensor + b * stride_b + h * stride_h;
-
+    
     // =========================================================================
     // Load func values into registers
     // Warp-level: each thread loads TOKENS_PER_THREAD tokens
     // Block-level: each thread loads 1 token
     // =========================================================================
-
+    
     // Common pointer for this thread's primary q_token (used in block-level mode)
     int q_idx_primary = q_start + tid;
     bool is_active_primary = (tid < num_active_tokens);
     const int* my_func_ptr = base_func_ptr + q_idx_primary * stride_q;
-
+    
     // Register arrays for func values (sized based on mode)
     int func_regs[TOKENS_PER_THREAD][N_FUNC > 0 ? N_FUNC : 1];
     bool token_active[TOKENS_PER_THREAD];
-
+    
 #ifndef DISABLE_REG_CACHE
     // Load func values into registers
     #pragma unroll
@@ -702,7 +702,7 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
         }
         int q_idx = q_start + local_q_idx;
         token_active[t] = (local_q_idx < num_active_tokens);
-
+        
         if (token_active[t]) {
             const int* func_ptr = base_func_ptr + q_idx * stride_q;
             if constexpr (N_FUNC > 0) {
@@ -717,12 +717,12 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     // Without register caching, just initialize token_active
     token_active[0] = is_active_primary;
 #endif
-
+    
     // =========================================================================
     // Compute kv_block traversal range
     // =========================================================================
     int kv_block_start, kv_block_end;
-
+    
 #ifdef DISABLE_KV_RANGE_OPT
     kv_block_start = 0;
     kv_block_end = num_kv_blocks;
@@ -730,7 +730,7 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     {
         int thread_min_kv = INT_MAX;
         int thread_max_kv = 0;
-
+        
         if constexpr (USE_WARP_LEVEL) {
             // Warp-level: local reduce across this thread's tokens
             #pragma unroll
@@ -745,7 +745,7 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
             // Warp reduce to get block's kv range
             int block_min_kv = __reduce_min_sync(0xFFFFFFFF, thread_min_kv);
             int block_max_kv = __reduce_max_sync(0xFFFFFFFF, thread_max_kv);
-
+            
             if (block_max_kv > 0 && block_min_kv != INT_MAX) {
                 kv_block_start = block_min_kv / KV_BLOCK_SIZE;
                 kv_block_end = min(DIVUP(block_max_kv, KV_BLOCK_SIZE), num_kv_blocks);
@@ -772,35 +772,35 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
         }
     }
 #endif  // DISABLE_KV_RANGE_OPT
-
+    
     // Output tensor strides (contiguous layout)
     int out_cnt_stride_b = H * num_q_blocks;
     int out_cnt_stride_h = num_q_blocks;
     int out_idx_stride_b = H * num_q_blocks * num_kv_blocks;
     int out_idx_stride_h = num_q_blocks * num_kv_blocks;
     int out_idx_stride_q = num_kv_blocks;
-
+    
     // Output offsets
     int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + q_block;
     int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + q_block * out_idx_stride_q;
-
+    
     // Counters
     int mask_count = 0;
     int full_count = 0;
-
+    
     // Process each kv_block within the computed range
     for (int kv_block = kv_block_start; kv_block < kv_block_end; kv_block++) {
         int kv_start = kv_block * KV_BLOCK_SIZE;
         int kv_end = min(kv_start + KV_BLOCK_SIZE, KV_LEN);
-
+        
         // Check if this is a partial kv_block
         bool is_kv_block_full = (kv_end == kv_start + KV_BLOCK_SIZE);
-
+        
         // =====================================================================
         // Each thread computes state for its tokens and accumulates into bitmask
         // =====================================================================
         unsigned int local_state_mask = 0;
-
+        
         #pragma unroll
         for (int t = 0; t < TOKENS_PER_THREAD; t++) {
             int token_state;
@@ -832,7 +832,7 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
             // Accumulate state into bitmask: EMPTY->0b001, MASK->0b010, FULL->0b100
             local_state_mask |= (1u << token_state);
         }
-
+        
         // =====================================================================
         // Reduce state across all tokens in the q_block
         // =====================================================================
@@ -844,12 +844,12 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
             // Block-level reduction (warp reduce + cross-warp reduce)
             kv_block_state = block_reduce_state_bitmask(local_state_mask, warp_results);
         }
-
+        
         // Record the result (thread 0 / lane 0)
         int leader_id = USE_WARP_LEVEL ? lane_id : tid;
         if (leader_id == 0) {
             bool can_be_full = (!check_q_boundary || is_q_block_full) && is_kv_block_full;
-
+            
             if (kv_block_state == STATE_FULL && can_be_full) {
                 block_idx[idx_base + full_count] = kv_block;
                 full_count++;
@@ -858,12 +858,12 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
                 mask_count++;
             }
         }
-
+        
         if constexpr (!USE_WARP_LEVEL) {
             __syncthreads();
         }
     }
-
+    
     // Write final counts
     int final_leader_id = USE_WARP_LEVEL ? lane_id : tid;
     if (final_leader_id == 0) {
@@ -878,22 +878,22 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
 
 /**
  * K2Q Preprocessing Kernel: Compute min/max kv positions for each q_block.
- *
+ * 
  * This kernel precomputes the kv range that each q_block can access,
  * which allows the main K2Q kernel to skip q_blocks that don't overlap
  * with the current kv_block.
- *
+ * 
  * Design:
  * - One block processes one (b, h, q_block)
  * - Each block has Q_BLOCK_SIZE threads, one per q_token
  * - Grid: dim3(num_q_blocks, H, B)
- *
+ * 
  * Output:
  * - q_block_kv_min[B, H, num_q_blocks]: minimum kv position for each q_block
  * - q_block_kv_max[B, H, num_q_blocks]: maximum kv position for each q_block (exclusive)
- *
+ * 
  * If a q_block has no valid intervals, min=INT_MAX and max=0.
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant, 0 means use runtime n_func)
  */
 template <int N_FUNC>
@@ -909,41 +909,41 @@ __global__ void compute_q_block_kv_range_kernel(
     // Shared memory for warp-level reduction
     __shared__ int warp_min_results[MAX_NUM_WARPS];
     __shared__ int warp_max_results[MAX_NUM_WARPS];
-
+    
     // Get block indices
     int q_block = blockIdx.x;
     int h = blockIdx.y;
     int b = blockIdx.z;
     int H = gridDim.y;
     int tid = threadIdx.x;
-
+    
     // Calculate q range for this block
     int q_start = q_block * Q_BLOCK_SIZE;
     int q_end = min(q_start + Q_BLOCK_SIZE, Q_LEN);
     int num_active_threads = q_end - q_start;
-
+    
     // This thread's q_token index
     int q_idx = q_start + tid;
     bool is_active = (tid < num_active_threads);
-
+    
     // Pointer to func_tensor at [b, h, 0, q_idx]
     const int* my_func_ptr = func_tensor + b * stride_b + h * stride_h + q_idx * stride_q;
-
+    
     // Each thread computes min/max kv for its q_token
     // Inactive threads use INT_MAX/0 so they don't affect the reduce
     int thread_min_kv = INT_MAX;
     int thread_max_kv = 0;
-
+    
     if (is_active) {
         get_token_kv_range<N_FUNC>(my_func_ptr, n_func, stride_f, thread_min_kv, thread_max_kv);
     }
-
+    
     // Block-level reduction to get q_block's min/max kv range
     int block_min_kv, block_max_kv;
-    reduce_kv_range_raw(thread_min_kv, thread_max_kv,
+    reduce_kv_range_raw(thread_min_kv, thread_max_kv, 
                         warp_min_results, warp_max_results,
                         block_min_kv, block_max_kv);
-
+    
     // Thread 0 writes the result
     if (tid == 0) {
         int out_offset = b * H * num_q_blocks + h * num_q_blocks + q_block;
@@ -958,23 +958,23 @@ __global__ void compute_q_block_kv_range_kernel(
 
 /**
  * K2Q Kernel: Create block sparse tensors from function encoding for backward pass.
- *
+ * 
  * Design (controlled by ENABLE_WARP_LEVEL_OPT macro):
- *
+ * 
  * Block-level mode (default):
  * - One block processes one (b, h, kv_block) with Q_BLOCK_SIZE threads
  * - Each thread handles one q_token per q_block (TOKENS_PER_THREAD = 1)
  * - Uses block-level reduction (warp reduce + cross-warp reduce via shared memory)
- *
+ * 
  * Warp-level mode (ENABLE_WARP_LEVEL_OPT defined):
  * - One block processes one (b, h, kv_block) with 32 threads (one warp)
  * - Each thread handles Q_BLOCK_SIZE/32 q_tokens per q_block
  * - Uses warp-level reduction only (no shared memory for state reduction)
- *
+ * 
  * Grid: dim3(num_kv_blocks, H, B)
- *
+ * 
  * Note: Always performs boundary checking (partial q_blocks cannot have FULL status).
- *
+ * 
  * @tparam N_FUNC: number of function values (compile-time constant, 0 means use runtime n_func)
  * @tparam Q_BLOCK_SIZE_T: Q block size (compile-time constant, 0 means use runtime value)
  * @tparam KV_BLOCK_SIZE_T: KV block size (compile-time constant, 0 means use runtime value)
@@ -998,19 +998,19 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     // Use compile-time constant if available, otherwise use runtime value
     const int Q_BLOCK_SIZE = (Q_BLOCK_SIZE_T > 0) ? Q_BLOCK_SIZE_T : Q_BLOCK_SIZE_RT;
     const int KV_BLOCK_SIZE = (KV_BLOCK_SIZE_T > 0) ? KV_BLOCK_SIZE_T : KV_BLOCK_SIZE_RT;
-
+    
     // Determine if warp-level optimization is enabled AND valid for this template instantiation
 #ifdef ENABLE_WARP_LEVEL_OPT
     constexpr bool USE_WARP_LEVEL_K2Q = (Q_BLOCK_SIZE_T > 0) && (Q_BLOCK_SIZE_T % WARP_SIZE_CONST == 0);
 #else
     constexpr bool USE_WARP_LEVEL_K2Q = false;
 #endif
-
+    
     constexpr int TOKENS_PER_THREAD_K2Q = USE_WARP_LEVEL_K2Q ? (Q_BLOCK_SIZE_T / WARP_SIZE_CONST) : 1;
-
+    
     // Shared memory for block-level reduction (only needed when not using warp-level)
     __shared__ int warp_results_k2q[USE_WARP_LEVEL_K2Q ? 1 : MAX_NUM_WARPS];
-
+    
     // Get block indices
     int kv_block = blockIdx.x;
     int h = blockIdx.y;
@@ -1018,28 +1018,28 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     int H = gridDim.y;
     int tid = threadIdx.x;
     int lane_id = tid % WARP_SIZE_CONST;
-
+    
     // Calculate kv range for this block
     int kv_start = kv_block * KV_BLOCK_SIZE;
     int kv_end = min(kv_start + KV_BLOCK_SIZE, KV_LEN);
-
+    
     // Check if this is a partial kv_block
     bool is_kv_block_full = (kv_end == kv_start + KV_BLOCK_SIZE);
-
+    
     // Base pointer for func_tensor at [b, h, 0, 0]
     const int* base_func_ptr = func_tensor + b * stride_b + h * stride_h;
-
+    
     // Output tensor strides (contiguous layout)
     int out_cnt_stride_b = H * num_kv_blocks;
     int out_cnt_stride_h = num_kv_blocks;
     int out_idx_stride_b = H * num_kv_blocks * num_q_blocks;
     int out_idx_stride_h = num_kv_blocks * num_q_blocks;
     int out_idx_stride_kv = num_q_blocks;
-
+    
     // Output offsets
     int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + kv_block;
     int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + kv_block * out_idx_stride_kv;
-
+    
     // Precomputed q_block kv range offset (if available)
     int precompute_base = b * H * num_q_blocks + h * num_q_blocks;
 #ifndef DISABLE_KV_RANGE_OPT
@@ -1051,14 +1051,14 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     // Optimization disabled: don't use precompute, iterate all q_blocks
     constexpr bool use_precompute = false;
 #endif
-
+    
     // Counters
     int mask_count = 0;
     int full_count = 0;
-
+    
     // Register array for func values
     int func_regs_k2q[TOKENS_PER_THREAD_K2Q][N_FUNC > 0 ? N_FUNC : 1];
-
+    
     // Process each q_block
     for (int q_block_idx = 0; q_block_idx < num_q_blocks; q_block_idx++) {
         // =========================================================================
@@ -1067,26 +1067,26 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
         if constexpr (use_precompute) {
             int q_min_kv = q_block_kv_min[precompute_base + q_block_idx];
             int q_max_kv = q_block_kv_max[precompute_base + q_block_idx];
-
+            
             if (q_max_kv <= kv_start || q_min_kv >= kv_end) {
                 continue;
             }
         }
-
+        
         // Calculate q range for this q_block
         int q_start = q_block_idx * Q_BLOCK_SIZE;
         int q_end = min(q_start + Q_BLOCK_SIZE, Q_LEN);
         int num_active_tokens = q_end - q_start;
-
+        
         // Check if this q_block is full
         bool is_q_block_full = (num_active_tokens == Q_BLOCK_SIZE);
-
+        
         // =====================================================================
         // Load func values and compute state
         // =====================================================================
         unsigned int local_state_mask = 0;
         bool token_active_k2q[TOKENS_PER_THREAD_K2Q];
-
+        
         // Load func values
         #pragma unroll
         for (int t = 0; t < TOKENS_PER_THREAD_K2Q; t++) {
@@ -1098,7 +1098,7 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
             }
             int q_idx = q_start + local_q_idx;
             token_active_k2q[t] = (local_q_idx < num_active_tokens);
-
+            
             if (token_active_k2q[t]) {
                 const int* my_func_ptr = base_func_ptr + q_idx * stride_q;
                 if constexpr (N_FUNC > 0) {
@@ -1109,7 +1109,7 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
                 }
             }
         }
-
+        
         // Compute state for each token
         #pragma unroll
         for (int t = 0; t < TOKENS_PER_THREAD_K2Q; t++) {
@@ -1133,7 +1133,7 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
             }
             local_state_mask |= (1u << token_state);
         }
-
+        
         // =====================================================================
         // Reduce state across all tokens in the q_block
         // =====================================================================
@@ -1145,12 +1145,12 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
             // Block-level reduction (warp reduce + cross-warp reduce)
             q_block_state = block_reduce_state_bitmask(local_state_mask, warp_results_k2q);
         }
-
+        
         // Record the result
         int leader_id_k2q = USE_WARP_LEVEL_K2Q ? lane_id : tid;
         if (leader_id_k2q == 0) {
             bool can_be_full = is_q_block_full && is_kv_block_full;
-
+            
             if (q_block_state == STATE_FULL && can_be_full) {
                 block_idx[idx_base + full_count] = q_block_idx;
                 full_count++;
@@ -1159,12 +1159,12 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
                 mask_count++;
             }
         }
-
+        
         if constexpr (!USE_WARP_LEVEL_K2Q) {
             __syncthreads();
         }
     }
-
+    
     // Write final counts
     int final_leader_id_k2q = USE_WARP_LEVEL_K2Q ? lane_id : tid;
     if (final_leader_id_k2q == 0) {
@@ -1260,7 +1260,7 @@ void launch_create_q2k_block_sparse_from_func(
 ) {
     int num_q_blocks = DIVUP(Q_LEN, Q_BLOCK_SIZE);
     int num_kv_blocks = DIVUP(KV_LEN, KV_BLOCK_SIZE);
-
+    
     // 3D grid: (num_q_blocks, H, B)
     dim3 grid(num_q_blocks, H, B);
 
@@ -1271,7 +1271,7 @@ void launch_create_q2k_block_sparse_from_func(
     // Requires: Q_BLOCK_SIZE % 32 == 0, n_func in [1,33] (odd)
     // =========================================================================
     int block_size = WARP_SIZE_CONST;  // 32 threads per block
-
+    
     if (Q_BLOCK_SIZE == 256 && KV_BLOCK_SIZE == 128) {
         DISPATCH_Q2K_BY_NFUNC(n_func, 256, 128);
     } else if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
@@ -1321,7 +1321,7 @@ void launch_compute_q_block_kv_range(
     cudaStream_t stream
 ) {
     int num_q_blocks = DIVUP(Q_LEN, Q_BLOCK_SIZE);
-
+    
     // 3D grid: (num_q_blocks, H, B)
     dim3 grid(num_q_blocks, H, B);
     int block_size = Q_BLOCK_SIZE;
@@ -1386,7 +1386,7 @@ void launch_create_k2q_block_sparse_from_func(
 ) {
     int num_q_blocks = DIVUP(Q_LEN, Q_BLOCK_SIZE);
     int num_kv_blocks = DIVUP(KV_LEN, KV_BLOCK_SIZE);
-
+    
     // 3D grid: (num_kv_blocks, H, B) - note: kv_blocks is the outer loop
     dim3 grid(num_kv_blocks, H, B);
 
@@ -1396,7 +1396,7 @@ void launch_create_k2q_block_sparse_from_func(
     // Each thread processes Q_BLOCK_SIZE/32 q_tokens
     // =========================================================================
     int block_size = WARP_SIZE_CONST;  // 32 threads per block
-
+    
     if (Q_BLOCK_SIZE == 128 && KV_BLOCK_SIZE == 128) {
         DISPATCH_K2Q_BY_NFUNC(n_func, 128, 128);
     } else if (Q_BLOCK_SIZE == 256 && KV_BLOCK_SIZE == 128) {
@@ -1457,7 +1457,7 @@ void launch_create_k2q_block_sparse_from_func(
 
 /**
  * Kernel to extract compact indices from block_idx.
- *
+ * 
  * Each block handles one row of block_idx.
  * - Full indices: stored left-to-right at block_idx[row, 0:full_cnt]
  * - Mask indices: stored right-to-left at block_idx[row, max_blocks-mask_cnt:max_blocks]
@@ -1476,21 +1476,21 @@ __global__ void extract_compact_indices_kernel(
 ) {
     int row = blockIdx.x;
     if (row >= n_blocks) return;
-
+    
     int tid = threadIdx.x;
-
+    
     int fcnt = full_cnt[row];
     int mcnt = mask_cnt[row];
     int foff = full_offset[row];
     int moff = mask_offset[row];
-
+    
     const int* row_ptr = block_idx + row * max_blocks;
-
+    
     // Extract full indices (left-to-right, no reversal needed)
     for (int i = tid; i < fcnt; i += blockDim.x) {
         full_idx_compact[foff + i] = row_ptr[i];
     }
-
+    
     // Extract mask indices (right-to-left, need to reverse)
     // Original: row_ptr[max_blocks - mcnt + i] for i in [0, mcnt)
     // Reversed: row_ptr[max_blocks - 1 - i] for i in [0, mcnt)
@@ -1538,10 +1538,10 @@ struct Int2Sum {
 
 /**
  * Dual inclusive sum kernel with exclusive prefix sum output format.
- *
+ * 
  * Input:  cnt[0..n-1]
  * Output: offset[0..n] where offset[0]=0, offset[i+1]=sum(cnt[0..i])
- *
+ * 
  * This produces exclusive prefix sum format: [0, c0, c0+c1, ..., total]
  */
 __global__ void dual_inclusive_sum_kernel(
@@ -1555,21 +1555,21 @@ __global__ void dual_inclusive_sum_kernel(
     typedef cub::BlockScan<int2, SCAN_BLOCK_SIZE> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
     __shared__ int2 shared_prefix;
-
+    
     int tid = threadIdx.x;
-
+    
     // Write leading zeros (offset[0] = 0)
     if (tid == 0) {
         mask_offset[0] = 0;
         full_offset[0] = 0;
     }
-
+    
     // Process all elements in tiles using a single CTA
     int2 running_prefix = make_int2(0, 0);
-
+    
     for (int tile_start = 0; tile_start < n_elements; tile_start += SCAN_BLOCK_SIZE) {
         int idx = tile_start + tid;
-
+        
         // Load data (use 0 for out-of-bounds)
         int2 thread_data;
         if (idx < n_elements) {
@@ -1577,22 +1577,22 @@ __global__ void dual_inclusive_sum_kernel(
         } else {
             thread_data = make_int2(0, 0);
         }
-
+        
         // Perform block-level inclusive scan
         int2 thread_result;
         BlockScan(temp_storage).InclusiveScan(thread_data, thread_result, Int2Sum());
         __syncthreads();
-
+        
         // Add running prefix from previous tiles
         thread_result.x += running_prefix.x;
         thread_result.y += running_prefix.y;
-
+        
         // Write result to offset[idx + 1] (exclusive prefix sum format)
         if (idx < n_elements) {
             mask_offset[idx + 1] = thread_result.x;
             full_offset[idx + 1] = thread_result.y;
         }
-
+        
         // Broadcast running_prefix to all threads for next tile
         // The last valid thread in this tile writes to shared memory
         int last_tid_in_tile = min(SCAN_BLOCK_SIZE - 1, n_elements - 1 - tile_start);

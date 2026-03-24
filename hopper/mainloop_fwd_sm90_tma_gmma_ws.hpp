@@ -925,27 +925,27 @@ struct CollectiveMainloopFwdSm90 {
             // ============================================================
             // Block sparse iteration path
             // ============================================================
-
+            
             // Initialize block sparsity info for this (bidb, bidh, m_block)
             BlockSparsityInfo block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, m_block);
-
+            
             // Combined lambda for load_Q and wait_barrier_O
             auto load_Q_and_wait = [&]() {
                 load_Q();
                 wait_barrier_O();
             };
-
+            
             // Call the unified block sparse load function
             flash::produce_block_sparse_loads<IntraWGOverlap, Transpose_V, PagedKVNonTMA>(
                 block_sparse_info,
                 load_K, load_V, load_Q_and_wait, copy_Vt_to_V,
                 paged_kv_manager, smem_pipe_write, should_load_KV
             );
-
+            
             scheduler_prefetch();
         }
-
+        
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
     }
@@ -1049,7 +1049,7 @@ struct CollectiveMainloopFwdSm90 {
             block_sparse_info.init(block_sparse_params, bidb, bidh, m_block);
             if (block_sparse_info.is_empty()) { return false; }
         }
-
+        
 
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -1139,7 +1139,7 @@ struct CollectiveMainloopFwdSm90 {
         [[maybe_unused]] auto construct_gMaskFunc = [&]() {
             // Use kNFunc or 1 (fake) to avoid zero-size shape when Is_arbitrary is false
             constexpr int kNFuncSafe = Is_arbitrary ? kNFunc : 1;
-            Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr),
+            Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr), 
                                            params.shape_mask_func, params.stride_mask_func);
             // Support broadcasting: use _0{} when head/batch dimension is 1
             // shape_mask_func: (seqlen_q + 256, func_num, head_q or 1, batch or 1)
@@ -1147,10 +1147,10 @@ struct CollectiveMainloopFwdSm90 {
             int const Func_batch_idx = get<3>(params.shape_mask_func) == 1 ? 0 : bidb;
             // Local tile: select batch, head, and tile by m_block
             // gMaskFunc shape: (kBlockM, kNFunc) -> but we need (kNFunc, kBlockM) for mask.apply
-            Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{},
+            Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{}, 
                                               make_coord(m_block, 0, Func_head_idx, Func_batch_idx));  // (kBlockM, kNFunc)
             // Transpose to (kNFunc, kBlockM) for consistent access pattern in mask.apply
-            return make_tensor(gMaskFunc.data(),
+            return make_tensor(gMaskFunc.data(), 
                                make_layout(make_shape(Int<kNFuncSafe>{}, Int<kBlockM>{}),
                                            make_stride(get<1>(gMaskFunc.stride()), get<0>(gMaskFunc.stride()))));
         };
@@ -1227,7 +1227,7 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         if constexpr (IntraWGOverlap) {
-
+            
             // ==========================================
             // Common lambdas for both paths
             // ==========================================
@@ -1239,7 +1239,7 @@ struct CollectiveMainloopFwdSm90 {
             // Need a named variable since max_get_scale takes non-const reference
             Tensor tSrS_for_scale = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS_for_scale);
-
+            
             // First half block: QK gemm + mask + softmax + convert to P
             auto process_first_half_block = [&](int const n_block, auto mask_fn) {
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
@@ -1305,7 +1305,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
-
+            
             // Last half block: final PV gemm + finalize softmax
             auto process_last_half_block = [&]() {
                 // Tell producers that smem_q is ready
@@ -1326,19 +1326,19 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
                 ++smem_pipe_read;
             };
-
+            
             if constexpr (Use_block_sparsity) {
                 // ==========================================
                 // Block Sparsity Path (IntraWGOverlap)
                 // ==========================================
-
+                
                 // Initialize block sparsity info for this (bidb, bidh, m_block)
                 BlockSparsityInfo block_sparse_info;
                 block_sparse_info.init(block_sparse_params, bidb, bidh, m_block);
-
+                
                 // Simplified mask functions for block sparsity:
                 // - For mask_blocks: apply arbitrary mask only (Seqlenk info is already in MaskFunc)
-                // - For full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't
+                // - For full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't 
                 //   need mask as out-of-bound won't be written back in epilogue)
                 // - check_inf: only needed when mask is applied (mask_blocks)
                 auto arbitrary_mask_fn = [&](auto& tSrS, int n_block) {
@@ -1349,13 +1349,13 @@ struct CollectiveMainloopFwdSm90 {
                     // No mask needed if Is_arbitrary is false (full block behavior)
                 };
                 auto no_mask_fn = [](auto& tSrS, int n_block) { };
-
+                
                 // Empty lambdas for warp scheduler barriers parameters to consume_block_sparse_loads.
                 // In IntraWGOverlap path, barriers are called directly inside fwd_step lambda,
                 // so consume_block_sparse_loads doesn't need to call these (they're only used in !IntraWGOverlap path).
                 auto warp_scheduler_barrier_sync_noop = []() {};
                 auto warp_scheduler_barrier_arrive_noop = []() {};
-
+                
                 // Empty case is handled at function entry - block_sparse_info.is_empty() returns false early
                 flash::consume_block_sparse_loads<true /*IntraWGOverlap*/>(
                     block_sparse_info,
@@ -1367,15 +1367,15 @@ struct CollectiveMainloopFwdSm90 {
                     warp_scheduler_barrier_sync_noop,
                     warp_scheduler_barrier_arrive_noop
                 );
-
+                
             } else {
                 // ==========================================
                 // Original Path (Non-Block-Sparsity, IntraWGOverlap)
                 // ==========================================
-
+                
                 // First half block with seqlen + causal/local mask
-                auto first_mask_fn = [&](auto& tSrS, int n_block) {
-                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                auto first_mask_fn = [&](auto& tSrS, int n_block) { 
+                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); 
                 };
                 process_first_half_block(n_block, first_mask_fn);
                 --n_block;
@@ -1407,7 +1407,7 @@ struct CollectiveMainloopFwdSm90 {
                         fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                     }
                 }
-
+                
                 // Last half block
                 process_last_half_block();
             }
@@ -1467,8 +1467,8 @@ struct CollectiveMainloopFwdSm90 {
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
             };
-
-
+            
+            
             // Common finalize
             auto finalize = [&]() {
                 warp_scheduler_barrier_arrive();
@@ -1485,19 +1485,19 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
                 ++smem_pipe_read;
             };
-
+            
             if constexpr (Use_block_sparsity) {
                 // ==========================================
                 // Block Sparsity Path (Non-IntraWGOverlap)
                 // ==========================================
-
+                
                 // Initialize block sparsity info for this (bidb, bidh, m_block)
                 BlockSparsityInfo block_sparse_info;
                 block_sparse_info.init(block_sparse_params, bidb, bidh, m_block);
-
+                
                 // Simplified mask functions for block sparsity:
                 // - For mask_blocks: apply arbitrary mask only (Seqlenk info is already in MaskFunc)
-                // - For full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't
+                // - For full_blocks: no mask needed (Seqlenk info is in MaskFunc, Seqlenq doesn't 
                 //   need mask as out-of-bound won't be written back in epilogue)
                 // - check_inf: only needed when mask is applied (mask_blocks)
                 auto arbitrary_mask_fn = [&](auto& tSrS, int n_block) {
@@ -1508,15 +1508,15 @@ struct CollectiveMainloopFwdSm90 {
                     // No mask needed if Is_arbitrary is false (full block behavior)
                 };
                 auto no_mask_fn = [](auto& tSrS, int n_block) { };
-
+                
                 // Dummy process_first/last_half_block for non-overlap path (not used)
                 auto process_first_half_block_noop = [](int, auto) {};
                 auto process_last_half_block_noop = []() {};
-
+                
                 // Wrap member functions as lambdas for passing to consume_block_sparse_loads
                 auto warp_scheduler_barrier_sync_fn = [&]() { warp_scheduler_barrier_sync(); };
                 auto warp_scheduler_barrier_arrive_fn = [&]() { warp_scheduler_barrier_arrive(); };
-
+                
                 // Empty case is handled at function entry - block_sparse_info.is_empty() returns false early
                 flash::consume_block_sparse_loads<false /*IntraWGOverlap*/>(
                     block_sparse_info,
@@ -1529,12 +1529,12 @@ struct CollectiveMainloopFwdSm90 {
                     warp_scheduler_barrier_arrive_fn
                 );
                 finalize();
-
+                
             } else {
                 // ==========================================
                 // Original Path (Non-Block-Sparsity, Non-IntraWGOverlap)
                 // ==========================================
-
+                
                 auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 --n_block;
@@ -1564,7 +1564,7 @@ struct CollectiveMainloopFwdSm90 {
                         fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                     }
                 }
-
+                
                 finalize();
             }
         }
