@@ -14,6 +14,15 @@ from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
+from .tile_size import (
+    get_arch,
+    get_fwd_tile_sizes,
+    get_bwd_tile_sizes,
+    validate_tile_sizes,
+    get_fwd_tile_sizes_dsl,
+    get_bwd_tile_sizes_dsl,
+    get_tile_sizes_by_backend,
+)
 
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default

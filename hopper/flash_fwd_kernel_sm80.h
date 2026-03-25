@@ -14,6 +14,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "block_sparsity.hpp"
 
 namespace flash {
 
@@ -58,6 +59,11 @@ public:
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
+    // Block sparsity derived types
+    using BlockSparsity = flash::BlockSparsity;
+    using BlockSparsityArguments = typename BlockSparsity::Arguments;
+    using BlockSparsityParams = typename BlockSparsity::Params;
+
     static constexpr uint32_t NumThreads = CUTE_STATIC_V(size(TiledMma{}));
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMma{}));
     static constexpr uint32_t MinBlocksPerMultiprocessor = NumThreads == 128 ? 2 : 1;
@@ -93,6 +99,7 @@ public:
         EpilogueArguments epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerArguments scheduler{};
+        BlockSparsityArguments block_sparsity{};
     };
 
     // Kernel entry point API
@@ -101,6 +108,7 @@ public:
         EpilogueParams epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerParams scheduler{};
+        BlockSparsityParams block_sparsity{};
     };
 
     //
@@ -128,7 +136,8 @@ public:
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
             hw_info,
-            TileScheduler::to_underlying_arguments(args.scheduler)
+            TileScheduler::to_underlying_arguments(args.scheduler),
+            BlockSparsity::to_underlying_arguments(args.block_sparsity)
         };
     }
 
@@ -195,7 +204,7 @@ public:
                 if (tile_new_valid) { __syncthreads(); }
             }
             bool tile_valid = mainloop.mma(
-                params.mainloop, tOrO, softmax, threadIdx.x, seqlen_info, block_coord,
+                params.mainloop, params.block_sparsity, tOrO, softmax, threadIdx.x, seqlen_info, block_coord,
                 shared_storage);
             scheduler.prefetch_next_work(params.scheduler, work_tile_info);
             if (tile_valid) {

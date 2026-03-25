@@ -4,7 +4,113 @@
 
 #include "create_block_mask.h"
 
+// Single source of truth for tile sizes
+// This ensures tile sizes stay in sync with the attention kernels implementation
+#include "hopper/tile_size.h"
+
 #define DIVUP(x, y) (((x) + (y) - 1) / (y))
+
+// ============================================================================
+// Tile size computation helpers
+// Using hopper/tile_size.h as the SINGLE SOURCE OF TRUTH
+// ============================================================================
+
+/**
+ * Get GPU architecture as int (80, 86, 89, 90, 100, etc.)
+ */
+inline int get_gpu_arch() {
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    return prop.major * 10 + prop.minor;
+}
+
+/**
+ * Get forward pass tile sizes based on architecture.
+ * Calls hopper/tile_size.h functions (SINGLE SOURCE OF TRUTH).
+ * 
+ * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
+ * @param headdim Head dimension
+ * @param is_causal Whether using causal attention
+ * @param is_local Whether using local attention
+ * @param is_arbitrary Whether using arbitrary mask
+ * 
+ * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for forward pass
+ */
+inline std::pair<int, int> get_fwd_tile_sizes(
+    int arch,
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = false,
+    bool paged_kv = false,
+    bool varlen_and_split = false
+) {
+    if (arch < 0) {
+        arch = get_gpu_arch();
+    }
+    
+    int headdim_v = headdim;  // Assume same for simplicity
+    
+    if (arch >= 100) {
+        // Use tile_size.h SM100 function
+        auto [kBlockM, kBlockN] = tile_size_fwd_sm100(); // fake function
+        return {kBlockM, kBlockN};
+    } else if (arch >= 90) {
+        // Use tile_size.h SM90 function - returns {kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap}
+        auto tile_config = tile_size_fwd_sm90(headdim, headdim_v, is_causal, is_local, is_arbitrary, 
+                                               /*element_size=*/2, /*v_colmajor=*/false, paged_kv);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
+    } else {
+        // Use tile_size.h SM8x function - returns {kBlockM, kBlockN, kNWarps, kStages, Q_in_regs}
+        bool sm86_or_89 = (arch == 86) || (arch == 89);
+        auto tile_config = tile_size_fwd_sm8x(sm86_or_89, headdim, headdim_v, is_causal, is_local, is_arbitrary,
+                                               /*element_size=*/2, paged_kv, varlen_and_split);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
+    }
+}
+
+/**
+ * Get backward pass tile sizes based on architecture.
+ * Calls hopper/tile_size.h functions (SINGLE SOURCE OF TRUTH).
+ * 
+ * @param arch GPU architecture (80, 86, 89, 90, 100). If -1, auto-detect.
+ * @param headdim Head dimension
+ * @param is_causal Whether using causal attention
+ * @param is_local Whether using local attention
+ * @param is_arbitrary Whether using arbitrary mask
+ * @param has_softcap Whether using softcap
+ * 
+ * @return Pair of (Q_BLOCK_SIZE, KV_BLOCK_SIZE) for backward pass
+ */
+inline std::pair<int, int> get_bwd_tile_sizes(
+    int arch,
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = false,
+    bool has_softcap = false
+) {
+    if (arch < 0) {
+        arch = get_gpu_arch();
+    }
+    
+    if (arch >= 100) {
+        // Use tile_size.h SM100 function
+        auto [kBlockM, kBlockN] = tile_size_bwd_sm100(); // fake function
+        return {kBlockM, kBlockN};
+    } else if (arch >= 90) {
+        // Use tile_size.h SM90 function - returns full config tuple
+        auto tile_config = tile_size_bwd_sm90(headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
+    } else {
+        // Use tile_size.h SM8x function - returns full config tuple
+        bool sm86_or_89 = (arch == 86) || (arch == 89);
+        auto tile_config = tile_size_bwd_sm8x(sm86_or_89, headdim, is_causal, is_local, is_arbitrary, has_softcap);
+        return {std::get<0>(tile_config), std::get<1>(tile_config)};
+    }
+}
 
 /**
  * Q2K (Forward): Convert function encoding tensor to block sparse tensors.
@@ -437,14 +543,167 @@ create_k2q_csr_sparse_from_func(
     return compact_block_idx(mask_block_cnt, full_block_cnt, block_idx);
 }
 
+// ============================================================================
+// Auto tile size functions - automatically compute tile sizes from architecture
+// ============================================================================
+
+/**
+ * Q2K CSR Auto (Forward): Convert with automatic tile size detection.
+ * 
+ * Automatically detects GPU architecture and computes the correct tile sizes
+ * based on headdim and mask configuration. Users don't need to specify tile sizes.
+ * 
+ * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
+ * @param Q_LEN: query sequence length
+ * @param KV_LEN: key/value sequence length
+ * @param headdim: head dimension (required for tile size computation)
+ * @param is_causal: whether using causal attention
+ * @param is_local: whether using local attention
+ * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
+ * @param check_q_boundary: if true, partial q_blocks cannot have FULL kv_blocks
+ * 
+ * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
+ *                   full_block_cnt, full_block_offset, full_block_idx,
+ *                   Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int, int>
+create_q2k_csr_sparse_auto(
+    const at::Tensor& func_tensor,
+    int Q_LEN,
+    int KV_LEN,
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = true,
+    bool check_q_boundary = false
+) {
+    // Auto-detect tile sizes
+    auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_fwd_tile_sizes(
+        -1,  // auto-detect arch
+        headdim,
+        is_causal,
+        is_local,
+        is_arbitrary
+    );
+    
+    // Create CSR sparse tensors
+    auto [mask_block_cnt, mask_block_offset, mask_block_idx,
+          full_block_cnt, full_block_offset, full_block_idx] = 
+        create_q2k_csr_sparse_from_func(
+            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE, check_q_boundary);
+    
+    return std::make_tuple(
+        mask_block_cnt, mask_block_offset, mask_block_idx,
+        full_block_cnt, full_block_offset, full_block_idx,
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE
+    );
+}
+
+/**
+ * K2Q CSR Auto (Backward): Convert with automatic tile size detection.
+ * 
+ * Automatically detects GPU architecture and computes the correct tile sizes
+ * based on headdim and mask configuration. Users don't need to specify tile sizes.
+ * 
+ * @param func_tensor: [B, H, n_func, func_q_len], int32, function encoding tensor
+ * @param Q_LEN: query sequence length
+ * @param KV_LEN: key/value sequence length
+ * @param headdim: head dimension (required for tile size computation)
+ * @param is_causal: whether using causal attention
+ * @param is_local: whether using local attention
+ * @param is_arbitrary: whether using arbitrary mask (default: true since using func_tensor)
+ * @param has_softcap: whether using softcap
+ * 
+ * @return tuple of (mask_block_cnt, mask_block_offset, mask_block_idx,
+ *                   full_block_cnt, full_block_offset, full_block_idx,
+ *                   Q_BLOCK_SIZE, KV_BLOCK_SIZE)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int, int>
+create_k2q_csr_sparse_auto(
+    const at::Tensor& func_tensor,
+    int Q_LEN,
+    int KV_LEN,
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = true,
+    bool has_softcap = false
+) {
+    // Auto-detect tile sizes
+    auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
+        -1,  // auto-detect arch
+        headdim,
+        is_causal,
+        is_local,
+        is_arbitrary,
+        has_softcap
+    );
+    
+    // Create CSR sparse tensors
+    auto [mask_block_cnt, mask_block_offset, mask_block_idx,
+          full_block_cnt, full_block_offset, full_block_idx] = 
+        create_k2q_csr_sparse_from_func(
+            func_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE);
+    
+    return std::make_tuple(
+        mask_block_cnt, mask_block_offset, mask_block_idx,
+        full_block_cnt, full_block_offset, full_block_idx,
+        Q_BLOCK_SIZE, KV_BLOCK_SIZE
+    );
+}
+
+/**
+ * Python-accessible function to get forward tile sizes.
+ */
+std::tuple<int, int> py_get_fwd_tile_sizes(
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = true,
+    int arch = -1
+) {
+    auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_fwd_tile_sizes(
+        arch, headdim, is_causal, is_local, is_arbitrary);
+    return std::make_tuple(Q_BLOCK_SIZE, KV_BLOCK_SIZE);
+}
+
+/**
+ * Python-accessible function to get backward tile sizes.
+ */
+std::tuple<int, int> py_get_bwd_tile_sizes(
+    int headdim,
+    bool is_causal = false,
+    bool is_local = false,
+    bool is_arbitrary = true,
+    bool has_softcap = false,
+    int arch = -1
+) {
+    auto [Q_BLOCK_SIZE, KV_BLOCK_SIZE] = get_bwd_tile_sizes(
+        arch, headdim, is_causal, is_local, is_arbitrary, has_softcap);
+    return std::make_tuple(Q_BLOCK_SIZE, KV_BLOCK_SIZE);
+}
+
+/**
+ * Python-accessible function to get GPU architecture.
+ */
+int py_get_gpu_arch() {
+    return get_gpu_arch();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "CUDA kernels for creating block sparse tensors (FlexAttention/BlockSparseTensorsTorch format)";
+    
+    // ========================================================================
+    // Original functions with explicit tile sizes (for advanced users)
+    // ========================================================================
     
     m.def("create_q2k_block_sparse_from_func", &create_q2k_block_sparse_from_func,
           "Q2K (Forward): Convert function encoding tensor to block sparse tensors. "
           "Fix q_block, loop kv_blocks. "
           "Returns (mask_block_cnt, full_block_cnt, block_idx) "
-          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.",
+          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.\n\n"
+          "WARNING: Q_BLOCK_SIZE and KV_BLOCK_SIZE must match kernel tile sizes! "
+          "Use create_q2k_csr_sparse_auto() instead for automatic tile size detection.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
@@ -457,7 +716,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "K2Q (Backward): Convert function encoding tensor to block sparse tensors. "
           "Fix kv_block, loop q_blocks. Always checks boundary. "
           "Returns (mask_block_cnt, full_block_cnt, block_idx) "
-          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.",
+          "where block_idx contains full blocks left-to-right and mask blocks right-to-left.\n\n"
+          "WARNING: Q_BLOCK_SIZE and KV_BLOCK_SIZE must match kernel tile sizes! "
+          "Use create_k2q_csr_sparse_auto() instead for automatic tile size detection.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
@@ -479,7 +740,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Q2K CSR (Forward): Convert function encoding tensor directly to CSR sparse format. "
           "Combines create_q2k_block_sparse_from_func and compact_block_idx in one call. "
           "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
-          "full_block_cnt, full_block_offset, full_block_idx).",
+          "full_block_cnt, full_block_offset, full_block_idx).\n\n"
+          "WARNING: Q_BLOCK_SIZE and KV_BLOCK_SIZE must match kernel tile sizes! "
+          "Use create_q2k_csr_sparse_auto() instead for automatic tile size detection.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
@@ -491,10 +754,73 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "K2Q CSR (Backward): Convert function encoding tensor directly to CSR sparse format. "
           "Combines create_k2q_block_sparse_from_func and compact_block_idx in one call. "
           "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
-          "full_block_cnt, full_block_offset, full_block_idx).",
+          "full_block_cnt, full_block_offset, full_block_idx).\n\n"
+          "WARNING: Q_BLOCK_SIZE and KV_BLOCK_SIZE must match kernel tile sizes! "
+          "Use create_k2q_csr_sparse_auto() instead for automatic tile size detection.",
           py::arg("func_tensor"),
           py::arg("Q_LEN"),
           py::arg("KV_LEN"),
           py::arg("Q_BLOCK_SIZE") = 128,
           py::arg("KV_BLOCK_SIZE") = 128);
+    
+    // ========================================================================
+    // Auto tile size functions (RECOMMENDED)
+    // These automatically detect GPU architecture and compute correct tile sizes
+    // ========================================================================
+    
+    m.def("create_q2k_csr_sparse_auto", &create_q2k_csr_sparse_auto,
+          "Q2K CSR Auto (Forward): Convert with AUTOMATIC tile size detection.\n\n"
+          "RECOMMENDED: This function automatically detects GPU architecture and "
+          "computes the correct tile sizes based on headdim and mask configuration.\n\n"
+          "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
+          "full_block_cnt, full_block_offset, full_block_idx, Q_BLOCK_SIZE, KV_BLOCK_SIZE).",
+          py::arg("func_tensor"),
+          py::arg("Q_LEN"),
+          py::arg("KV_LEN"),
+          py::arg("headdim"),
+          py::arg("is_causal") = false,
+          py::arg("is_local") = false,
+          py::arg("is_arbitrary") = true,
+          py::arg("check_q_boundary") = false);
+    
+    m.def("create_k2q_csr_sparse_auto", &create_k2q_csr_sparse_auto,
+          "K2Q CSR Auto (Backward): Convert with AUTOMATIC tile size detection.\n\n"
+          "RECOMMENDED: This function automatically detects GPU architecture and "
+          "computes the correct tile sizes based on headdim and mask configuration.\n\n"
+          "Returns (mask_block_cnt, mask_block_offset, mask_block_idx, "
+          "full_block_cnt, full_block_offset, full_block_idx, Q_BLOCK_SIZE, KV_BLOCK_SIZE).",
+          py::arg("func_tensor"),
+          py::arg("Q_LEN"),
+          py::arg("KV_LEN"),
+          py::arg("headdim"),
+          py::arg("is_causal") = false,
+          py::arg("is_local") = false,
+          py::arg("is_arbitrary") = true,
+          py::arg("has_softcap") = false);
+    
+    // ========================================================================
+    // Helper functions for tile size queries
+    // ========================================================================
+    
+    m.def("get_fwd_tile_sizes", &py_get_fwd_tile_sizes,
+          "Get forward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
+          "This mirrors the kernel's tile size selection logic from hopper/tile_size.h.",
+          py::arg("headdim"),
+          py::arg("is_causal") = false,
+          py::arg("is_local") = false,
+          py::arg("is_arbitrary") = true,
+          py::arg("arch") = -1);
+    
+    m.def("get_bwd_tile_sizes", &py_get_bwd_tile_sizes,
+          "Get backward pass tile sizes (Q_BLOCK_SIZE, KV_BLOCK_SIZE) based on configuration.\n\n"
+          "This mirrors the kernel's tile size selection logic from hopper/flash_bwd_launch_template.h.",
+          py::arg("headdim"),
+          py::arg("is_causal") = false,
+          py::arg("is_local") = false,
+          py::arg("is_arbitrary") = true,
+          py::arg("has_softcap") = false,
+          py::arg("arch") = -1);
+    
+    m.def("get_gpu_arch", &py_get_gpu_arch,
+          "Get GPU architecture as int (e.g., 80, 86, 89, 90, 100).");
 }

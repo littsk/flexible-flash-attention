@@ -35,10 +35,13 @@ SPLIT = [False, True]
 SOFTCAP = [False, True]
 PACKGQA = [False, True]
 
+# All possible NFUNC values (odd numbers 1-33) for generating per-nfunc instantiation files
+NFUNC_VALUES = list(range(1, 34, 2))  # [1, 3, 5, 7, ..., 33]
+
 KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, 0>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 """
 
@@ -46,8 +49,8 @@ KERNEL_IMPL_TEMPLATE_FWD_SM8x = """#include "flash_fwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
-template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, 0>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGEDKV}, {SOFTCAP}, {PACKGQA}, 0>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 #endif
 """
@@ -55,10 +58,7 @@ template void run_mha_fwd_<86, {DTYPE}, {HEAD_DIM}, {HEAD_DIM_V}, {SPLIT}, {PAGE
 KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template<>
-void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<{ARCH}, {DTYPE}, {SOFTCAP}>(params, stream);
-}}
+template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTCAP}, 0>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
 """
 
@@ -66,14 +66,8 @@ KERNEL_IMPL_TEMPLATE_BWD_SM8x = """#include "flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template<>
-void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<80, {DTYPE}, {SOFTCAP}>(params, stream);
-}}
-template<>
-void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}, {SOFTCAP}>(Flash_bwd_params &params, cudaStream_t stream) {{
-    run_mha_bwd_hdim{HEAD_DIM}<86, {DTYPE}, {SOFTCAP}>(params, stream);
-}}
+template void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}, {SOFTCAP}, 0>(Flash_bwd_params &params, cudaStream_t stream);
+template void run_mha_bwd_<86, {DTYPE}, {HEAD_DIM}, {SOFTCAP}, 0>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
 #endif
 """
@@ -184,7 +178,92 @@ def batch_softcap(kernels_all) -> List[KERNEL_BATCH]:
             yield KERNEL_BATCH(template, filename)
 
 
-def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
+def generate_nfunc_fwd_instantiation(nfunc, sm, kernels_all) -> str:
+    """Generate all forward instantiations for a given nfunc value and SM arch."""
+    lines = ['#include "flash_fwd_launch_template.h"', '',
+             '#ifndef FLASHATTENTION_DISABLE_ARBITRARY',
+             f'#ifdef FLASHATTENTION_NFUNC_{nfunc}']
+
+    for k in kernels_all:
+        if k.direction != "fwd" or k.sm != sm:
+            continue
+        dtype_cpp = DTYPE_MAP.get(k.dtype, DTYPE_MAP_FWD_SM8x.get(k.dtype))
+        if dtype_cpp is None:
+            continue
+        if sm == 90:
+            packgqa = k.packgqa or k.paged_kv or k.split
+            hdim_guard = k.head_dim if k.head_dim == k.head_dim_v else k.head_dim
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{hdim_guard}')
+            lines.append(f'template void run_mha_fwd_<{sm}, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, {str(packgqa).lower()}, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+        else:
+            # SM8x
+            if k.dtype not in DTYPE_MAP_FWD_SM8x:
+                continue
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_SM8x')
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_fwd_<80, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'template void run_mha_fwd_<86, {dtype_cpp}, {k.head_dim}, {k.head_dim_v}, {str(k.split).lower()}, {str(k.paged_kv).lower()}, {str(k.softcap).lower()}, true, {nfunc}>(Flash_fwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+            lines.append(f'#endif')
+
+    lines.append(f'#endif // FLASHATTENTION_NFUNC_{nfunc}')
+    lines.append('#endif // FLASHATTENTION_DISABLE_ARBITRARY')
+    return '\n'.join(lines)
+
+
+def generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all) -> str:
+    """Generate all backward instantiations for a given nfunc value and SM arch."""
+    lines = ['#include "flash_bwd_launch_template.h"', '',
+             '#ifndef FLASHATTENTION_DISABLE_ARBITRARY',
+             '#ifndef FLASHATTENTION_DISABLE_BACKWARD',
+             f'#ifdef FLASHATTENTION_NFUNC_{nfunc}']
+
+    for k in kernels_all:
+        if k.direction != "bwd" or k.sm != sm:
+            continue
+        dtype_cpp = DTYPE_MAP_BWD.get(k.dtype)
+        if dtype_cpp is None:
+            continue
+        if sm == 90:
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_bwd_<{sm}, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+        else:
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_SM8x')
+            lines.append(f'#ifndef FLASHATTENTION_DISABLE_HDIM{k.head_dim}')
+            lines.append(f'template void run_mha_bwd_<80, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'template void run_mha_bwd_<86, {dtype_cpp}, {k.head_dim}, {str(k.softcap).lower()}, {nfunc}>(Flash_bwd_params &params, cudaStream_t stream);')
+            lines.append(f'#endif')
+            lines.append(f'#endif')
+
+    lines.append(f'#endif // FLASHATTENTION_NFUNC_{nfunc}')
+    lines.append('#endif // FLASHATTENTION_DISABLE_BACKWARD')
+    lines.append('#endif // FLASHATTENTION_DISABLE_ARBITRARY')
+    return '\n'.join(lines)
+
+
+def generate_nfunc_files(kernels_all) -> List[KERNEL_BATCH]:
+    """Generate per-nfunc instantiation files.
+
+    Creates one file per (nfunc_value, direction, arch) combination.
+    Each file is guarded by #ifdef FLASHATTENTION_NFUNC_X so it only compiles
+    when that specific nfunc value is enabled. This allows different nfunc values
+    to compile in parallel across separate translation units.
+    """
+    for nfunc in NFUNC_VALUES:
+        for sm in SM:
+            # Forward
+            content = generate_nfunc_fwd_instantiation(nfunc, sm, kernels_all)
+            filename = f"flash_fwd_nfunc{nfunc}_sm{sm}.cu"
+            yield KERNEL_BATCH(content, filename)
+            # Backward
+            content = generate_nfunc_bwd_instantiation(nfunc, sm, kernels_all)
+            filename = f"flash_bwd_nfunc{nfunc}_sm{sm}.cu"
+            yield KERNEL_BATCH(content, filename)
+
+
+def write_kernel(kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 // Splitting the different template instantiations to different files to speed up compilation.
 // This file is auto-generated. See "generate_kernels.py"\n
@@ -201,6 +280,8 @@ def main(output_dir: Optional[str]) -> None:
     for kernel in batch_hdim(kernels_all):
         write_kernel(kernel, output_dir)
     for kernel in batch_softcap(kernels_all):
+        write_kernel(kernel, output_dir)
+    for kernel in generate_nfunc_files(kernels_all):
         write_kernel(kernel, output_dir)
 
 
