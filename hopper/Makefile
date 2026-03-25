@@ -123,7 +123,7 @@ clean:
 	@echo "Clean complete."
 
 install: check_block_mask generate show_flags
-	$(PYTHON) setup.py install
+	$(PYTHON) -m pip install . --no-build-isolation
 
 # Use test_arbitrary_mask.py only when both ARBITRARY=1 and ARBITRARY_TEST=1
 ifneq ($(and $(filter 1,$(ARBITRARY)),$(filter 1,$(ARBITRARY_TEST))),)
