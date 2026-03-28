@@ -38,7 +38,7 @@ import flash_attn_cute.ffa_fa3._C # Registers operators with PyTorch
 
 # isort: on
 
-flash_attn_3_cuda = torch.ops.flash_attn_3
+magi_flash_attn_3_cuda = torch.ops.magi_flash_attn_3
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -69,7 +69,7 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
-@torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@torch.library.custom_op("magi_flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -147,7 +147,7 @@ def _flash_attn_forward(
 
     # nvtx
     with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
-        out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_cuda.fwd(
+        out, softmax_lse, out_accum, softmax_lse_accum = magi_flash_attn_3_cuda.fwd(
             q,
             k,
             v,
@@ -202,7 +202,7 @@ def _flash_attn_forward(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@torch.library.register_fake("flash_attn_3::_flash_attn_forward")
+@torch.library.register_fake("magi_flash_attn_3::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -323,7 +323,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, out_accum, softmax_lse_accum
 
 
-@torch.library.custom_op("flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
+@torch.library.custom_op("magi_flash_attn_3::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -370,7 +370,7 @@ def _flash_attn_backward(
         print(f"block_sparse_full_idx: {block_sparse_full_idx}")
         
     with torch.cuda.nvtx.range("flash_attn_bwd_kernel"):
-        softmax_d, *rest = flash_attn_3_cuda.bwd(
+        softmax_d, *rest = magi_flash_attn_3_cuda.bwd(
             dout,
             q,
             k,
@@ -404,7 +404,7 @@ def _flash_attn_backward(
     return softmax_d
 
 
-@torch.library.register_fake("flash_attn_3::_flash_attn_backward")
+@torch.library.register_fake("magi_flash_attn_3::_flash_attn_backward")
 def _flash_attn_backward_fake(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1291,7 +1291,7 @@ def flash_attn_varlen_func(
 
 
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flash_attn_3_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    return magi_flash_attn_3_cuda.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
 def flash_attn_with_kvcache(
@@ -1508,7 +1508,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = flash_attn_3_cuda.get_scheduler_metadata(
+    scheduler_metadata = magi_flash_attn_3_cuda.get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
