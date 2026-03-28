@@ -1954,7 +1954,7 @@ mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen 
     return {out, softmax_lse};
 }
 
-TORCH_LIBRARY(flash_attn_3, m) {
+TORCH_LIBRARY(magi_flash_attn_3, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -2059,7 +2059,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int sm_margin = 0) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
+TORCH_LIBRARY_IMPL(magi_flash_attn_3, CUDA, m) {
     m.impl("fwd", &mha_fwd);
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);
