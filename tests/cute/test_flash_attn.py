@@ -627,8 +627,8 @@ def test_flash_attn_varlen_output(
         ):
             g_unpad = torch.randn_like(out_unpad)
             do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
-            # import flash_attn_3_cuda
-            # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
+            # import magi_flash_attn_3_cuda
+            # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = magi_flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,
             #     q_unpad,
             #     k_unpad,

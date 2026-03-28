@@ -2186,7 +2186,7 @@ void boxed_mha_fwd_get_scheduler_metadata(
     stack[0] = from(scheduler_metadata);
 }
 
-STABLE_TORCH_LIBRARY(flash_attn_3, m) {
+STABLE_TORCH_LIBRARY(magi_flash_attn_3, m) {
     m.def("fwd("
         "Tensor q,"
         "Tensor k,"
@@ -2291,7 +2291,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int sm_margin = 0) -> Tensor");
 }
 
-STABLE_TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
+STABLE_TORCH_LIBRARY_IMPL(magi_flash_attn_3, CUDA, m) {
     m.impl("fwd", &boxed_mha_fwd);
     m.impl("bwd", &boxed_mha_bwd);
     m.impl("fwd_combine", &boxed_mha_combine);
