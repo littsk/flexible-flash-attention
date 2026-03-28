@@ -52,11 +52,22 @@ import torch
 
 def get_cuda_gencode_flags():
     """Detect current GPU architecture and return appropriate -gencode flags."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available, cannot determine target architecture")
-    capability = torch.cuda.get_device_capability()
-    arch = capability[0] * 10 + capability[1]
-    return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        arch = capability[0] * 10 + capability[1]
+        return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+    cc_env = os.environ.get("MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY", "")
+    if cc_env:
+        flags = []
+        for cc in cc_env.split(","):
+            cc = cc.strip()
+            if cc:
+                flags += ["-gencode", f"arch=compute_{cc},code=sm_{cc}"]
+        if flags:
+            return flags
+    raise RuntimeError(
+        "CUDA is not available and MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY not set"
+    )
 
 cuda_gencode_flags = get_cuda_gencode_flags()
 
