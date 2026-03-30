@@ -78,7 +78,7 @@ install_block_mask:
 	@echo "=============================================="
 	@echo "Installing create_block_mask_cuda..."
 	@echo "=============================================="
-	cd ../csrc/utils/create_block_mask && pip install -e . --no-build-isolation
+	cd ../csrc/utils/create_block_mask && $(PYTHON) setup.py build ext --inplace && $(PYTHON) setup.py install --user
 	@echo "create_block_mask_cuda installed successfully"
 
 # Generate kernel instantiation files
@@ -142,7 +142,7 @@ fm:
 	PYTHONPATH=${PWD} ncu --set full --nvtx --nvtx-include "flash_attn_bwd_kernel/" --nvtx-include "flash_attn_fwd_kernel/"  -f -o flash_attn.%p  python $(TEST_FILE)
 
 show_flags:
-	@echo "Build flags -> env："
+	@echo "Build flags -> env: "
 	@echo " BACKWARD=$(BACKWARD) -> FLASH_ATTENTION_DISABLE_BACKWARD=$(FLASH_ATTENTION_DISABLE_BACKWARD)"
 	@echo " SPLIT=$(SPLIT) -> FLASH_ATTENTION_DISABLE_SPLIT=$(FLASH_ATTENTION_DISABLE_SPLIT)"
 	@echo " PAGEDKV=$(PAGEDKV) -> FLASH_ATTENTION_DISABLE_PAGEDKV=$(FLASH_ATTENTION_DISABLE_PAGEDKV)"
