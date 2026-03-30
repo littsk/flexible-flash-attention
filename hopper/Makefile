@@ -123,7 +123,12 @@ clean:
 	@echo "Clean complete."
 
 install: check_block_mask generate show_flags
+ifdef MAGI_WHEEL_DIR
+	$(PYTHON) -m pip wheel . --no-build-isolation --no-deps --wheel-dir "$(MAGI_WHEEL_DIR)"
+	$(PYTHON) -m pip install "$(MAGI_WHEEL_DIR)"/ffa_fa3-*.whl --force-reinstall --no-deps
+else
 	$(PYTHON) -m pip install . --no-build-isolation
+endif
 
 # Use test_arbitrary_mask.py only when both ARBITRARY=1 and ARBITRARY_TEST=1
 ifneq ($(and $(filter 1,$(ARBITRARY)),$(filter 1,$(ARBITRARY_TEST))),)
