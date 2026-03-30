@@ -50,12 +50,21 @@ project_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 
 import torch
 
+BUILD_COMPUTE_CAPABILITY = os.getenv("MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY", "")
+
 def get_cuda_gencode_flags():
     """Detect current GPU architecture and return appropriate -gencode flags."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available, cannot determine target architecture")
-    capability = torch.cuda.get_device_capability()
-    arch = capability[0] * 10 + capability[1]
+    if BUILD_COMPUTE_CAPABILITY:
+        print(f"Using build compute capability from environment variable: {BUILD_COMPUTE_CAPABILITY}")
+        arch = BUILD_COMPUTE_CAPABILITY
+    else:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is not available and MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY is not set, cannot determine target architecture. "
+                "Please set MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY to the compute capability of your GPU (e.g. 80 for Ampere, 90 for Hopper)."
+            )
+        capability = torch.cuda.get_device_capability()
+        arch = capability[0] * 10 + capability[1]
     return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
 
 cuda_gencode_flags = get_cuda_gencode_flags()
