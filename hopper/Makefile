@@ -125,10 +125,11 @@ clean:
 install: check_block_mask generate show_flags
 ifdef MAGI_WHEEL_DIR
 ifdef MAGI_WHEEL_PLAT_NAME
-	$(PYTHON) -m pip wheel . --no-build-isolation --no-deps --wheel-dir "$(MAGI_WHEEL_DIR)" --build-option="--plat-name=$(MAGI_WHEEL_PLAT_NAME)"
+	$(PYTHON) setup.py bdist_wheel --plat-name "$(MAGI_WHEEL_PLAT_NAME)"
 else
-	$(PYTHON) -m pip wheel . --no-build-isolation --no-deps --wheel-dir "$(MAGI_WHEEL_DIR)"
+	$(PYTHON) setup.py bdist_wheel
 endif
+	cp -f dist/*.whl "$(MAGI_WHEEL_DIR)/"
 	$(PYTHON) -m pip install "$(MAGI_WHEEL_DIR)"/ffa_fa3-*.whl --force-reinstall --no-deps
 else
 	$(PYTHON) -m pip install . --no-build-isolation
