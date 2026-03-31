@@ -78,7 +78,7 @@ install_block_mask:
 	@echo "=============================================="
 	@echo "Installing create_block_mask_cuda..."
 	@echo "=============================================="
-	cd ../csrc/utils/create_block_mask && $(PYTHON) setup.py build ext --inplace && $(PYTHON) setup.py install --user
+	cd ../csrc/utils/create_block_mask && $(PYTHON) setup.py build_ext --inplace && $(PYTHON) setup.py install --user
 	@echo "create_block_mask_cuda installed successfully"
 
 # Generate kernel instantiation files
