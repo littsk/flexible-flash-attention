@@ -65,7 +65,13 @@ def get_cuda_gencode_flags():
             )
         capability = torch.cuda.get_device_capability()
         arch = capability[0] * 10 + capability[1]
-    return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+    flags = []
+    for a in str(arch).split(","):
+        a = a.strip()
+        if not a:
+            continue
+        flags += ["-gencode", f"arch=compute_{a},code=sm_{a}"]
+    return flags
 
 cuda_gencode_flags = get_cuda_gencode_flags()
 
