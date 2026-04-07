@@ -557,6 +557,110 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = {}
 
 
+def _compute_bwd_dQ_lock_values(block_sparse_tensors):
+    """Precompute per-entry semaphore lock values for deterministic backward.
+
+    For block-sparse attention, not every n_block processes every m_block.
+    The original code uses ``lock_value = n_block`` which assumes dense
+    iteration and deadlocks when blocks are skipped.  This function computes
+    the correct lock value for each CSR entry: the rank of the current
+    n_block among all n_blocks that process the same m_block.
+
+    Pure GPU implementation — no ``.item()``, ``.cpu()``, or any other
+    CPU-GPU synchronisation.  The algorithm:
+
+    1. Map every CSR entry to a *global position* that reflects the
+       kernel's iteration order (mask entries before full entries within
+       each n_block, n_blocks in ascending order).
+    2. Scatter the m_block values into a flat array ordered by global
+       position.
+    3. Stable-sort by m_block value so entries with the same m_block are
+       contiguous (and among them the original global-position order is
+       preserved).
+    4. Compute within-group rank with a ``cummax`` trick (no segmented
+       scan needed).
+    5. Scatter the ranks back and gather per-array results.
+    """
+    device = block_sparse_tensors.mask_block_idx.device
+
+    mask_cnt = block_sparse_tensors.mask_block_cnt
+    mask_off = block_sparse_tensors.mask_block_offset
+    mask_idx = block_sparse_tensors.mask_block_idx
+    has_full = block_sparse_tensors.full_block_cnt is not None
+
+    mask_len = mask_idx.shape[0]
+    num_n = mask_cnt.shape[0]
+
+    if has_full:
+        full_cnt = block_sparse_tensors.full_block_cnt
+        full_off = block_sparse_tensors.full_block_offset
+        full_idx = block_sparse_tensors.full_block_idx
+        full_len = full_idx.shape[0]
+    else:
+        full_len = 0
+
+    total = mask_len + full_len
+    if total == 0:
+        return (
+            torch.zeros_like(mask_idx),
+            torch.zeros_like(block_sparse_tensors.full_block_idx) if has_full else None,
+        )
+
+    # -- 1. cumulative per-n_block entry counts (global-position base) ---
+    total_per_n = mask_cnt.to(torch.int64)
+    if has_full:
+        total_per_n = total_per_n + full_cnt.to(torch.int64)
+    cum = torch.zeros(num_n + 1, dtype=torch.int64, device=device)
+    cum[1:] = torch.cumsum(total_per_n, dim=0)
+
+    # -- 2. global position for every mask entry --------------------------
+    mp = torch.arange(mask_len, dtype=torch.int64, device=device)
+    mo = mask_off.to(torch.int64)
+    mn = torch.searchsorted(mo, mp, right=True) - 1
+    mg = cum[mn] + (mp - mo[mn])
+
+    # -- 3. global position for every full entry --------------------------
+    fg = None
+    if has_full and full_len > 0:
+        fp = torch.arange(full_len, dtype=torch.int64, device=device)
+        fo = full_off.to(torch.int64)
+        fn = torch.searchsorted(fo, fp, right=True) - 1
+        fg = cum[fn] + mask_cnt[fn].to(torch.int64) + (fp - fo[fn])
+
+    # -- 4. flat m_block array in global iteration order ------------------
+    flat = torch.zeros(total, dtype=torch.int32, device=device)
+    flat.scatter_(0, mg, mask_idx)
+    if fg is not None:
+        flat.scatter_(0, fg, full_idx)
+
+    # -- 5. within-group rank via stable sort + cummax --------------------
+    si = torch.argsort(flat.to(torch.int64), stable=True)
+    sv = flat[si]
+
+    pos = torch.arange(total, dtype=torch.int64, device=device)
+    boundary_pos = torch.full_like(pos, -1)
+    boundary_pos[0] = 0
+    if total > 1:
+        changed = sv[1:] != sv[:-1]
+        boundary_pos[1:] = torch.where(changed, pos[1:], torch.tensor(-1, dtype=torch.int64, device=device))
+    last_boundary, _ = torch.cummax(boundary_pos, dim=0)
+    sorted_rank = (pos - last_boundary).to(torch.int32)
+
+    # -- 6. scatter ranks back, then gather per-array results -------------
+    flat_lock = torch.empty(total, dtype=torch.int32, device=device)
+    flat_lock[si] = sorted_rank
+
+    mask_lock = flat_lock[mg]
+    if has_full and full_len > 0:
+        full_lock = flat_lock[fg]
+    elif has_full:
+        full_lock = torch.zeros_like(block_sparse_tensors.full_block_idx)
+    else:
+        full_lock = None
+
+    return mask_lock, full_lock
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -781,6 +885,11 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
+    dQ_lock_values_mask = None
+    dQ_lock_values_full = None
+    if deterministic and use_block_sparsity:
+        dQ_lock_values_mask, dQ_lock_values_full = _compute_bwd_dQ_lock_values(block_sparse_tensors)
+
     func_num = aux_tensors[0].shape[2] if arbitrary and aux_tensors is not None else 0
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -906,7 +1015,15 @@ def _flash_attn_bwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
-        
+        dQ_lock_mask_tensor = (
+            from_dlpack(dQ_lock_values_mask.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+            if dQ_lock_values_mask is not None else None
+        )
+        dQ_lock_full_tensor = (
+            from_dlpack(dQ_lock_values_full.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+            if dQ_lock_values_full is not None else None
+        )
+
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -987,6 +1104,8 @@ def _flash_attn_bwd(
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
+            dQ_lock_mask_tensor,
+            dQ_lock_full_tensor,
             options="--enable-tvm-ffi"
         )
     # Execute with torch tensors directly
@@ -1012,6 +1131,8 @@ def _flash_attn_bwd(
             mdQ_semaphore=dQ_semaphore,
             mdK_semaphore=dK_semaphore,
             mdV_semaphore=dV_semaphore,
+            dQ_lock_values_mask=dQ_lock_values_mask,
+            dQ_lock_values_full=dQ_lock_values_full,
         )
 
     num_threads = 256 if compute_capability == 9 else 128
