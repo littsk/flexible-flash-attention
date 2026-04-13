@@ -377,8 +377,10 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        dQ_lock_values_mask: Optional[cute.Tensor] = None,
-        dQ_lock_values_full: Optional[cute.Tensor] = None,
+        dQ_lock_values: Optional[cute.Tensor] = None,
+        dQ_lock_combined_offset: Optional[cute.Tensor] = None,
+        sorted_block_idx: Optional[cute.Tensor] = None,
+        sorted_block_is_full: Optional[cute.Tensor] = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
@@ -574,7 +576,7 @@ class FlashAttentionBackwardSm100:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = self.is_causal and self.deterministic
+        self.spt = self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -694,8 +696,10 @@ class FlashAttentionBackwardSm100:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
-            dQ_lock_values_mask,
-            dQ_lock_values_full,
+            dQ_lock_values,
+            dQ_lock_combined_offset,
+            sorted_block_idx,
+            sorted_block_is_full,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -754,8 +758,10 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
-        dQ_lock_values_mask: Optional[cute.Tensor],
-        dQ_lock_values_full: Optional[cute.Tensor],
+        dQ_lock_values: Optional[cute.Tensor],
+        dQ_lock_combined_offset: Optional[cute.Tensor],
+        sorted_block_idx: Optional[cute.Tensor],
+        sorted_block_is_full: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -1072,6 +1078,9 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 should_load_Q=True,
                 should_load_dO=True,
+                sorted_block_idx=sorted_block_idx,
+                sorted_block_is_full=sorted_block_is_full,
+                dQ_lock_combined_offset=dQ_lock_combined_offset,
             )
 
         #  MMA
@@ -1168,6 +1177,9 @@ class FlashAttentionBackwardSm100:
                 tiled_copy_r2s_dKV,
                 mdK_semaphore,
                 mdV_semaphore,
+                sorted_block_idx=sorted_block_idx,
+                sorted_block_is_full=sorted_block_is_full,
+                dQ_lock_combined_offset=dQ_lock_combined_offset,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -1186,8 +1198,10 @@ class FlashAttentionBackwardSm100:
                 TileSchedulerCls,
                 blocksparse_tensors,
                 mdQ_semaphore,
-                dQ_lock_values_mask,
-                dQ_lock_values_full,
+                dQ_lock_values,
+                dQ_lock_combined_offset,
+                sorted_block_idx,
+                sorted_block_is_full,
             )
 
         return
@@ -1225,6 +1239,9 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         should_load_Q: bool = True,
         should_load_dO: bool = True,
+        sorted_block_idx: Optional[cute.Tensor] = None,
+        sorted_block_is_full: Optional[cute.Tensor] = None,
+        dQ_lock_combined_offset: Optional[cute.Tensor] = None,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -1377,6 +1394,32 @@ class FlashAttentionBackwardSm100:
                             )
                         producer_state_dO_dPsum.advance()
 
+            elif const_expr(sorted_block_idx is not None):
+                from flash_attn_cute.block_sparse_utils import load_block_list_bwd_sm100
+                sorted_off = dQ_lock_combined_offset[n_block]
+                sorted_cnt = dQ_lock_combined_offset[n_block + 1] - sorted_off
+                producer_state_Q_LSE, producer_state_dO_dPsum = load_block_list_bwd_sm100(
+                    block_indices=sorted_block_idx,
+                    block_offset=sorted_off,
+                    block_count=sorted_cnt,
+                    load_kv_with_first=True,
+                    load_Q=load_Q,
+                    load_K=load_K,
+                    load_V=load_V,
+                    load_dO=load_dO,
+                    copy_stats=copy_stats,
+                    gLSE=gLSE,
+                    sLSE=sLSE,
+                    gdPsum=gdPsum,
+                    sdPsum=sdPsum,
+                    pipeline_Q=pipeline_Q,
+                    pipeline_LSE=pipeline_LSE,
+                    pipeline_dO=pipeline_dO,
+                    pipeline_dPsum=pipeline_dPsum,
+                    producer_state_Q_LSE=producer_state_Q_LSE,
+                    producer_state_dO_dPsum=producer_state_dO_dPsum,
+                    tma_copy_bytes={"K": self.tma_copy_bytes["K"], "V": self.tma_copy_bytes["V"]},
+                )
             else:
                 producer_state_Q_LSE, producer_state_dO_dPsum = produce_block_sparse_loads_bwd_sm100(
                     blocksparse_tensors,
@@ -1759,6 +1802,9 @@ class FlashAttentionBackwardSm100:
         tiled_copy_r2s_dKV: Optional[cute.TiledCopy],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        sorted_block_idx: Optional[cute.Tensor] = None,
+        sorted_block_is_full: Optional[cute.Tensor] = None,
+        dQ_lock_combined_offset: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -1922,7 +1968,29 @@ class FlashAttentionBackwardSm100:
             )
 
             # Mainloop
-            if const_expr(self.use_block_sparsity):
+            if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
+                sorted_off = dQ_lock_combined_offset[n_block]
+                sorted_cnt = dQ_lock_combined_offset[n_block + 1] - sorted_off
+                for i in cutlass.range(0, sorted_cnt, unroll=1):
+                    s_m_block = sorted_block_idx[sorted_off + i]
+                    s_is_full = sorted_block_is_full[sorted_off + i]
+                    if s_is_full:
+                        (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
+                            m_block=s_m_block, mask_fn=None,
+                            consumer_state_LSE=consumer_state_LSE,
+                            consumer_state_S_P_dP=consumer_state_S_P_dP,
+                            consumer_state_dPsum=consumer_state_dPsum,
+                            producer_state_dS=producer_state_dS,
+                        )
+                    else:
+                        (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_step_fn(
+                            m_block=s_m_block, mask_fn=mask_fn,
+                            consumer_state_LSE=consumer_state_LSE,
+                            consumer_state_S_P_dP=consumer_state_S_P_dP,
+                            consumer_state_dPsum=consumer_state_dPsum,
+                            producer_state_dS=producer_state_dS,
+                        )
+            elif const_expr(self.use_block_sparsity):
                 (consumer_state_LSE, consumer_state_S_P_dP, consumer_state_dPsum, producer_state_dS) = compute_block_sparse_bwd_sm100(
                     blocksparse_tensors,
                     n_block,
@@ -2362,8 +2430,10 @@ class FlashAttentionBackwardSm100:
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[LinearBlockSparseTensors],
         mdQ_semaphore: Optional[cute.Tensor],
-        dQ_lock_values_mask: Optional[cute.Tensor],
-        dQ_lock_values_full: Optional[cute.Tensor],
+        dQ_lock_values: Optional[cute.Tensor],
+        dQ_lock_combined_offset: Optional[cute.Tensor],
+        sorted_block_idx: Optional[cute.Tensor] = None,
+        sorted_block_is_full: Optional[cute.Tensor] = None,
     ):
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
@@ -2416,6 +2486,7 @@ class FlashAttentionBackwardSm100:
             delay_semaphore_release = self.is_causal
             n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
+            curr_combined_offset = Int32(0)
             if const_expr(self.use_block_sparsity):
                 (
                     curr_mask_cnt,
@@ -2426,6 +2497,8 @@ class FlashAttentionBackwardSm100:
                 ) = get_block_sparse_iteration_info_bwd(
                     blocksparse_tensors, batch_idx, head_idx, n_block
                 )
+                if const_expr(dQ_lock_combined_offset is not None):
+                    curr_combined_offset = dQ_lock_combined_offset[n_block]
             else:
                 curr_mask_cnt = Int32(0)
                 curr_mask_offset = Int32(0)
@@ -2434,7 +2507,9 @@ class FlashAttentionBackwardSm100:
                 loop_count = m_block_max - m_block_min
 
             for iter_idx in cutlass.range(loop_count, unroll=1):
-                if const_expr(self.use_block_sparsity):
+                if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
+                    m_block = sorted_block_idx[curr_combined_offset + iter_idx]
+                elif const_expr(self.use_block_sparsity):
                     m_block, _ = get_m_block_from_iter_bwd(
                         iter_idx,
                         curr_mask_cnt,
@@ -2473,7 +2548,9 @@ class FlashAttentionBackwardSm100:
 
                     # Semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
-                        if const_expr(self.spt):
+                        if const_expr(self.use_block_sparsity):
+                            lock_value = dQ_lock_values[curr_combined_offset + iter_idx]
+                        elif const_expr(self.spt):
                             n_block_max_for_m_block = min(
                                 n_block_global_max,
                                 cute.ceil_div(
@@ -2482,15 +2559,6 @@ class FlashAttentionBackwardSm100:
                                 ),
                             )
                             lock_value = n_block_max_for_m_block - 1 - n_block
-                        elif const_expr(self.use_block_sparsity):
-                            lock_value = Int32(0)
-                            if const_expr(dQ_lock_values_full is not None):
-                                if iter_idx < curr_mask_cnt:
-                                    lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
-                                else:
-                                    lock_value = dQ_lock_values_full[curr_full_offset + iter_idx - curr_mask_cnt]
-                            else:
-                                lock_value = dQ_lock_values_mask[curr_mask_offset + iter_idx]
                         else:
                             lock_value = n_block
                         barrier.wait_eq(
@@ -2515,8 +2583,15 @@ class FlashAttentionBackwardSm100:
 
                     # Semaphore release for prior m_block
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                        if const_expr(self.use_block_sparsity):
-                            # For block sparse: get actual previous m_block from iteration
+                        if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
+                            if iter_idx > 0:
+                                prev_m_block = sorted_block_idx[curr_combined_offset + iter_idx - 1]
+                                if m_block_max > 0:
+                                    prev_m_block = cutlass.min(prev_m_block, m_block_max - 1)
+                                barrier.arrive_inc(
+                                    mdQ_semaphore_cur[(prev_m_block, None)].iterator, tidx, 0, 1
+                                )
+                        elif const_expr(self.use_block_sparsity):
                             if iter_idx > 0:
                                 prev_m_block, _ = get_m_block_from_iter_bwd(
                                     iter_idx - 1,
@@ -2552,8 +2627,15 @@ class FlashAttentionBackwardSm100:
 
             # Final semaphore release for delay mode
             if const_expr(self.deterministic and delay_semaphore_release):
-                if const_expr(self.use_block_sparsity):
-                    # For block sparse: release the last processed m_block
+                if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
+                    if loop_count > 0:
+                        last_m_block = sorted_block_idx[curr_combined_offset + loop_count - 1]
+                        if m_block_max > 0:
+                            last_m_block = cutlass.min(last_m_block, m_block_max - 1)
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[(last_m_block, None)].iterator, tidx, 0, 1
+                        )
+                elif const_expr(self.use_block_sparsity):
                     if loop_count > 0:
                         last_m_block, _ = get_m_block_from_iter_bwd(
                             loop_count - 1,
