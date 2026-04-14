@@ -1228,7 +1228,7 @@ def _flash_attn_bwd(
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
             
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1270,7 +1270,7 @@ def _flash_attn_bwd(
             seqused_k_tensor = from_dlpack(seqused_k.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=seqused_k.ndim - 1) if seqused_k is not None else None
             
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
