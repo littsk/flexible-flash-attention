@@ -21,10 +21,13 @@
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
 
+import logging
 import math
 from typing import Optional, Tuple, Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 import cuda.bindings.driver as cuda
 
@@ -392,6 +395,10 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
+        logger.warning(
+            "[FFA_FA4] Recompiling fwd kernel (compile_key=%s, cache_size=%d)",
+            compile_key, len(_flash_attn_fwd.compile_cache),
+        )
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, o_tensor = [
             from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -908,6 +915,10 @@ def _flash_attn_bwd(
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
+        logger.warning(
+            "[FFA_FA4] Recompiling bwd_pre kernel (compile_key=%s, cache_size=%d)",
+            compile_key_pre, len(_flash_attn_bwd.compile_cache_pre),
+        )
         # Only create from_dlpack tensors when compilation is needed
         o_tensor = from_dlpack(out.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=out.ndim - 1)
         do_tensor = from_dlpack(dout.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dout.ndim - 1)
@@ -999,6 +1010,10 @@ def _flash_attn_bwd(
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
+        logger.warning(
+            "[FFA_FA4] Recompiling bwd kernel (compile_key=%s, cache_size=%d)",
+            compile_key, len(_flash_attn_bwd.compile_cache),
+        )
         # Only create from_dlpack tensors when compilation is needed
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -1163,6 +1178,10 @@ def _flash_attn_bwd(
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
+        logger.warning(
+            "[FFA_FA4] Recompiling bwd_post (dq) kernel (compile_key=%s, cache_size=%d)",
+            compile_key_post, len(_flash_attn_bwd.compile_cache_post),
+        )
         # Only create from_dlpack tensors when compilation is needed
         dq_accum_tensor = from_dlpack(dq_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq_accum.ndim - 1)
         dq_tensor = from_dlpack(dq.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dq.ndim - 1)
@@ -1198,6 +1217,10 @@ def _flash_attn_bwd(
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
         compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
+            logger.warning(
+                "[FFA_FA4] Recompiling bwd_post (dk) kernel (compile_key=%s, cache_size=%d)",
+                compile_key_post, len(_flash_attn_bwd.compile_cache_post),
+            )
             # Only create from_dlpack tensors when compilation is needed
             dk_accum_tensor = from_dlpack(dk_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk_accum.ndim - 1)
             dk_tensor = from_dlpack(dk.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dk.ndim - 1)
@@ -1236,6 +1259,10 @@ def _flash_attn_bwd(
             dKV_swapAB,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
+            logger.warning(
+                "[FFA_FA4] Recompiling bwd_post (dv) kernel (compile_key=%s, cache_size=%d)",
+                compile_key_post, len(_flash_attn_bwd.compile_cache_post),
+            )
             # Only create from_dlpack tensors when compilation is needed
             dv_accum_tensor = from_dlpack(dv_accum.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv_accum.ndim - 1)
             dv_tensor = from_dlpack(dv.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=dv.ndim - 1)
@@ -1591,6 +1618,10 @@ def _flash_attn_fwd_combine(
     )
 
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
+        logger.warning(
+            "[FFA_FA4] Recompiling fwd_combine kernel (compile_key=%s, cache_size=%d)",
+            compile_key, len(_flash_attn_fwd_combine.compile_cache),
+        )
         # Only create from_dlpack tensors when compilation is needed
         out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=4 if not is_varlen else 3
