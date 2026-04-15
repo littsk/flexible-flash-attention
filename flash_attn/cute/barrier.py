@@ -52,6 +52,32 @@ def red_release(
     )
 
 
+@dsl_user_op
+def fence_proxy_async(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.proxy.async;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def membar_sys(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "membar.sys;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def wait_eq(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: Int32) -> None:
     flag_ptr = lock_ptr + flag_offset
@@ -67,5 +93,6 @@ def arrive_inc(
 ) -> None:
     flag_ptr = lock_ptr + flag_offset
     if thread_idx == 0:
+        fence_proxy_async()
         red_release(flag_ptr, val)
         # red_relaxed(flag_ptr, val)

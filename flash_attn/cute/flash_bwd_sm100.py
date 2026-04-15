@@ -822,7 +822,8 @@ class FlashAttentionBackwardSm100:
 
         if warp_idx == 1:
             cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+                tmem_dealloc_mbar_ptr,
+                cute.arch.WARP_SIZE * (len(self.compute_warp_ids) + len(self.reduce_warp_ids)),
             )
         if const_expr(self.cluster_reduce_dQ):
             if warp_idx == 4:
@@ -1203,6 +1204,7 @@ class FlashAttentionBackwardSm100:
                 sorted_block_idx,
                 sorted_block_is_full,
             )
+            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         return
 
@@ -2239,12 +2241,12 @@ class FlashAttentionBackwardSm100:
             )
 
         # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
         if const_expr(deterministic_KV):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+            barrier.fence_proxy_async()
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
         cute.arch.sync_warp()
@@ -2456,7 +2458,7 @@ class FlashAttentionBackwardSm100:
         ).get_slice(tidx)
         tdQsdQ = thr_copy_dQaccum_r2s.partition_D(sdQaccum)
 
-        read_flag = const_expr(not self.deterministic)
+        read_flag = True
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -2576,13 +2578,17 @@ class FlashAttentionBackwardSm100:
                                 self.tma_copy_bytes["dQ"] // 1,
                             )
                         cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
+                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
 
                     self.reduce_sync_barrier.arrive_and_wait()
                     dQ_tma_store_producer_state.advance()
 
                     # Semaphore release for prior m_block
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                        # TMA reduce-adds go through the async proxy; the semaphore
+                        # red.release goes through the generic proxy.  Without this
+                        # fence the release can be observed before the TMA writes land.
+                        barrier.fence_proxy_async()
                         if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
                             if iter_idx > 0:
                                 prev_m_block = sorted_block_idx[curr_combined_offset + iter_idx - 1]
@@ -2618,6 +2624,7 @@ class FlashAttentionBackwardSm100:
                     if is_tma_warp:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
+                    barrier.fence_proxy_async()
                     barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
 
             # Final cleanup after loop
@@ -2627,6 +2634,7 @@ class FlashAttentionBackwardSm100:
 
             # Final semaphore release for delay mode
             if const_expr(self.deterministic and delay_semaphore_release):
+                barrier.fence_proxy_async()
                 if const_expr(self.use_block_sparsity and sorted_block_idx is not None):
                     if loop_count > 0:
                         last_m_block = sorted_block_idx[curr_combined_offset + loop_count - 1]
@@ -2954,12 +2962,12 @@ class FlashAttentionBackwardSm100:
             )
 
         # semaphore release
-        # NOTE: arrive_inc calls red_release which issues membar
         if const_expr(deterministic_KV):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+            barrier.fence_proxy_async()
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
         cute.arch.sync_warp()
