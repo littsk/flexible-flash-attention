@@ -815,8 +815,15 @@ class FlashAttentionBackwardSm100:
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
 
         if warp_idx == 1:
+            # SM100 tmem_dealloc_mbar must also wait on the reduce warpgroup so that
+            # tmem is not freed while the reduce warps are still loading dQ accumulator
+            # data from tmem. Otherwise, under SM contention the tail m_block's tmem
+            # read can race with dealloc/reallocate and produce non-deterministic dq.
+            # Upstream fix: flash-attention@dd8a272 "[Sm100] Fix tmem delloc: sync before dealloc".
             cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+                tmem_dealloc_mbar_ptr,
+                cute.arch.WARP_SIZE
+                * (len(self.compute_warp_ids) + len(self.reduce_warp_ids)),
             )
         if const_expr(self.cluster_reduce_dQ):
             if warp_idx == 4:
@@ -1189,6 +1196,9 @@ class FlashAttentionBackwardSm100:
                 dQ_lock_values_mask,
                 dQ_lock_values_full,
             )
+            # Signal that reduce warps are done reading dQ accumulator from tmem,
+            # so the load/mma warpgroup can safely dealloc_tmem. See above init comment.
+            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
         return
 
