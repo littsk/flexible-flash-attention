@@ -570,13 +570,22 @@ _flash_attn_fwd.compile_cache = {}
 def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     """Precompute sorted iteration metadata for deterministic backward.
 
+    Shape symbols used below (all 1-D unless noted):
+      num_n    – number of n_blocks (kv tiles)
+      mask_len – total mask entries across all n_blocks
+                 (== ``block_sparse_tensors.mask_block_idx.shape[0]``)
+      full_len – total full entries across all n_blocks
+                 (== ``block_sparse_tensors.full_block_idx.shape[0]``, 0 if no full)
+      total    – mask_len + full_len
+      num_m    – number of distinct m_blocks, i.e. ``max(num_n, sorted_flat.max()+1)``
+
     Returns a dict with:
 
-    * ``dQ_lock_values``  — int32[total]: semaphore lock value per entry
-    * ``dQ_lock_combined_offset`` — int32[num_n+1]: prefix-sum offset
-    * ``sorted_block_idx``  — int32[total]: m_block indices sorted by
+    * ``dQ_lock_values``  — int32 (total,): semaphore lock value per entry
+    * ``dQ_lock_combined_offset`` — int32 (num_n + 1,): prefix-sum offset
+    * ``sorted_block_idx``  — int32 (total,): m_block indices sorted by
       m_block within each n_block (merge of mask + full)
-    * ``sorted_block_is_full`` — int32[total]: 0 = mask, 1 = full
+    * ``sorted_block_is_full`` — int32 (total,): 0 = mask, 1 = full
 
     The sorted order ensures CTAs encounter the same m_block at similar
     iteration indices, minimising semaphore wait bubbles.
@@ -585,18 +594,20 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     """
     device = block_sparse_tensors.mask_block_idx.device
 
-    mask_cnt = block_sparse_tensors.mask_block_cnt
-    mask_off = block_sparse_tensors.mask_block_offset
-    mask_idx = block_sparse_tensors.mask_block_idx
+    # Inputs from LinearBlockSparseTensorsTorch. `*_block_offset` is a prefix-sum
+    # so it has one extra entry (leading 0, trailing total count).
+    mask_cnt = block_sparse_tensors.mask_block_cnt        # int32 (num_n,)
+    mask_off = block_sparse_tensors.mask_block_offset     # int32 (num_n + 1,)
+    mask_idx = block_sparse_tensors.mask_block_idx        # int32 (mask_len,)
     has_full = block_sparse_tensors.full_block_cnt is not None
 
     mask_len = mask_idx.shape[0]
     num_n = mask_cnt.shape[0]
 
     if has_full:
-        full_cnt = block_sparse_tensors.full_block_cnt
-        full_off = block_sparse_tensors.full_block_offset
-        full_idx = block_sparse_tensors.full_block_idx
+        full_cnt = block_sparse_tensors.full_block_cnt        # int32 (num_n,)
+        full_off = block_sparse_tensors.full_block_offset     # int32 (num_n + 1,)
+        full_idx = block_sparse_tensors.full_block_idx        # int32 (full_len,)
         full_len = full_idx.shape[0]
     else:
         full_len = 0
@@ -604,10 +615,10 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     total = mask_len + full_len
 
     # -- combined offset (prefix-sum of per-n_block total counts) ---------
-    total_per_n = mask_cnt.to(torch.int64)
+    total_per_n = mask_cnt.to(torch.int64)                # int64 (num_n,)
     if has_full:
-        total_per_n = total_per_n + full_cnt.to(torch.int64)
-    combined_offset = torch.zeros(num_n + 1, dtype=torch.int32, device=device)
+        total_per_n = total_per_n + full_cnt.to(torch.int64)  # int64 (num_n,)
+    combined_offset = torch.zeros(num_n + 1, dtype=torch.int32, device=device)  # int32 (num_n + 1,)
     combined_offset[1:] = torch.cumsum(total_per_n, dim=0).to(torch.int32)
 
     empty = dict(
@@ -620,54 +631,60 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
         return empty
 
     # -- flat m_block & is_full arrays (mask-first order) -----------------
-    cum64 = combined_offset.to(torch.int64)
+    cum64 = combined_offset.to(torch.int64)               # int64 (num_n + 1,)
 
-    mp = torch.arange(mask_len, dtype=torch.int64, device=device)
-    mo = mask_off.to(torch.int64)
-    mn = torch.searchsorted(mo, mp, right=True) - 1
-    mask_dst = cum64[mn] + (mp - mo[mn])
+    mp = torch.arange(mask_len, dtype=torch.int64, device=device)   # int64 (mask_len,)
+    mo = mask_off.to(torch.int64)                                   # int64 (num_n + 1,)
+    # mn[i] = which n_block the i-th mask entry belongs to, in [0, num_n).
+    mn = torch.searchsorted(mo, mp, right=True) - 1                 # int64 (mask_len,)
+    # Destination of the i-th mask entry in the combined (mask-first) layout.
+    mask_dst = cum64[mn] + (mp - mo[mn])                            # int64 (mask_len,)
 
-    flat = torch.zeros(total, dtype=torch.int64, device=device)
+    flat = torch.zeros(total, dtype=torch.int64, device=device)     # int64 (total,) — m_block ids
     flat.scatter_(0, mask_dst, mask_idx.to(torch.int64))
 
-    is_full = torch.zeros(total, dtype=torch.int32, device=device)
+    is_full = torch.zeros(total, dtype=torch.int32, device=device)  # int32 (total,) — 0 mask / 1 full
 
     if has_full and full_len > 0:
-        fp = torch.arange(full_len, dtype=torch.int64, device=device)
-        fo = full_off.to(torch.int64)
-        fn = torch.searchsorted(fo, fp, right=True) - 1
-        full_dst = cum64[fn] + mask_cnt[fn].to(torch.int64) + (fp - fo[fn])
+        fp = torch.arange(full_len, dtype=torch.int64, device=device)   # int64 (full_len,)
+        fo = full_off.to(torch.int64)                                   # int64 (num_n + 1,)
+        fn = torch.searchsorted(fo, fp, right=True) - 1                 # int64 (full_len,) in [0, num_n)
+        # full entries come right after this n_block's mask entries in the combined layout.
+        full_dst = cum64[fn] + mask_cnt[fn].to(torch.int64) + (fp - fo[fn])  # int64 (full_len,)
         flat.scatter_(0, full_dst, full_idx.to(torch.int64))
         is_full.scatter_(0, full_dst, torch.ones(full_len, dtype=torch.int32, device=device))
 
     # -- per-n_block sort by m_block (stable, mask entries before full) ---
     # Sort key = m_block * 2 + is_full so ties break mask-before-full.
-    sort_key = flat * 2 + is_full.to(torch.int64)
+    sort_key = flat * 2 + is_full.to(torch.int64)         # int64 (total,)
     # Segment-sort: offset each n_block's keys to keep segments separate.
     seg_bias = torch.repeat_interleave(
         torch.arange(num_n, dtype=torch.int64, device=device) * (num_n * 4),
         total_per_n,
-    )
-    sort_key = sort_key + seg_bias
+    )                                                      # int64 (total,)
+    sort_key = sort_key + seg_bias                         # int64 (total,)
 
-    perm = torch.argsort(sort_key, stable=True)
-    sorted_flat = flat[perm]
-    sorted_is_full = is_full[perm]
+    perm = torch.argsort(sort_key, stable=True)            # int64 (total,)
+    sorted_flat = flat[perm]                               # int64 (total,) — sorted m_block ids
+    sorted_is_full = is_full[perm]                         # int32 (total,)
 
     # -- lock values: reverse n_block order (last n_block → lock=0) ---------
     # Combined with the LPT scheduler's block reversal (spt=True), CTA 0
     # maps to n_block=num_n-1 which gets lock=0 → never blocks.
-    positions = torch.arange(total, dtype=torch.int64, device=device)
+    positions = torch.arange(total, dtype=torch.int64, device=device)  # int64 (total,)
     num_m = max(num_n, int(sorted_flat.max().item()) + 1) if total > 0 else num_n
-    one_hot = torch.zeros(num_m, total, dtype=torch.int32, device=device)
+    # one_hot[m, p] = 1 iff the p-th entry (across all n_blocks in sorted order)
+    # targets m_block m. cumsum along p gives, at each entry, how many prior
+    # entries touched the same m_block → per-m forward arrival index.
+    one_hot = torch.zeros(num_m, total, dtype=torch.int32, device=device)  # int32 (num_m, total)
     one_hot[sorted_flat, positions] = 1
-    cumcount = one_hot.cumsum(dim=1)
-    fwd_lock = (cumcount[sorted_flat, positions] - 1).to(torch.int32)
+    cumcount = one_hot.cumsum(dim=1)                                       # int32 (num_m, total)
+    fwd_lock = (cumcount[sorted_flat, positions] - 1).to(torch.int32)      # int32 (total,)
     # Reverse: max_lock_per_m_block - forward_lock
-    m_block_count = torch.zeros(num_m, dtype=torch.int32, device=device)
+    m_block_count = torch.zeros(num_m, dtype=torch.int32, device=device)   # int32 (num_m,)
     m_block_count.scatter_add_(0, sorted_flat.to(torch.int64),
                                torch.ones(total, dtype=torch.int32, device=device))
-    lock_values = (m_block_count[sorted_flat] - 1 - fwd_lock)
+    lock_values = (m_block_count[sorted_flat] - 1 - fwd_lock)              # int32 (total,)
 
     return dict(
         dQ_lock_values=lock_values,

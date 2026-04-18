@@ -2561,13 +2561,22 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.use_block_sparsity):
                             lock_value = dQ_lock_values[curr_combined_offset + iter_idx]
                         elif const_expr(self.spt):
-                            n_block_max_for_m_block = min(
-                                n_block_global_max,
-                                cute.ceil_div(
-                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                                    self.tile_n,
-                                ),
-                            )
+                            # SPT reverse-lock: CTA with largest n_block writes first (lock_value=0)
+                            # and smallest last. For causal the valid n_block range per m_block is
+                            # capped by the causal triangle; for non-causal (non block-sparse) every
+                            # n_block participates, so the cap must be the global max. Using the
+                            # causal cap for non-causal yields negative lock_values for n_block >= cap
+                            # and deadlocks the reduce warpgroup on wait_eq.
+                            if const_expr(self.is_causal):
+                                n_block_max_for_m_block = min(
+                                    n_block_global_max,
+                                    cute.ceil_div(
+                                        (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
+                                        self.tile_n,
+                                    ),
+                                )
+                            else:
+                                n_block_max_for_m_block = n_block_global_max
                             lock_value = n_block_max_for_m_block - 1 - n_block
                         else:
                             lock_value = n_block
