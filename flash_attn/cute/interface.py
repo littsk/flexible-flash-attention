@@ -658,8 +658,16 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     # Sort key = m_block * 2 + is_full so ties break mask-before-full.
     sort_key = flat * 2 + is_full.to(torch.int64)         # int64 (total,)
     # Segment-sort: offset each n_block's keys to keep segments separate.
+    # The multiplier MUST strictly exceed the largest intra-segment sort key,
+    # otherwise argsort interleaves entries across n_blocks and the resulting
+    # ``sorted_block_idx`` / ``dQ_lock_values`` become incoherent with
+    # ``dQ_lock_combined_offset`` — which deadlocks the deterministic reduce
+    # warpgroup on wait_eq. max(sort_key_in_segment) = 2 * max(flat) + 1, so
+    # a multiplier of 2 * (max(flat) + 1) is sufficient and tight.
+    max_flat_plus_one = int(flat.max().item()) + 1 if total > 0 else 1
+    seg_multiplier = max(num_n * 4, 2 * max_flat_plus_one)
     seg_bias = torch.repeat_interleave(
-        torch.arange(num_n, dtype=torch.int64, device=device) * (num_n * 4),
+        torch.arange(num_n, dtype=torch.int64, device=device) * seg_multiplier,
         total_per_n,
     )                                                      # int64 (total,)
     sort_key = sort_key + seg_bias                         # int64 (total,)
