@@ -733,29 +733,38 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     # already target the same m_block as entry p. I.e. "I am the k-th one to
     # hit this m_block, counting from 0".
     #
-    # Vectorized via one-hot + row-wise cumsum:
-    #   one_hot[m, p] = 1 iff sorted_flat[p] == m
-    #   cumcount[m, p] = number of entries at positions [0..p] with m_block==m
-    # Then fwd_lock[p] = cumcount[sorted_flat[p], p] - 1.
+    # Memory-efficient sort-based computation (O(total) memory vs the
+    # O(num_m * total) one-hot+cumsum approach, which blows up when ``total``
+    # and ``num_m`` both scale with num_n):
+    #   1. Stable argsort ``sorted_flat`` by m_block value. Entries sharing
+    #      the same m_block become consecutive in this order, and stability
+    #      preserves their original p-order within each group.
+    #   2. For the i-th entry in the sorted order, its rank within its group
+    #      equals ``i - group_start[m]``, where ``group_start`` is the
+    #      prefix-sum of per-m_block occurrence counts (i.e. ``bincount``).
+    #   3. Scatter the per-sorted-position ranks back to the original
+    #      positions via the argsort permutation.
     #
-    # For the example:
-    #   one_hot (rows m=0,2,5 shown; others all zero):
-    #                 p=0 p=1 p=2 p=3 p=4 p=5
-    #     m=0        [  1   0   0   0   1   0 ]
-    #     m=2        [  0   0   1   0   0   0 ]
-    #     m=5        [  0   1   0   1   0   1 ]
-    #   cumcount:
-    #     m=0        [  1   1   1   1   2   2 ]
-    #     m=2        [  0   0   1   1   1   1 ]
-    #     m=5        [  0   1   1   2   2   3 ]
-    #   fwd_lock   = [  0   0   0   1   1   2 ]
-    one_hot = torch.zeros(num_m, total, dtype=torch.int32, device=device)  # int32 (num_m, total)
-    one_hot[sorted_flat, positions] = 1
-    cumcount = one_hot.cumsum(dim=1)                                       # int32 (num_m, total)
-    fwd_lock = (cumcount[sorted_flat, positions] - 1).to(torch.int32)      # int32 (total,)
+    # For the example (sorted_flat = [0, 5, 2, 5, 0, 5], num_m = 6):
+    #   order         = [0, 4, 2, 1, 3, 5]    (stable argsort)
+    #   sorted_m      = [0, 0, 2, 5, 5, 5]
+    #   m_block_count = [2, 0, 1, 0, 0, 3]
+    #   group_starts  = [0, 2, 2, 3, 3, 3]    (exclusive prefix-sum)
+    #   ranks_in_ord  = [0, 1, 0, 0, 1, 2]    (i - group_starts[sorted_m[i]])
+    #   fwd_lock[order[i]] = ranks_in_ord[i]
+    #                 = [0, 0, 0, 1, 1, 2]
+    order = torch.argsort(sorted_flat, stable=True)                        # int64 (total,)
+    sorted_m = sorted_flat[order]                                          # int64 (total,)
+    m_block_count = torch.bincount(sorted_flat, minlength=num_m).to(torch.int32)  # int32 (num_m,)
+    group_starts = torch.zeros(num_m, dtype=torch.int64, device=device)    # int64 (num_m,)
+    group_starts[1:] = m_block_count[:-1].to(torch.int64).cumsum(0)
+    ranks_in_order = positions - group_starts[sorted_m]                    # int64 (total,)
+    fwd_lock = torch.empty(total, dtype=torch.int32, device=device)        # int32 (total,)
+    fwd_lock[order] = ranks_in_order.to(torch.int32)
 
     # ---- Step 2: reverse into lock values ----------------------------------
-    # ``m_block_count[m]`` = total number of entries that target m_block m.
+    # ``m_block_count[m]`` = total number of entries that target m_block m
+    # (computed above via bincount, reused here).
     # Reversed lock: the LAST arrival (fwd_lock = count-1) gets lock 0, the
     # second-to-last gets lock 1, etc., so the reduction chain completes in
     # the reverse of the sorted sequence.
@@ -775,9 +784,6 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     #       wait_eq(dQ_sem[m], dQ_lock_values[i])   # fixed predecessor chain
     #       dQ[m] += partial_dQ
     #       atomic_add(dQ_sem[m], 1)                # hand off to successor
-    m_block_count = torch.zeros(num_m, dtype=torch.int32, device=device)   # int32 (num_m,)
-    m_block_count.scatter_add_(0, sorted_flat.to(torch.int64),
-                               torch.ones(total, dtype=torch.int32, device=device))
     lock_values = (m_block_count[sorted_flat] - 1 - fwd_lock)              # int32 (total,)
 
     # --------------------------------------------------------------------
