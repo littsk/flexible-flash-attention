@@ -356,6 +356,15 @@ def _flash_attn_backward(
     block_sparse_full_cnt: Optional[torch.Tensor] = None,
     block_sparse_full_offset: Optional[torch.Tensor] = None,
     block_sparse_full_idx: Optional[torch.Tensor] = None,
+    # Deterministic dQ-lock metadata (K2Q direction, block-sparse only).
+    # sorted_block_idx[combined_offset[n]+i] is the m_block touched at iteration i
+    # of n_block n; dQ_lock_values[combined_offset[n]+i] is the expected
+    # semaphore value on arrival. Produced by
+    # flash_attn.cute.interface._compute_bwd_dQ_lock_values.
+    dQ_lock_values: Optional[torch.Tensor] = None,
+    dQ_lock_combined_offset: Optional[torch.Tensor] = None,
+    sorted_block_idx: Optional[torch.Tensor] = None,
+    sorted_block_is_full: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -400,6 +409,10 @@ def _flash_attn_backward(
             block_sparse_full_cnt,
             block_sparse_full_offset,
             block_sparse_full_idx,
+            dQ_lock_values,
+            dQ_lock_combined_offset,
+            sorted_block_idx,
+            sorted_block_is_full,
         )
     return softmax_d
 
@@ -437,6 +450,11 @@ def _flash_attn_backward_fake(
     block_sparse_full_cnt: Optional[torch.Tensor] = None,
     block_sparse_full_offset: Optional[torch.Tensor] = None,
     block_sparse_full_idx: Optional[torch.Tensor] = None,
+    # Deterministic dQ-lock metadata (see _flash_attn_backward).
+    dQ_lock_values: Optional[torch.Tensor] = None,
+    dQ_lock_combined_offset: Optional[torch.Tensor] = None,
+    sorted_block_idx: Optional[torch.Tensor] = None,
+    sorted_block_is_full: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 
     is_varlen_q = cu_seqlens_q is not None

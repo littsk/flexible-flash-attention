@@ -46,6 +46,24 @@ struct BlockSparsityArguments {
     int num_heads = 0;
     // Number of batches (needed for computing flat index, can be 1 for broadcasting)
     int num_batches = 0;
+
+    // ----- Deterministic dQ-lock metadata (backward only, optional) -----
+    // When non-null and accompanied by deterministic=true, the backward store_dq
+    // iterator walks m_blocks in sorted order (per-n_block) and uses
+    // dq_lock_values[combined_offset[n_block] + i] as the expected semaphore
+    // value at the i-th store for n_block n_block. See
+    // flash_attn.cute.interface._compute_bwd_dQ_lock_values for how these are
+    // produced. Shapes:
+    //   dq_lock_values        : [total_entries]
+    //   dq_lock_combined_offset : [num_n_blocks + 1]
+    //   sorted_block_idx      : [total_entries]  (m_block at each entry)
+    //   sorted_block_is_full  : [total_entries]  (0 = mask, 1 = full)
+    // Currently only populated when (B, H) == (1, 1) because the Python
+    // precomputation path is head/batch-agnostic; guarded in flash_api.cpp.
+    int const* dq_lock_values = nullptr;
+    int const* dq_lock_combined_offset = nullptr;
+    int const* sorted_block_idx = nullptr;
+    int const* sorted_block_is_full = nullptr;
 };
 
 // Device-side params (same as Arguments for now, but can be optimized separately)
@@ -797,7 +815,18 @@ struct BlockSparsityInfoBwd {
     int full_block_offset = 0;
     int const* mask_block_idx = nullptr;
     int const* full_block_idx = nullptr;
-    
+
+    // Deterministic iteration metadata (per n_block slice). All four become
+    // non-null together; when present, `store_dq_block_sparse_deterministic`
+    // walks `sorted_block_idx[combined_start..combined_start + total)` and
+    // arrives semaphore value `dq_lock_values[combined_start + i]` at each
+    // store. `combined_total` equals `mask_block_cnt + full_block_cnt`.
+    int combined_start = 0;
+    int combined_total = 0;
+    int const* dq_lock_values = nullptr;
+    int const* sorted_block_idx = nullptr;
+    int const* sorted_block_is_full = nullptr;
+
     CUTLASS_DEVICE
     BlockSparsityInfoBwd() = default;
     
@@ -815,6 +844,22 @@ struct BlockSparsityInfoBwd {
         full_block_cnt = params.full_block_cnt[flat_idx];
         full_block_offset = params.full_block_offset[flat_idx];
         full_block_idx = params.full_block_idx;
+
+        // Optional deterministic metadata. combined_offset is indexed by
+        // n_block only (the Python precomputation is (B, H) = (1, 1)).
+        if (params.dq_lock_combined_offset != nullptr) {
+            combined_start = params.dq_lock_combined_offset[n_block];
+            int const combined_end = params.dq_lock_combined_offset[n_block + 1];
+            combined_total = combined_end - combined_start;
+            dq_lock_values = params.dq_lock_values;
+            sorted_block_idx = params.sorted_block_idx;
+            sorted_block_is_full = params.sorted_block_is_full;
+        }
+    }
+
+    CUTLASS_DEVICE
+    bool has_deterministic_order() const {
+        return dq_lock_values != nullptr && sorted_block_idx != nullptr;
     }
     
     CUTLASS_DEVICE
@@ -1047,6 +1092,34 @@ void store_dq_block_sparse(
     for (int i = 0; i < info.full_block_cnt; ++i) {
         int m_block = info.get_full_m_block(i);
         store_step(m_block);
+    }
+}
+
+/**
+ * Deterministic variant used for block-sparse + deterministic backward.
+ *
+ * Walks m_blocks in the precomputed global sorted order (see
+ * `_compute_bwd_dQ_lock_values` in flash_attn.cute.interface). For each
+ * iteration i of this n_block, the store callback is invoked with:
+ *   m_block      = sorted_block_idx[combined_start + i]
+ *   expected_lock = dq_lock_values[combined_start + i]
+ *
+ * The mainloop uses `expected_lock` to arrive into the per-m_block
+ * semaphore (`Barrier::wait_eq(expected_lock)` followed by `arrive_inc()`
+ * on the next producer). This replaces the naive `n_block`-keyed scheme
+ * that only works for dense backward.
+ */
+template <typename StoreStep>
+CUTLASS_DEVICE
+void store_dq_block_sparse_deterministic(
+    BlockSparsityInfoBwd const& info,
+    StoreStep&& store_step
+) {
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int i = 0; i < info.combined_total; ++i) {
+        int const m_block = info.sorted_block_idx[info.combined_start + i];
+        int const expected_lock = info.dq_lock_values[info.combined_start + i];
+        store_step(m_block, expected_lock);
     }
 }
 

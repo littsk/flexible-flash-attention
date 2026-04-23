@@ -244,6 +244,17 @@ struct Flash_bwd_params : public Flash_fwd_params {
     int *__restrict__ dk_semaphore;
     int *__restrict__ dv_semaphore;
 
+    // Deterministic dQ-lock metadata for block-sparse backward (K2Q direction).
+    // Mirrors the FA4 cute kernel: iteration i of n_block n targets
+    // m_block = sorted_block_idx[dq_lock_combined_offset[n] + i] with expected
+    // semaphore value dq_lock_values[dq_lock_combined_offset[n] + i].
+    // When null, the kernel falls back to the legacy linear-order scheme used
+    // for dense deterministic backward.
+    int const *__restrict__ dq_lock_values;
+    int const *__restrict__ dq_lock_combined_offset;
+    int const *__restrict__ sorted_block_idx;
+    int const *__restrict__ sorted_block_is_full;
+
     bool deterministic;
     index_t dq_accum_split_stride;
 };

@@ -1452,7 +1452,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     std::optional<at::Tensor> block_sparse_mask_idx_,     // [total_mask_blocks]: indices of mask blocks
     std::optional<at::Tensor> block_sparse_full_cnt_,     // [batch, head_q, num_n_blocks]: count of full blocks per n_block
     std::optional<at::Tensor> block_sparse_full_offset_,  // [batch * head_q * num_n_blocks + 1]: cumulative offset into full_idx
-    std::optional<at::Tensor> block_sparse_full_idx_      // [total_full_blocks]: indices of full blocks
+    std::optional<at::Tensor> block_sparse_full_idx_,     // [total_full_blocks]: indices of full blocks
+    // Deterministic dQ-lock metadata (K2Q direction, block-sparse only).
+    // All four are int32 1D tensors produced by
+    // _compute_bwd_dQ_lock_values in flash_attn.cute.interface:
+    //   dq_lock_values_           : [total] expected semaphore value per entry
+    //   dq_lock_combined_offset_  : [num_n + 1] prefix sum of per-n_block counts
+    //   sorted_block_idx_         : [total] m_block targeted at each entry
+    //   sorted_block_is_full_     : [total] 0 for mask, 1 for full
+    std::optional<at::Tensor> dq_lock_values_,
+    std::optional<at::Tensor> dq_lock_combined_offset_,
+    std::optional<at::Tensor> sorted_block_idx_,
+    std::optional<at::Tensor> sorted_block_is_full_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1815,6 +1826,76 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         params.block_sparse_num_batches = 0;
     }
 
+    // Deterministic dQ-lock metadata (for block-sparse + deterministic bwd).
+    // The kernel consumes `sorted_block_idx[combined_offset[n]+i]` as the
+    // m_block target at iteration i, and waits on `dq_lock_values[...]` via
+    // `Barrier::wait_eq` before incrementing. Feeding them in is optional;
+    // when nullptr, the mainloop falls back to the legacy linear-order scheme
+    // that is only correct for dense (non-block-sparse) backward.
+    bool use_dq_lock =
+        dq_lock_values_.has_value() && dq_lock_combined_offset_.has_value() &&
+        sorted_block_idx_.has_value() && sorted_block_is_full_.has_value();
+
+    if (use_dq_lock) {
+        TORCH_CHECK(use_block_sparsity,
+            "dQ_lock_values/sorted_block_idx are only meaningful with block "
+            "sparsity; block_sparse_* tensors must also be provided.");
+        TORCH_CHECK(deterministic,
+            "dQ_lock_values/sorted_block_idx require deterministic=True.");
+
+        auto dq_lock_values = dq_lock_values_.value();
+        auto dq_lock_combined_offset = dq_lock_combined_offset_.value();
+        auto sorted_block_idx = sorted_block_idx_.value();
+        auto sorted_block_is_full = sorted_block_is_full_.value();
+
+        CHECK_DEVICE(dq_lock_values); CHECK_CONTIGUOUS(dq_lock_values);
+        CHECK_DEVICE(dq_lock_combined_offset); CHECK_CONTIGUOUS(dq_lock_combined_offset);
+        CHECK_DEVICE(sorted_block_idx); CHECK_CONTIGUOUS(sorted_block_idx);
+        CHECK_DEVICE(sorted_block_is_full); CHECK_CONTIGUOUS(sorted_block_is_full);
+
+        TORCH_CHECK(dq_lock_values.dtype() == torch::kInt32,
+            "dQ_lock_values must be int32");
+        TORCH_CHECK(dq_lock_combined_offset.dtype() == torch::kInt32,
+            "dQ_lock_combined_offset must be int32");
+        TORCH_CHECK(sorted_block_idx.dtype() == torch::kInt32,
+            "sorted_block_idx must be int32");
+        TORCH_CHECK(sorted_block_is_full.dtype() == torch::kInt32,
+            "sorted_block_is_full must be int32");
+
+        TORCH_CHECK(dq_lock_values.dim() == 1 &&
+                    dq_lock_combined_offset.dim() == 1 &&
+                    sorted_block_idx.dim() == 1 &&
+                    sorted_block_is_full.dim() == 1,
+            "All dQ-lock tensors must be 1D.");
+
+        int64_t num_n = params.block_sparse_num_blocks;
+        TORCH_CHECK(dq_lock_combined_offset.size(0) == num_n + 1,
+            "dQ_lock_combined_offset must have length num_n_blocks + 1");
+        TORCH_CHECK(dq_lock_values.size(0) == sorted_block_idx.size(0) &&
+                    dq_lock_values.size(0) == sorted_block_is_full.size(0),
+            "dQ_lock_values / sorted_block_idx / sorted_block_is_full must "
+            "have the same length.");
+
+        params.dq_lock_values = dq_lock_values.data_ptr<int>();
+        params.dq_lock_combined_offset = dq_lock_combined_offset.data_ptr<int>();
+        params.sorted_block_idx = sorted_block_idx.data_ptr<int>();
+        params.sorted_block_is_full = sorted_block_is_full.data_ptr<int>();
+    } else {
+        params.dq_lock_values = nullptr;
+        params.dq_lock_combined_offset = nullptr;
+        params.sorted_block_idx = nullptr;
+        params.sorted_block_is_full = nullptr;
+    }
+
+    // sm80 does not yet implement the sorted/lock-based deterministic bwd for
+    // block sparsity. Guard the unsupported combination explicitly so the user
+    // does not silently get non-deterministic results.
+    if (deterministic && use_block_sparsity && params.arch < 90) {
+        TORCH_CHECK(false,
+            "Deterministic backward with block sparsity is only implemented "
+            "for Hopper (SM90) in this build; got arch=", params.arch, ".");
+    }
+
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
@@ -2026,7 +2107,11 @@ TORCH_LIBRARY(magi_flash_attn_3, m) {
         "Tensor? block_sparse_mask_idx = None,"
         "Tensor? block_sparse_full_cnt = None,"
         "Tensor? block_sparse_full_offset = None,"
-        "Tensor? block_sparse_full_idx = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? block_sparse_full_idx = None,"
+        "Tensor? dq_lock_values = None,"
+        "Tensor? dq_lock_combined_offset = None,"
+        "Tensor? sorted_block_idx = None,"
+        "Tensor? sorted_block_is_full = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

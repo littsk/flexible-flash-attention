@@ -1523,7 +1523,12 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     std::optional<at::Tensor> block_sparse_mask_idx_,     // [total_mask_blocks]: indices of mask blocks
     std::optional<at::Tensor> block_sparse_full_cnt_,     // [batch, head_q, num_n_blocks]: count of full blocks per n_block
     std::optional<at::Tensor> block_sparse_full_offset_,  // [batch * head_q * num_n_blocks + 1]: cumulative offset into full_idx
-    std::optional<at::Tensor> block_sparse_full_idx_      // [total_full_blocks]: indices of full blocks
+    std::optional<at::Tensor> block_sparse_full_idx_,     // [total_full_blocks]: indices of full blocks
+    // Deterministic dQ-lock metadata; mirror flash_api.cpp::mha_bwd semantics.
+    std::optional<at::Tensor> dq_lock_values_,
+    std::optional<at::Tensor> dq_lock_combined_offset_,
+    std::optional<at::Tensor> sorted_block_idx_,
+    std::optional<at::Tensor> sorted_block_is_full_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1889,6 +1894,47 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
         params.block_sparse_num_batches = 0;
     }
 
+    // Deterministic dQ-lock metadata (see flash_api.cpp::mha_bwd for full docs).
+    bool use_dq_lock =
+        dq_lock_values_.has_value() && dq_lock_combined_offset_.has_value() &&
+        sorted_block_idx_.has_value() && sorted_block_is_full_.has_value();
+    if (use_dq_lock) {
+        STD_TORCH_CHECK(use_block_sparsity,
+            "dq_lock_* tensors require block_sparse_* tensors to also be provided.");
+        STD_TORCH_CHECK(deterministic,
+            "dq_lock_* tensors require deterministic=True.");
+        auto dq_lock_values = dq_lock_values_.value();
+        auto dq_lock_combined_offset = dq_lock_combined_offset_.value();
+        auto sorted_block_idx = sorted_block_idx_.value();
+        auto sorted_block_is_full = sorted_block_is_full_.value();
+        CHECK_DEVICE(dq_lock_values); CHECK_CONTIGUOUS(dq_lock_values);
+        CHECK_DEVICE(dq_lock_combined_offset); CHECK_CONTIGUOUS(dq_lock_combined_offset);
+        CHECK_DEVICE(sorted_block_idx); CHECK_CONTIGUOUS(sorted_block_idx);
+        CHECK_DEVICE(sorted_block_is_full); CHECK_CONTIGUOUS(sorted_block_is_full);
+        STD_TORCH_CHECK(dq_lock_values.scalar_type() == torch::headeronly::ScalarType::Int,
+            "dq_lock_values must be int32");
+        STD_TORCH_CHECK(dq_lock_combined_offset.scalar_type() == torch::headeronly::ScalarType::Int,
+            "dq_lock_combined_offset must be int32");
+        STD_TORCH_CHECK(sorted_block_idx.scalar_type() == torch::headeronly::ScalarType::Int,
+            "sorted_block_idx must be int32");
+        STD_TORCH_CHECK(sorted_block_is_full.scalar_type() == torch::headeronly::ScalarType::Int,
+            "sorted_block_is_full must be int32");
+        params.dq_lock_values = static_cast<int*>(dq_lock_values.data_ptr());
+        params.dq_lock_combined_offset = static_cast<int*>(dq_lock_combined_offset.data_ptr());
+        params.sorted_block_idx = static_cast<int*>(sorted_block_idx.data_ptr());
+        params.sorted_block_is_full = static_cast<int*>(sorted_block_is_full.data_ptr());
+    } else {
+        params.dq_lock_values = nullptr;
+        params.dq_lock_combined_offset = nullptr;
+        params.sorted_block_idx = nullptr;
+        params.sorted_block_is_full = nullptr;
+    }
+
+    if (deterministic && use_block_sparsity && params.arch < 90) {
+        STD_TORCH_CHECK(false,
+            "Deterministic backward with block sparsity is only implemented for SM90 in this build.");
+    }
+
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::headeronly::ScalarType::Int)) : torch::empty({1}, opts.dtype(torch::headeronly::ScalarType::Int));
     // params.tile_count_semaphore = static_cast<int*>(tile_count_semaphore.data_ptr());
     // Will be zero'ed out in the backward preprocess kernel
@@ -2125,8 +2171,12 @@ void boxed_mha_bwd(
     auto block_sparse_full_cnt = to<std::optional<Tensor>>(stack[26]);
     auto block_sparse_full_offset = to<std::optional<Tensor>>(stack[27]);
     auto block_sparse_full_idx = to<std::optional<Tensor>>(stack[28]);
+    auto dq_lock_values = to<std::optional<Tensor>>(stack[29]);
+    auto dq_lock_combined_offset = to<std::optional<Tensor>>(stack[30]);
+    auto sorted_block_idx = to<std::optional<Tensor>>(stack[31]);
+    auto sorted_block_is_full = to<std::optional<Tensor>>(stack[32]);
 
-    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin, arbitrary_func, block_sparse_mask_cnt, block_sparse_mask_offset, block_sparse_mask_idx, block_sparse_full_cnt, block_sparse_full_offset, block_sparse_full_idx);
+    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin, arbitrary_func, block_sparse_mask_cnt, block_sparse_mask_offset, block_sparse_mask_idx, block_sparse_full_cnt, block_sparse_full_offset, block_sparse_full_idx, dq_lock_values, dq_lock_combined_offset, sorted_block_idx, sorted_block_is_full);
 
     stack[0] = from(softmax_d);
     stack[1] = from(softmax_lse_log2);
@@ -2258,7 +2308,11 @@ STABLE_TORCH_LIBRARY(magi_flash_attn_3, m) {
         "Tensor? block_sparse_mask_idx = None,"
         "Tensor? block_sparse_full_cnt = None,"
         "Tensor? block_sparse_full_offset = None,"
-        "Tensor? block_sparse_full_idx = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? block_sparse_full_idx = None,"
+        "Tensor? dq_lock_values = None,"
+        "Tensor? dq_lock_combined_offset = None,"
+        "Tensor? sorted_block_idx = None,"
+        "Tensor? sorted_block_is_full = None) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

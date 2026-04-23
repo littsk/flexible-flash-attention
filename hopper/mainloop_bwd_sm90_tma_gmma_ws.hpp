@@ -429,7 +429,9 @@ struct CollectiveMainloopBwdSm90 {
                 // Block sparsity params - convert from Arguments to Params (same structure)
                 {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
                  args.block_sparse.full_block_cnt, args.block_sparse.full_block_offset, args.block_sparse.full_block_idx,
-                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches},
+                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches,
+                 args.block_sparse.dq_lock_values, args.block_sparse.dq_lock_combined_offset,
+                 args.block_sparse.sorted_block_idx, args.block_sparse.sorted_block_is_full},
                 // Arbitrary mask function params
                 args.mask_func_ptr, args.shape_mask_func, args.stride_mask_func};
     }
@@ -763,12 +765,53 @@ struct CollectiveMainloopBwdSm90 {
             // ============================================================
             BlockSparsityInfoBwd block_sparse_info;
             block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
-            
-            store_dq_block_sparse(block_sparse_info, store_dq_step);
-            
-            // For Is_local && Deterministic, we still need to handle the semaphore for remaining m_blocks
-            // However, with block sparsity, the m_block iteration is non-contiguous, so we skip this
-            // The deterministic mode with block sparsity may need special handling
+
+            if constexpr (Deterministic) {
+                // Deterministic + block-sparse: walk m_blocks in the
+                // globally-sorted order produced by
+                // _compute_bwd_dQ_lock_values and arrive the precomputed
+                // lock value instead of n_block. Falls back to the legacy
+                // unordered iteration when sorted metadata is absent
+                // (matches the prior non-deterministic behaviour).
+                if (block_sparse_info.has_deterministic_order()) {
+                    auto store_dq_step_det = [&](int m_block, int expected_lock) {
+                        Barrier::wait_eq(
+                            lock_ptr,
+                            threadIdx.x % cutlass::NumThreadsPerWarp,
+                            m_block * num_batch * num_head,
+                            expected_lock);
+                        #pragma unroll
+                        for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                            cutlass::arch::NamedBarrier::sync(
+                                cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                            if (lane_predicate) {
+                                SM90_BULK_REDUCE_ADD::copy(
+                                    raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                    raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()),
+                                    dQ_TMA_num_bytes,
+                                    static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                                tma_store_arrive();
+                            }
+                        }
+                        for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
+                            if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
+                            cutlass::arch::NamedBarrier::arrive(
+                                cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);
+                        });
+                        Barrier::arrive_inc(
+                            lock_ptr,
+                            threadIdx.x % cutlass::NumThreadsPerWarp,
+                            m_block * num_batch * num_head);
+                    };
+                    store_dq_block_sparse_deterministic(block_sparse_info, store_dq_step_det);
+                } else {
+                    store_dq_block_sparse(block_sparse_info, store_dq_step);
+                }
+            } else {
+                store_dq_block_sparse(block_sparse_info, store_dq_step);
+            }
         } else {
             // ============================================================
             // Non-Block Sparse Path (original code)
