@@ -640,7 +640,31 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     # Destination of the i-th mask entry in the combined (mask-first) layout.
     mask_dst = cum64[mn] + (mp - mo[mn])                            # int64 (mask_len,)
 
+    # ``flat`` is the merged m_block-id array that unifies mask_idx and full_idx
+    # into a single per-n_block-segmented buffer, laid out as:
+    #   [ n0.mask | n0.full | n1.mask | n1.full | ... | n_{num_n-1}.mask | n_{num_n-1}.full ]
+    # Segment boundaries follow ``cum64`` (combined prefix-sum), and inside each
+    # n_block segment mask entries precede full entries. This unified layout is
+    # what the downstream per-segment sort (see below) operates on.
+    #
+    # Concrete example (num_n = 3):
+    #   mask_cnt = [2, 3, 1],  full_cnt = [1, 0, 2]   => total = 9
+    #   mask_off = [0, 2, 5, 6]       (prefix sum of mask_cnt)
+    #   cum64    = [0, 3, 6, 9]       (prefix sum of mask_cnt + full_cnt)
+    #   mask_idx = [a0, a1, b0, b1, b2, c0]                  (flat, by n_block)
+    #   full_idx = [A0,         C0, C1]                      (flat, by n_block)
+    #
+    # After the two scatters below fill both mask and full slots, ``flat`` becomes:
+    #   index:     0   1   2   3   4   5   6   7   8
+    #   flat:    [ a0  a1  A0  b0  b1  b2  c0  C0  C1 ]
+    #   is_full: [  0   0   1   0   0   0   0   1   1 ]
+    #            └─ n_block0 ─┘└ n_block1 ┘└ n_block2 ┘
+    # (lowercase = mask entries, uppercase = full entries; each cell holds the
+    # m_block id that the corresponding mask/full entry points at.)
     flat = torch.zeros(total, dtype=torch.int64, device=device)     # int64 (total,) — m_block ids
+    # Scatter mask entries into their mask-first slots computed above; full
+    # slots remain 0 for now and are filled in the ``has_full`` branch below.
+    # In the example above this writes [a0, a1, 0, b0, b1, b2, c0, 0, 0].
     flat.scatter_(0, mask_dst, mask_idx.to(torch.int64))
 
     is_full = torch.zeros(total, dtype=torch.int32, device=device)  # int32 (total,) — 0 mask / 1 full
@@ -676,24 +700,113 @@ def _compute_bwd_dQ_lock_values(block_sparse_tensors):
     sorted_flat = flat[perm]                               # int64 (total,) — sorted m_block ids
     sorted_is_full = is_full[perm]                         # int32 (total,)
 
-    # -- lock values: reverse n_block order (last n_block → lock=0) ---------
-    # Combined with the LPT scheduler's block reversal (spt=True), CTA 0
-    # maps to n_block=num_n-1 which gets lock=0 → never blocks.
+    # --------------------------------------------------------------------
+    # Lock values for deterministic dQ accumulation
+    # --------------------------------------------------------------------
+    # Background: multiple CTAs produce partial dQ contributions that all land
+    # on the same ``m_block`` (query tile). To make the reduction bitwise
+    # deterministic we force a fixed accumulation order via per-m_block
+    # semaphores: each entry gets a ``lock_value`` and the kernel executes
+    # ``wait_eq(dQ_sem[m], lock_value)`` before adding its contribution, then
+    # ``atomic_add(dQ_sem[m], 1)`` to hand off to the next one.
+    #
+    # We assign lock values in REVERSE order of the sorted sequence, so that
+    # the entry scheduled to run FIRST on the GPU carries ``lock=0`` (it
+    # never waits) and subsequent entries carry 1, 2, ... Combined with the
+    # LPT scheduler's block reversal (``spt=True``), CTA 0 maps to
+    # ``n_block = num_n - 1``, which lines up with the lock=0 slots so the
+    # chain never stalls on a CTA that hasn't launched yet.
+    #
+    # Running example (num_n = 3, total = 6):
+    #   sorted_flat = [ 0   5   2   5   0   5 ]     m_block ids
+    #   position        0   1   2   3   4   5
+    #                   └─ n0 ┘└─ n1 ┘└─ n2 ─┘
+    # m_block occurrences: m=0 twice, m=2 once, m=5 three times.
+
     positions = torch.arange(total, dtype=torch.int64, device=device)  # int64 (total,)
+    # ``num_m`` must cover every m_block id that appears, and also be at least
+    # ``num_n`` since the kernel indexes the semaphore array by m_block.
     num_m = max(num_n, int(sorted_flat.max().item()) + 1) if total > 0 else num_n
-    # one_hot[m, p] = 1 iff the p-th entry (across all n_blocks in sorted order)
-    # targets m_block m. cumsum along p gives, at each entry, how many prior
-    # entries touched the same m_block → per-m forward arrival index.
+
+    # ---- Step 1: forward arrival index per m_block -------------------------
+    # ``fwd_lock[p]`` = how many earlier entries (p' < p) in ``sorted_flat``
+    # already target the same m_block as entry p. I.e. "I am the k-th one to
+    # hit this m_block, counting from 0".
+    #
+    # Vectorized via one-hot + row-wise cumsum:
+    #   one_hot[m, p] = 1 iff sorted_flat[p] == m
+    #   cumcount[m, p] = number of entries at positions [0..p] with m_block==m
+    # Then fwd_lock[p] = cumcount[sorted_flat[p], p] - 1.
+    #
+    # For the example:
+    #   one_hot (rows m=0,2,5 shown; others all zero):
+    #                 p=0 p=1 p=2 p=3 p=4 p=5
+    #     m=0        [  1   0   0   0   1   0 ]
+    #     m=2        [  0   0   1   0   0   0 ]
+    #     m=5        [  0   1   0   1   0   1 ]
+    #   cumcount:
+    #     m=0        [  1   1   1   1   2   2 ]
+    #     m=2        [  0   0   1   1   1   1 ]
+    #     m=5        [  0   1   1   2   2   3 ]
+    #   fwd_lock   = [  0   0   0   1   1   2 ]
     one_hot = torch.zeros(num_m, total, dtype=torch.int32, device=device)  # int32 (num_m, total)
     one_hot[sorted_flat, positions] = 1
     cumcount = one_hot.cumsum(dim=1)                                       # int32 (num_m, total)
     fwd_lock = (cumcount[sorted_flat, positions] - 1).to(torch.int32)      # int32 (total,)
-    # Reverse: max_lock_per_m_block - forward_lock
+
+    # ---- Step 2: reverse into lock values ----------------------------------
+    # ``m_block_count[m]`` = total number of entries that target m_block m.
+    # Reversed lock: the LAST arrival (fwd_lock = count-1) gets lock 0, the
+    # second-to-last gets lock 1, etc., so the reduction chain completes in
+    # the reverse of the sorted sequence.
+    #
+    #   lock_values[p] = m_block_count[sorted_flat[p]] - 1 - fwd_lock[p]
+    #
+    # For the example:
+    #   m_block_count = [ 2, _, 1, _, _, 3 ]   (m=1,3,4 unused → 0)
+    #   lock_values   = [ 2-1-0, 3-1-0, 1-1-0, 3-1-1, 2-1-1, 3-1-2 ]
+    #                 = [   1,     2,     0,     1,     0,     0   ]
+    #
+    # Kernel-side usage of these lock values (per CTA / per n_block):
+    #   for i in range(combined_offset[n], combined_offset[n+1]):
+    #       m    = sorted_block_idx[i]
+    #       full = sorted_block_is_full[i]
+    #       # ... compute partial dQ for (n, m) ...
+    #       wait_eq(dQ_sem[m], dQ_lock_values[i])   # fixed predecessor chain
+    #       dQ[m] += partial_dQ
+    #       atomic_add(dQ_sem[m], 1)                # hand off to successor
     m_block_count = torch.zeros(num_m, dtype=torch.int32, device=device)   # int32 (num_m,)
     m_block_count.scatter_add_(0, sorted_flat.to(torch.int64),
                                torch.ones(total, dtype=torch.int32, device=device))
     lock_values = (m_block_count[sorted_flat] - 1 - fwd_lock)              # int32 (total,)
 
+    # --------------------------------------------------------------------
+    # Returned tensors (the "deterministic schedule table" consumed by the
+    # backward kernel). All four are aligned entry-by-entry along ``total``
+    # except for ``dQ_lock_combined_offset`` which partitions ``total`` by
+    # n_block:
+    #
+    #   dQ_lock_values         — int32 (total,)
+    #       Per-entry semaphore value the CTA must ``wait_eq`` on before
+    #       accumulating its partial dQ into ``dQ[m_block]``. Ordering is
+    #       REVERSED so the earliest-scheduled CTA (mapped to the last
+    #       n_block by LPT reversal) carries lock=0 and never blocks.
+    #
+    #   dQ_lock_combined_offset — int32 (num_n + 1,)
+    #       Prefix-sum boundaries. CTA handling n_block ``n`` reads the
+    #       slice ``[combined_offset[n], combined_offset[n+1])`` of the
+    #       three per-entry arrays below.
+    #
+    #   sorted_block_idx       — int32 (total,)
+    #       The sorted sequence of m_block ids each (n_block, entry) pair
+    #       targets. Within an n_block segment: sorted by m_block ascending,
+    #       mask entries before full entries on ties.
+    #
+    #   sorted_block_is_full   — int32 (total,)
+    #       0 = mask block (apply sparsity/causal mask in the kernel),
+    #       1 = full block (dense fast-path). Index-aligned with
+    #       ``sorted_block_idx``.
+    # --------------------------------------------------------------------
     return dict(
         dQ_lock_values=lock_values,
         dQ_lock_combined_offset=combined_offset,
