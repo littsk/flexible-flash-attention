@@ -8,7 +8,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.cute.arch import ProxyKind, SharedSpace
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
@@ -1165,7 +1164,7 @@ class FlashAttentionBackwardSm90:
         # This sync is to ensure (1) P is written in case of !mma_dkv_is_rs and
         # (2) dS is already read by the Mma in the previous iteration in case of mma_dkv_is_rs.
         if const_expr(not self.mma_dkv_is_rs or (self.PdS_stage == 1 and self.mma_dkv_is_rs)):
-            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=self.num_mma_threads
             )
@@ -1183,7 +1182,7 @@ class FlashAttentionBackwardSm90:
             mma_pdo_fn(tCrA=tdVrP, B_idx=smem_idx_dO, zero_init=not dKV_accumulate, wg_wait=-1)
 
         # smem fence to make sure sdS is written before it's read by WGMMA
-        cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.PdS), number_of_threads=self.num_mma_threads
         )
@@ -1207,7 +1206,7 @@ class FlashAttentionBackwardSm90:
         )
         tdQrdQaccum_flat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
         cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
-        cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
             number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
@@ -1273,7 +1272,7 @@ class FlashAttentionBackwardSm90:
         taccdVsdV = smem_thr_copy_dV.partition_D(sdV)
         cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
         # ensure smem writes are visible to TMA
-        cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
         )
@@ -1284,7 +1283,7 @@ class FlashAttentionBackwardSm90:
         taccdKsdK = smem_thr_copy_dK.partition_D(sdK)  # reuse sK SMEM
         cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
         # ensure smem writes are visible to TMA
-        cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+        cute.arch.fence_view_async_shared()
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
         )
