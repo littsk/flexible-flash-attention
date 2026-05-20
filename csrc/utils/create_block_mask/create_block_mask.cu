@@ -1,5 +1,6 @@
 #include "create_block_mask.h"
 #include <cassert>
+#include <cstdint>
 #include <cub/cub.cuh>
 
 #define DIVUP(x, y) (((x) + (y) - 1) / (y))
@@ -79,7 +80,7 @@ constexpr int WARP_SIZE_CONST = 32;
 template <int N_FUNC>
 __device__ __forceinline__ void load_func_to_registers(
     const int* func_ptr,
-    int stride_f,
+    int64_t stride_f,
     int* func_regs  // Must be a compile-time sized array
 ) {
     #pragma unroll
@@ -154,7 +155,7 @@ template <int N_FUNC>
 __device__ __forceinline__ void get_token_kv_range(
     const int* func_ptr,
     int n_func,
-    int stride_f,
+    int64_t stride_f,
     int& out_min_kv,
     int& out_max_kv
 ) {
@@ -216,7 +217,7 @@ template <int N_FUNC>
 __device__ __forceinline__ int get_token_kv_block_state(
     const int* func_ptr,
     int n_func,
-    int stride_f,
+    int64_t stride_f,
     int kv_start, 
     int kv_end
 ) {
@@ -625,7 +626,11 @@ __device__ __forceinline__ int block_reduce_state_bitmask(
 template <int N_FUNC, int Q_BLOCK_SIZE_T = 0, int KV_BLOCK_SIZE_T = 0>
 __global__ void create_q2k_block_sparse_from_func_kernel(
     const int* __restrict__ func_tensor,  // [B, H, n_func, func_q_len]
-    int stride_b, int stride_h, int stride_f, int stride_q,  // strides for func_tensor
+    // DEVIATION: strides are int64_t (not int) to avoid INT32 overflow at long
+    //   seqlen. The host-side launch helpers pass real PyTorch strides which
+    //   can exceed 2^31 for large H * n_func * func_q_len. See header file
+    //   docstrings for the matching rationale on the host wrappers.
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,  // strides for func_tensor
     int Q_LEN, int KV_LEN, int n_func,
     int Q_BLOCK_SIZE_RT, int KV_BLOCK_SIZE_RT,  // Runtime values (used when template param is 0)
     int num_q_blocks, int num_kv_blocks,
@@ -773,16 +778,27 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
     }
 #endif  // DISABLE_KV_RANGE_OPT
     
-    // Output tensor strides (contiguous layout)
+    // Output tensor strides (contiguous layout).
+    // DEVIATION: out_idx_stride_* and idx_base are int64_t (not int) because
+    //   for long sequences, num_q_blocks * num_kv_blocks alone can exceed
+    //   2^31 (e.g. seqlen=8M, tile=128 -> 65536^2 = 4.29e9). Computing the
+    //   offset into ``block_idx`` in int32 wraps around to a negative value
+    //   and produces an illegal memory access in the writeback below.
+    // Reason: ``block_idx`` is shape [B, H, num_q_blocks, num_kv_blocks];
+    //   element count grows like O(seqlen^2 / tile^2).
+    // Recovery: cnt_* offsets remain int because B*H*num_q_blocks is bounded
+    //   by ~num_q_blocks (B and H are small) and stays comfortably inside
+    //   int32 for any practical seqlen.
     int out_cnt_stride_b = H * num_q_blocks;
     int out_cnt_stride_h = num_q_blocks;
-    int out_idx_stride_b = H * num_q_blocks * num_kv_blocks;
-    int out_idx_stride_h = num_q_blocks * num_kv_blocks;
+    int64_t out_idx_stride_b = static_cast<int64_t>(H) * num_q_blocks * num_kv_blocks;
+    int64_t out_idx_stride_h = static_cast<int64_t>(num_q_blocks) * num_kv_blocks;
     int out_idx_stride_q = num_kv_blocks;
     
     // Output offsets
     int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + q_block;
-    int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + q_block * out_idx_stride_q;
+    int64_t idx_base = b * out_idx_stride_b + h * out_idx_stride_h
+                     + static_cast<int64_t>(q_block) * out_idx_stride_q;
     
     // Counters
     int mask_count = 0;
@@ -899,7 +915,9 @@ __global__ void create_q2k_block_sparse_from_func_kernel(
 template <int N_FUNC>
 __global__ void compute_q_block_kv_range_kernel(
     const int* __restrict__ func_tensor,  // [B, H, n_func, func_q_len]
-    int stride_b, int stride_h, int stride_f, int stride_q,  // strides for func_tensor
+    // DEVIATION: strides are int64_t to avoid INT32 overflow at long seqlen.
+    //   See matching block in create_q2k_block_sparse_from_func_kernel.
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,  // strides for func_tensor
     int Q_LEN, int n_func,
     int Q_BLOCK_SIZE,
     int num_q_blocks,
@@ -985,7 +1003,9 @@ __global__ void compute_q_block_kv_range_kernel(
 template <int N_FUNC, int Q_BLOCK_SIZE_T = 0, int KV_BLOCK_SIZE_T = 0>
 __global__ void create_k2q_block_sparse_from_func_kernel(
     const int* __restrict__ func_tensor,  // [B, H, n_func, func_q_len]
-    int stride_b, int stride_h, int stride_f, int stride_q,  // strides for func_tensor
+    // DEVIATION: strides are int64_t to avoid INT32 overflow at long seqlen.
+    //   See matching block in create_q2k_block_sparse_from_func_kernel.
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,  // strides for func_tensor
     int Q_LEN, int KV_LEN, int n_func,
     int Q_BLOCK_SIZE_RT, int KV_BLOCK_SIZE_RT,  // Runtime values (used when template param is 0)
     int num_q_blocks, int num_kv_blocks,
@@ -1029,16 +1049,27 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
     // Base pointer for func_tensor at [b, h, 0, 0]
     const int* base_func_ptr = func_tensor + b * stride_b + h * stride_h;
     
-    // Output tensor strides (contiguous layout)
+    // Output tensor strides (contiguous layout).
+    // DEVIATION: out_idx_stride_* and idx_base are int64_t (not int) because
+    //   for long sequences num_kv_blocks * num_q_blocks alone can exceed 2^31
+    //   (e.g. seqlen=8M, tile=128 -> 65536^2 = 4.29e9). Computing the offset
+    //   into ``block_idx`` in int32 wraps around to a negative value and
+    //   produces an illegal memory access in the writeback below.
+    // Reason: ``block_idx`` is shape [B, H, num_kv_blocks, num_q_blocks];
+    //   element count grows like O(seqlen^2 / tile^2).
+    // Recovery: cnt_* offsets and precompute_base remain int because their
+    //   element count is bounded by B*H*max(num_q_blocks, num_kv_blocks) and
+    //   stays inside int32 for any practical seqlen.
     int out_cnt_stride_b = H * num_kv_blocks;
     int out_cnt_stride_h = num_kv_blocks;
-    int out_idx_stride_b = H * num_kv_blocks * num_q_blocks;
-    int out_idx_stride_h = num_kv_blocks * num_q_blocks;
+    int64_t out_idx_stride_b = static_cast<int64_t>(H) * num_kv_blocks * num_q_blocks;
+    int64_t out_idx_stride_h = static_cast<int64_t>(num_kv_blocks) * num_q_blocks;
     int out_idx_stride_kv = num_q_blocks;
     
     // Output offsets
     int cnt_offset = b * out_cnt_stride_b + h * out_cnt_stride_h + kv_block;
-    int idx_base = b * out_idx_stride_b + h * out_idx_stride_h + kv_block * out_idx_stride_kv;
+    int64_t idx_base = b * out_idx_stride_b + h * out_idx_stride_h
+                     + static_cast<int64_t>(kv_block) * out_idx_stride_kv;
     
     // Precomputed q_block kv range offset (if available)
     int precompute_base = b * H * num_q_blocks + h * num_q_blocks;
@@ -1249,7 +1280,7 @@ __global__ void create_k2q_block_sparse_from_func_kernel(
 
 void launch_create_q2k_block_sparse_from_func(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B, int H, int Q_LEN, int KV_LEN, int n_func,
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     bool check_q_boundary,
@@ -1313,7 +1344,7 @@ void launch_create_q2k_block_sparse_from_func(
 
 void launch_compute_q_block_kv_range(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B, int H, int Q_LEN, int n_func,
     int Q_BLOCK_SIZE,
     int* d_q_block_kv_min,
@@ -1374,7 +1405,7 @@ void launch_compute_q_block_kv_range(
 
 void launch_create_k2q_block_sparse_from_func(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B, int H, int Q_LEN, int KV_LEN, int n_func,
     int Q_BLOCK_SIZE, int KV_BLOCK_SIZE,
     const int* d_q_block_kv_min,  // precomputed min kv for each q_block (can be nullptr)
@@ -1469,12 +1500,16 @@ __global__ void extract_compact_indices_kernel(
     const int* __restrict__ full_cnt,         // [n_blocks]
     const int* __restrict__ mask_offset,      // [n_blocks + 1]
     const int* __restrict__ full_offset,      // [n_blocks + 1]
-    int n_blocks,
-    int max_blocks,
+    int64_t n_blocks,
+    int64_t max_blocks,
     int* __restrict__ mask_idx_compact,       // [total_mask_blocks]
     int* __restrict__ full_idx_compact        // [total_full_blocks]
 ) {
-    int row = blockIdx.x;
+    // DEVIATION: row indexes a flattened [B*H*num_outer_blocks] grid; it is
+    //   bounded by gridDim.x (<= 2^31-1) so int32 suffices. But row*max_blocks
+    //   below can exceed 2^31 when both dims are large, so the pointer
+    //   arithmetic must be done in int64 (see row_ptr computation).
+    int64_t row = blockIdx.x;
     if (row >= n_blocks) return;
     
     int tid = threadIdx.x;
@@ -1484,6 +1519,9 @@ __global__ void extract_compact_indices_kernel(
     int foff = full_offset[row];
     int moff = mask_offset[row];
     
+    // row * max_blocks is the bug-prone term: both factors can be >= ~65k for
+    // long seqlen, producing a > 2^31 offset that wraps in int32. Both
+    // operands are int64 here so the multiplication stays in int64.
     const int* row_ptr = block_idx + row * max_blocks;
     
     // Extract full indices (left-to-right, no reversal needed)
@@ -1505,14 +1543,21 @@ void launch_extract_compact_indices(
     const int* d_full_block_cnt,
     const int* d_mask_block_offset,
     const int* d_full_block_offset,
-    int n_blocks,
-    int max_blocks,
+    int64_t n_blocks,
+    int64_t max_blocks,
     int* d_mask_block_idx,
     int* d_full_block_idx,
     cudaStream_t stream
 ) {
+    // DEVIATION: n_blocks is bounded by gridDim.x's 2^31-1 limit, which is
+    //   always satisfied at any realistic seqlen since B*H*num_outer_blocks
+    //   stays well below 2^31 (e.g. seqlen=8M -> num_outer_blocks=65536, B*H
+    //   typically O(1)-O(100)). max_blocks however can be ~65k for long
+    //   seqlen, and the kernel multiplies row * max_blocks for pointer
+    //   arithmetic so that product must be int64. See the kernel body.
     int threads_per_block = 256;
-    extract_compact_indices_kernel<<<n_blocks, threads_per_block, 0, stream>>>(
+    int grid_x = static_cast<int>(n_blocks);
+    extract_compact_indices_kernel<<<grid_x, threads_per_block, 0, stream>>>(
         d_block_idx,
         d_mask_block_cnt, d_full_block_cnt,
         d_mask_block_offset, d_full_block_offset,
@@ -1609,14 +1654,17 @@ void launch_dual_inclusive_sum(
     const int* d_full_cnt,
     int* d_mask_offset,
     int* d_full_offset,
-    int n_elements,         // Number of count elements (B * H * num_blocks)
+    int64_t n_elements,     // Number of count elements (B * H * num_blocks)
     cudaStream_t stream
 ) {
-    // Launch single CTA to process all elements
-    // Kernel writes offset[0] = 0 and offset[i+1] = inclusive_sum(cnt[0..i])
+    // DEVIATION: kernel param is int because n_elements counts the *outer*
+    //   block dim only (B*H*num_outer_blocks), which stays comfortably below
+    //   2^31 for any realistic seqlen even with B*H in the thousands. The
+    //   wider int64 here just keeps the host-side signature consistent with
+    //   the *inner* block-idx kernel which can overflow.
     dual_inclusive_sum_kernel<<<1, SCAN_BLOCK_SIZE, 0, stream>>>(
         d_mask_cnt, d_full_cnt,
         d_mask_offset, d_full_offset,
-        n_elements
+        static_cast<int>(n_elements)
     );
 }

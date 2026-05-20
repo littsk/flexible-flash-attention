@@ -167,11 +167,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_q2k_block_sparse_from_func
     int n_func = func_tensor.size(2);
     int func_q_len = func_tensor.size(3);
 
-    // Get strides for non-contiguous tensor support
-    int stride_b = func_tensor.stride(0);
-    int stride_h = func_tensor.stride(1);
-    int stride_f = func_tensor.stride(2);
-    int stride_q = func_tensor.stride(3);
+    // Get strides for non-contiguous tensor support.
+    // DEVIATION: must be int64_t (not int) because for very long sequences
+    //   (e.g. seqlen ~ millions), stride_b/stride_h = H * n_func * func_q_len
+    //   easily exceeds INT32_MAX. Truncating to int wraps around to a
+    //   negative offset, which then makes the kernel do an illegal memory
+    //   access on the func tensor.
+    // Reason: PyTorch native strides are int64_t; preserving the wider type
+    //   end-to-end into the kernel avoids silent truncation at any layer.
+    // Recovery: none -- this is a fix for a real out-of-bounds; no original
+    //   "int stride" value to recover.
+    int64_t stride_b = func_tensor.stride(0);
+    int64_t stride_h = func_tensor.stride(1);
+    int64_t stride_f = func_tensor.stride(2);
+    int64_t stride_q = func_tensor.stride(3);
 
     // Check that func_tensor has enough padding to avoid bounds checking in kernel
     TORCH_CHECK(func_q_len >= Q_LEN + 256, 
@@ -261,11 +270,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> create_k2q_block_sparse_from_func
     int n_func = func_tensor.size(2);
     int func_q_len = func_tensor.size(3);
 
-    // Get strides for non-contiguous tensor support
-    int stride_b = func_tensor.stride(0);
-    int stride_h = func_tensor.stride(1);
-    int stride_f = func_tensor.stride(2);
-    int stride_q = func_tensor.stride(3);
+    // Get strides for non-contiguous tensor support.
+    // DEVIATION: see matching block in create_q2k_block_sparse_from_func --
+    //   strides must be int64_t to avoid silent truncation at long seqlen.
+    int64_t stride_b = func_tensor.stride(0);
+    int64_t stride_h = func_tensor.stride(1);
+    int64_t stride_f = func_tensor.stride(2);
+    int64_t stride_q = func_tensor.stride(3);
 
     // Check that func_tensor has enough padding to avoid bounds checking in kernel
     TORCH_CHECK(func_q_len >= Q_LEN + 256, 

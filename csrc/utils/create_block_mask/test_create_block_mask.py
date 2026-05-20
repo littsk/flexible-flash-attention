@@ -385,6 +385,134 @@ def test_k2q_random_mask(seqlen_q, seqlen_k, n_func, Q_BLOCK_SIZE, KV_BLOCK_SIZE
 
 
 # =============================================================================
+# Long-seqlen regression: INT32 overflow in kernel offset arithmetic
+# =============================================================================
+
+# Free-memory budget required by the long-seqlen overflow regression below.
+# Worst-case allocations on the chosen seqlen=6M, tile=128 config (B=H=1):
+#   - block_idx          : num_blocks ** 2 * 4 B = 49152 ** 2 * 4 ~= 9.66 GiB
+#                          (per kernel: Q2K *and* K2Q each allocate one such
+#                          tensor and the second runs while the first's
+#                          temporaries linger inside compact_block_idx)
+#   - func_tensor         : ~ 24 MiB
+#   - q_block_kv_min/max  : ~ 0.5 MiB
+# We require ~24 GiB free to be safe across allocator fragmentation and the
+# brief overlap during compact_block_idx.
+_LONG_SEQLEN_OVERFLOW_FREE_MEM_BYTES = 24 * 1024 ** 3
+
+
+def _has_enough_free_cuda_mem(min_free_bytes: int) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    free, _total = torch.cuda.mem_get_info()
+    return free >= min_free_bytes
+
+
+@pytest.mark.skipif(create_block_mask_cuda is None, reason="CUDA kernel not built")
+@pytest.mark.skipif(
+    not _has_enough_free_cuda_mem(_LONG_SEQLEN_OVERFLOW_FREE_MEM_BYTES),
+    reason=(
+        "long-seqlen INT32 overflow regression requires "
+        f"~{_LONG_SEQLEN_OVERFLOW_FREE_MEM_BYTES // 1024 ** 3} GiB free CUDA memory"
+    ),
+)
+def test_long_seqlen_int32_offset_overflow_regression():
+    """Regression: pre-fix the kernel computed ``idx_base`` into ``block_idx``
+    in int32, so once ``(num_blocks - 1) * num_blocks`` exceeded ``INT32_MAX``
+    the kernel did an illegal memory access on the writeback. Same bug was
+    present in the matching strides and in ``extract_compact_indices_kernel``.
+
+    seqlen = 6 * 1024 * 1024 with tile = 128 gives num_blocks = 49152 and
+    ``(49152 - 1) * 49152 = 2_415_869_952 > INT32_MAX (2_147_483_647)`` --
+    i.e. the very smallest seqlen on a B=H=1 config that exercises the
+    overflow without being so large that ``compact_block_idx``'s int32
+    output buffers themselves overflow (a *separate* int32 limitation that
+    is not what we are pinning here).
+
+    We use a causal pattern instead of full attention because the
+    ``compact_block_idx`` postprocess stores the total full/partial count
+    as int32, and a full-attention pattern at this seqlen would also
+    overflow *that* int32 (total_full ~ N^2 ~ 2.4e9). Causal gives
+    total_full ~ N^2 / 2 ~ 1.2e9 which stays inside int32.
+
+    DEVIATION: this test exercises one specific kernel configuration only
+    (B=H=1, n_func=1, tile=128, causal). Smaller tiles or larger B*H would
+    push the overflow boundary lower in seqlen but each costs O(8-10 GiB)
+    of block_idx allocation, so we pick the single smallest seqlen that
+    crosses the boundary.
+    Reason: covering the full Cartesian product would burn dozens of GiB
+        of GPU memory per test invocation and would not add coverage --
+        the int32 overflow is a single property of the kernel's offset
+        arithmetic, not a property of the tile/head split.
+    Recovery: if a future change reintroduces the overflow on a path not
+        exercised here (e.g. extract_compact_indices for a different
+        outer-dim layout), add a separate regression with its own
+        skipif-memory guard.
+    """
+    B, H, n_func = 1, 1, 1
+    seqlen = 6 * 1024 * 1024  # 6 MiB tokens
+    q_block, kv_block = 128, 128
+    num_blocks = (seqlen + q_block - 1) // q_block
+    assert (num_blocks - 1) * num_blocks > (1 << 31) - 1, (
+        f"test sentinel: expected (N-1)*N to exceed INT32_MAX to actually "
+        f"exercise the overflow, got N={num_blocks}"
+    )
+
+    # Causal pattern: q_token at position i sees kv positions [0, i+1).
+    # n_func=1 encodes that as a single right edge per token.
+    func_tensor = torch.zeros(
+        B, H, n_func, seqlen + 256, dtype=torch.int32, device="cuda"
+    )
+    q_idx = torch.arange(seqlen, dtype=torch.int32, device="cuda")
+    func_tensor[0, 0, 0, :seqlen] = q_idx + 1
+
+    # Q2K (forward): if the int32 overflow were still present, this call
+    # would hit illegal-memory-access inside ``create_q2k_block_sparse_from_func_kernel``
+    # at the ``block_idx[idx_base + ...]`` writeback.
+    q2k = create_block_mask_cuda.create_q2k_csr_sparse_from_func(
+        func_tensor, seqlen, seqlen,
+        Q_BLOCK_SIZE=q_block, KV_BLOCK_SIZE=kv_block,
+        check_q_boundary=False,
+    )
+    # K2Q (backward): same kernel-side overflow path with a different layout.
+    k2q = create_block_mask_cuda.create_k2q_csr_sparse_from_func(
+        func_tensor, seqlen, seqlen,
+        Q_BLOCK_SIZE=q_block, KV_BLOCK_SIZE=kv_block,
+    )
+    # An async illegal memory access would surface here, not earlier --
+    # cuda errors are sticky on the stream so this sync is the meaningful
+    # assertion that no overflow-induced wild write happened.
+    torch.cuda.synchronize()
+
+    # Sanity: causal at num_blocks = N has exactly N (one per outer block)
+    # diagonal partials on each side and (N * (N - 1) / 2) fulls below the
+    # diagonal. Anything else means the kernel silently miscounted (a
+    # plausible failure mode if a future change "fixes" the overflow by
+    # masking the high bits instead of widening the offset).
+    _q_mask_cnt, q_mask_off, _q_mask_idx, _q_full_cnt, q_full_off, _q_full_idx = q2k
+    _k_mask_cnt, k_mask_off, _k_mask_idx, _k_full_cnt, k_full_off, _k_full_idx = k2q
+
+    expected_full = num_blocks * (num_blocks - 1) // 2
+    expected_mask = num_blocks  # one diagonal block per outer block
+    assert q_full_off[-1].item() == expected_full, (
+        f"Q2K full count mismatch: got {q_full_off[-1].item()}, "
+        f"expected {expected_full}"
+    )
+    assert q_mask_off[-1].item() == expected_mask, (
+        f"Q2K mask count mismatch: got {q_mask_off[-1].item()}, "
+        f"expected {expected_mask}"
+    )
+    assert k_full_off[-1].item() == expected_full, (
+        f"K2Q full count mismatch: got {k_full_off[-1].item()}, "
+        f"expected {expected_full}"
+    )
+    assert k_mask_off[-1].item() == expected_mask, (
+        f"K2Q mask count mismatch: got {k_mask_off[-1].item()}, "
+        f"expected {expected_mask}"
+    )
+
+
+# =============================================================================
 # Special Pattern Tests
 # =============================================================================
 

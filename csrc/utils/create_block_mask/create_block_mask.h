@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cuda_runtime.h>
 
 /**
@@ -49,7 +50,7 @@
  */
 void launch_create_q2k_block_sparse_from_func(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B,
     int H,
     int Q_LEN,
@@ -93,7 +94,7 @@ void launch_create_q2k_block_sparse_from_func(
  */
 void launch_compute_q_block_kv_range(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B,
     int H,
     int Q_LEN,
@@ -141,7 +142,7 @@ void launch_compute_q_block_kv_range(
  */
 void launch_create_k2q_block_sparse_from_func(
     const int* d_func_tensor,
-    int stride_b, int stride_h, int stride_f, int stride_q,
+    int64_t stride_b, int64_t stride_h, int64_t stride_f, int64_t stride_q,
     int B,
     int H,
     int Q_LEN,
@@ -197,8 +198,8 @@ void launch_extract_compact_indices(
     const int* d_full_block_cnt,
     const int* d_mask_block_offset,
     const int* d_full_block_offset,
-    int n_blocks,
-    int max_blocks,
+    int64_t n_blocks,
+    int64_t max_blocks,
     int* d_mask_block_idx,
     int* d_full_block_idx,
     cudaStream_t stream = nullptr
@@ -226,7 +227,7 @@ void launch_dual_inclusive_sum(
     const int* d_full_cnt,
     int* d_mask_offset,
     int* d_full_offset,
-    int n_elements,
+    int64_t n_elements,
     cudaStream_t stream = nullptr
 );
 
