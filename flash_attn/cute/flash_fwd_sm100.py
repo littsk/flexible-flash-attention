@@ -45,8 +45,11 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
+    get_total_block_count_linear_sm100,
     produce_block_sparse_loads_sm100,
+    produce_block_sparse_loads_sm100_linear,
     softmax_block_sparse_sm100,
+    softmax_block_sparse_sm100_linear,
     handle_block_sparse_empty_tile_correction_sm100,
 )
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
@@ -129,6 +132,8 @@ class FlashAttentionForwardSm100:
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
+        is_arbitrary: bool = False,
+        arbitrary_func_num: cutlass.Constexpr[int] = 0,
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
@@ -159,7 +164,7 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_103f, "Only SM 10.x Blackwell family is supported"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -174,6 +179,8 @@ class FlashAttentionForwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_arbitrary = is_arbitrary
+        self.arbitrary_func_num = arbitrary_func_num
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -225,7 +232,7 @@ class FlashAttentionForwardSm100:
 
         if is_varlen_q:
             self.TileScheduler = SingleTileVarlenScheduler
-        elif self.is_causal or self.is_local or self.use_clc_scheduler:
+        elif self.is_causal or self.is_local or self.is_arbitrary or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
         elif self.is_persistent:
             self.TileScheduler = StaticPersistentTileScheduler
@@ -628,7 +635,8 @@ class FlashAttentionForwardSm100:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         TileScheduler = self.TileScheduler
-        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
+        use_cluster_idx = self.cta_group_size > 1 and TileScheduler is not StaticPersistentTileScheduler
+        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if use_cluster_idx else 1)
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
             cute.size(mQ.shape[2]),
@@ -650,10 +658,10 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
-            lpt=self.is_causal or self.is_local,
+            lpt=self.is_causal or self.is_local or self.is_arbitrary,
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
-            use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
+            use_cluster_idx=use_cluster_idx,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -726,7 +734,6 @@ class FlashAttentionForwardSm100:
             assert const_expr(blocksparse_tensors.cu_total_m_blocks is not None), (
                 "blocksparse_tensors.cu_total_m_blocks must be provided for varlen blocksparsity"
             )
-
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -1494,24 +1501,43 @@ class FlashAttentionForwardSm100:
                             kv_producer_state.advance()
 
             else:
-                kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    seqlen,
-                    split_idx,
-                    num_splits,
-                    kv_producer_state,
-                    load_Q,
-                    load_K,
-                    load_V,
-                    pipeline_kv,
-                    self.q_stage,
-                    q_producer_phase,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                )
+                if const_expr(
+                    blocksparse_tensors.mask_block_offset is not None and not self.is_split_kv
+                ):
+                    kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100_linear(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        kv_producer_state,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        pipeline_kv,
+                        self.q_stage,
+                        q_producer_phase,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
+                else:
+                    kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        split_idx,
+                        num_splits,
+                        kv_producer_state,
+                        load_Q,
+                        load_K,
+                        load_V,
+                        pipeline_kv,
+                        self.q_stage,
+                        q_producer_phase,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
 
 
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1644,17 +1670,29 @@ class FlashAttentionForwardSm100:
             process_tile = False
 
             if const_expr(self.use_block_sparsity):
-                block_iter_count = get_total_block_count(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    split_idx,
-                    num_splits,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                    seqlen_info=seqlen,
-                )
+                if const_expr(
+                    blocksparse_tensors.mask_block_offset is not None and not self.is_split_kv
+                ):
+                    block_iter_count = get_total_block_count_linear_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
+                else:
+                    block_iter_count = get_total_block_count(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        split_idx,
+                        num_splits,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                        seqlen_info=seqlen,
+                    )
                 process_tile = block_iter_count > Int32(0)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -1948,6 +1986,9 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
+                use_2cta_instrs=self.use_2cta_instrs,
+                softmax_tidx=tidx,
+                cta_m_rank=thr_mma_qk.thr_idx,
             )
 
             # Recompute fastdiv_mods if necessary
@@ -1973,6 +2014,8 @@ class FlashAttentionForwardSm100:
             mask_fn = partial(
                 mask.apply_mask_sm100,
                 mask_mod=mask_mod,
+                mask_arbitrary=self.is_arbitrary,
+                func_num=self.arbitrary_func_num,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 **shared_mask_kwargs,
@@ -1982,6 +2025,8 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = partial(
                     mask.apply_mask_sm100,
                     mask_mod=None,
+                    mask_arbitrary=False,
+                    func_num=0,
                     fastdiv_mods=fastdiv_mods,
                     head_divmod=head_divmod,
                     **shared_mask_kwargs,
@@ -2013,17 +2058,29 @@ class FlashAttentionForwardSm100:
             softmax.reset()
 
             if const_expr(self.use_block_sparsity):
-                tile_block_count = get_total_block_count(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    split_idx,
-                    num_splits,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                    seqlen_info=seqlen,
-                )
+                if const_expr(
+                    blocksparse_tensors.mask_block_offset is not None and not self.is_split_kv
+                ):
+                    tile_block_count = get_total_block_count_linear_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
+                else:
+                    tile_block_count = get_total_block_count(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        split_idx,
+                        num_splits,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                        seqlen_info=seqlen,
+                    )
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
@@ -2063,38 +2120,75 @@ class FlashAttentionForwardSm100:
             if const_expr(self.use_block_sparsity):
                 # When aux_tensors exist, Q indices beyond seqlen_q must be wrapped to avoid
                 # OOB aux_tensor access. Only edge tiles (where m_tile_end > seqlen_q) need this.
-                if const_expr(aux_tensors is not None):
+                if const_expr(self.is_arbitrary):
+                    check_m_boundary = False
+                elif const_expr(aux_tensors is not None):
                     m_tile_end = ((self.q_stage * m_block + stage + 1) * self.cta_group_size) * self.m_block_size
-                    check_m_boundary = m_tile_end > seqlen.seqlen_q
+                    seqlen_q_packed = (
+                        seqlen.seqlen_q * self.qhead_per_kvhead
+                        if const_expr(self.pack_gqa)
+                        else seqlen.seqlen_q
+                    )
+                    check_m_boundary = m_tile_end > seqlen_q_packed
                 else:
                     check_m_boundary = False
-                (
-                    mma_si_consumer_phase,
-                    sm_stats_producer_phase,
-                    s0_s1_sequence_phase,
-                    empty_tile,
-                ) = softmax_block_sparse_sm100(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    seqlen,
-                    split_idx,
-                    num_splits,
-                    softmax_step,
-                    mask_fn,
-                    mask_fn_none,
-                    mma_si_consumer_phase,
-                    sm_stats_producer_phase,
-                    s0_s1_sequence_phase,
-                    pipeline_sm_stats,
-                    sm_stats_barrier,
-                    self.q_stage,
-                    Int32(stage),
-                    check_m_boundary,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                )
+                if const_expr(
+                    blocksparse_tensors.mask_block_offset is not None and not self.is_split_kv
+                ):
+                    (
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        empty_tile,
+                    ) = softmax_block_sparse_sm100_linear(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        softmax_step,
+                        mask_fn,
+                        mask_fn_none,
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        pipeline_sm_stats,
+                        sm_stats_barrier,
+                        self.q_stage,
+                        Int32(stage),
+                        check_m_boundary,
+                        self.is_arbitrary,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
+                else:
+                    (
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        empty_tile,
+                    ) = softmax_block_sparse_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        split_idx,
+                        num_splits,
+                        softmax_step,
+                        mask_fn,
+                        mask_fn_none,
+                        mma_si_consumer_phase,
+                        sm_stats_producer_phase,
+                        s0_s1_sequence_phase,
+                        pipeline_sm_stats,
+                        sm_stats_barrier,
+                        self.q_stage,
+                        Int32(stage),
+                        check_m_boundary,
+                        self.is_arbitrary,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
@@ -2108,6 +2202,16 @@ class FlashAttentionForwardSm100:
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
+                # Dense arbitrary-mask tiles can still have invalid packed-Q rows,
+                # e.g. pack-GQA with LPT scheduling the tail M tile first.
+                if const_expr(aux_tensors is not None):
+                    m_tile_end = ((self.q_stage * m_block + stage + 1) * self.cta_group_size) * self.m_block_size
+                    seqlen_q_packed = (
+                        seqlen.seqlen_q * self.qhead_per_kvhead if const_expr(self.pack_gqa) else seqlen.seqlen_q
+                    )
+                    check_m_boundary = m_tile_end > seqlen_q_packed
+                else:
+                    check_m_boundary = False
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
                     mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                         mma_si_consumer_phase,
@@ -2115,7 +2219,7 @@ class FlashAttentionForwardSm100:
                         s0_s1_sequence_phase,
                         n_block_max - 1,
                         is_first=True,
-                        mask_fn=partial(mask_fn, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
                     )
                     n_block_max -= 1
                     # Next couple of iterations with causal masking
@@ -2131,7 +2235,11 @@ class FlashAttentionForwardSm100:
                                     sm_stats_producer_phase,
                                     s0_s1_sequence_phase,
                                     n_block,
-                                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    mask_fn=partial(
+                                        mask_fn,
+                                        mask_seqlen=False,
+                                        check_q_boundary=check_m_boundary,
+                                    ),
                                 )
                             )
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
@@ -2144,7 +2252,11 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.mask_mod is not None):
                             mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
-                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                                mask_fn=partial(
+                                    mask_fn,
+                                    mask_seqlen=False,
+                                    check_q_boundary=check_m_boundary,
+                                ),
                             )
                         else:
                             mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
@@ -2161,7 +2273,11 @@ class FlashAttentionForwardSm100:
                                     sm_stats_producer_phase,
                                     s0_s1_sequence_phase,
                                     n_block,
-                                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    mask_fn=partial(
+                                        mask_fn,
+                                        mask_seqlen=False,
+                                        check_q_boundary=check_m_boundary,
+                                    ),
                                 )
                             )
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
@@ -2431,17 +2547,29 @@ class FlashAttentionForwardSm100:
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
-                total_block_count = get_total_block_count(
-                    blocksparse_tensors,
-                    batch_idx,
-                    head_idx,
-                    m_block,
-                    split_idx,
-                    num_splits,
-                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                    seqlen_info=seqlen,
-                )
+                if const_expr(
+                    blocksparse_tensors.mask_block_offset is not None and not self.is_split_kv
+                ):
+                    total_block_count = get_total_block_count_linear_sm100(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    )
+                else:
+                    total_block_count = get_total_block_count(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        split_idx,
+                        num_splits,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                        seqlen_info=seqlen,
+                    )
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min

@@ -225,7 +225,8 @@ public:
                         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                     };
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord);
+                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,
+                                  params.mainloop.block_sparse);
                 }
                 mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
@@ -235,7 +236,7 @@ public:
                     auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                     auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
                     cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord);
+                    mainloop.store_dq(params.mainloop, shared_storage, block_coord, params.mainloop.block_sparse);
                 }
             }
         } else {  // Consumer
@@ -263,7 +264,8 @@ public:
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage,
+                    params.mainloop.block_sparse);
                 if (tile_valid) {
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
                                    threadIdx.x - NumCopyThreads, block_coord);

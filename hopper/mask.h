@@ -41,13 +41,26 @@ struct Mask {
     {
     };
 
+    // Overload without gMaskFunc for non-arbitrary mask
     template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
         typename Engine, typename Layout>
     CUTLASS_DEVICE
     void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
+        apply<Seqlenk_mask, Causal_mask, Local_mask, false /*Arbitrary_mask*/, 0 /*kNFunc*/>(tSrS, m_block, n_block, static_cast<void*>(nullptr));
+    }
+
+    // Full version with gMaskFunc for arbitrary mask support
+    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
+        bool Arbitrary_mask=false, int kNFunc=0,
+        typename Engine, typename Layout, typename MaskFuncTensor>
+    CUTLASS_DEVICE
+    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
+               MaskFuncTensor const* gMaskFunc) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
+        static_assert(!(Arbitrary_mask && (Causal_mask || Local_mask)), "Arbitrary_mask cannot be combined with Causal_mask or Local_mask");
+        static_assert(!Arbitrary_mask || kNFunc > 0, "When Arbitrary_mask is true, kNFunc must be > 0");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
-        if (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
+        if (!Seqlenk_mask && !Causal_mask && !Local_mask && !Arbitrary_mask) { return; }
 
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
         auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
@@ -64,7 +77,7 @@ struct Mask {
         // So we subtract the limit by the first col index of this thread (get<Col>(tScS_rowcol(_0{}, _0{})))
         int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
         int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;
-        if constexpr (!Causal_mask && !Local_mask) {
+        if constexpr (!Causal_mask && !Local_mask && !Arbitrary_mask) {
             if constexpr (Seqlenk_mask) {  // Just masking based on col
                 #pragma unroll
                 for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
@@ -74,7 +87,49 @@ struct Mask {
                     }
                 }
             }
-        } else {  // mask based on both row and col
+        } else if constexpr (Arbitrary_mask) {  // Arbitrary mask based on mask function intervals
+            //   gMaskFunc has shape (kNFunc, kBlockM), where kNFunc is odd
+            //   For each row, stores valid column ranges:
+            //   col_max[0]   = gMaskFunc(0, row_idx_local) - first valid range upper bound
+            //   col_min[i]   = gMaskFunc(2*i+1, row_idx_local) - (i+1)th valid range lower bound
+            //   col_max[i+1] = gMaskFunc(2*i+2, row_idx_local) - (i+1)th valid range upper bound
+            static constexpr int kNumIntervals = kNFunc / 2;  // Number of additional intervals
+            #pragma unroll
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                int const row_idx_local = get<Row>(tScS_rowcol(m, _0{}));
+                int const global_row_idx = row_idx_local + m_block * kBlockM;
+                // Read col_max[0] from gMaskFunc
+                int col_max_0 = (*gMaskFunc)(0, row_idx_local);
+                // Read col_min[i] and col_max[i+1] for additional intervals
+                int col_min[kNumIntervals > 0 ? kNumIntervals : 1];
+                int col_max[kNumIntervals + 1];
+                col_max[0] = col_max_0;
+                #pragma unroll
+                for (int i = 0; i < kNumIntervals; ++i) {
+                    col_min[i] = (*gMaskFunc)(2 * i + 1, row_idx_local);
+                    col_max[i + 1] = (*gMaskFunc)(2 * i + 2, row_idx_local);
+                }
+                #pragma unroll
+                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    int const col_idx_local = int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                    int const global_col_idx = col_idx_local + n_block * kBlockN + thread_col_offset;
+                    // Check if global_col_idx is in valid interval [0, col_max[0]) or any [col_min[i], col_max[i+1])
+                    bool value_valid = global_col_idx < col_max[0];
+                    #pragma unroll
+                    for (int i = 0; i < kNumIntervals; ++i) {
+                        if (global_col_idx >= col_min[i] && global_col_idx < col_max[i + 1]) {
+                            value_valid = true;
+                        }
+                    }
+                    if constexpr (Seqlenk_mask) {
+                        bool const out_of_bounds = (global_row_idx >= seqlen_q) || (global_col_idx >= seqlen_k);
+                        if (out_of_bounds || !value_valid) { tSrS_rowcol(m, n) = -INFINITY; }
+                    } else {
+                        if (!value_valid) { tSrS_rowcol(m, n) = -INFINITY; }
+                    }
+                }
+            }
+        } else {  // Causal or Local mask based on both row and col
             if constexpr (!SwapAB) {
                 // If PackGQA, we split the work of compute divmod among threads in the same row
                 static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{});

@@ -515,6 +515,10 @@ class SingleTileLPTScheduler:
             return SingleTileLPTScheduler(
                 params, cute.arch.block_idx()[0], Int32(0), clc, loc=loc, ip=ip
             )
+        if const_expr(params.use_cluster_idx):
+            tile_idx = cute.arch.cluster_idx()[0]
+            split_idx = cute.arch.block_idx()[1]
+            return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
         tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
@@ -527,6 +531,8 @@ class SingleTileLPTScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             return SingleTileLPTScheduler._clc_grid_shape(params)
+        if const_expr(params.use_cluster_idx):
+            return (params.total_blocks * params.cluster_shape_m, params.num_splits, Int32(1))
         return (params.total_blocks, params.num_splits, Int32(1))
 
     @cute.jit

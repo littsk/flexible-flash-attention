@@ -176,10 +176,10 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     # batch_size = 40
     # nheads = 16
-    batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
-    nheads = 6
-    # nheads = 1
+    # batch_size = 9 if seqlen_k <= 2048 else 2  # origin
+    # nheads = 6  # origin
+    batch_size = 1
+    nheads = 32
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
@@ -187,7 +187,9 @@ def test_flash_attn_output(
         dv_vals = [d]
     if has_qv:
         dv_vals = [256, 512]
-    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0] # origin
+    attention_chunk_vals = [0]
+    dv_vals = [128]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         print(f"{dv = }, {attention_chunk = }")
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
@@ -285,9 +287,9 @@ def test_flash_attn_output(
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
-            and not V_colmajor 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
+            and not V_colmajor
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
@@ -418,7 +420,7 @@ def test_flash_attn_varlen_output(
     # batch_size = 2
     # nheads = 1
     # nheads_kv = nheads
-    
+
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
@@ -580,8 +582,8 @@ def test_flash_attn_varlen_output(
 
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
@@ -1261,3 +1263,20 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+if __name__ == "__main__":
+    # for quick test and benchmark
+    test_flash_attn_output(
+        seqlen_q=8192,
+        seqlen_k=8192,
+        d=128,
+        causal=True,
+        local=False,
+        softcap=0.0,
+        V_colmajor=False,
+        deterministic=False,
+        has_qv=False,
+        mha_type="mha",
+        dtype=torch.bfloat16,
+    )

@@ -21,7 +21,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.mask import AttentionMask, cute_arbitrary_mask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
@@ -39,6 +39,7 @@ from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
+    get_curr_dq_write_order_bwd,
     get_m_block_from_iter_bwd,
     produce_block_sparse_q_loads_bwd_sm100,
 )
@@ -64,6 +65,8 @@ class FlashAttentionBackwardSm100:
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
+        is_arbitrary: bool = False,
+        arbitrary_func_num: cutlass.Constexpr[int] = 0,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
     ):
@@ -87,7 +90,7 @@ class FlashAttentionBackwardSm100:
             and cluster_size == 2
             and score_mod is None
             and score_mod_bwd is None
-            and mask_mod is None
+            and (mask_mod is None or mask_mod is cute_arbitrary_mask)
         )
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
@@ -114,6 +117,8 @@ class FlashAttentionBackwardSm100:
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
+        self.is_arbitrary = is_arbitrary
+        self.arbitrary_func_num = arbitrary_func_num
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pack_gqa = False
         self.deterministic = deterministic
@@ -934,7 +939,17 @@ class FlashAttentionBackwardSm100:
             )
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
-        if const_expr(self.use_block_sparsity or aux_tensors is not None):
+        supports_varlen_aux_tensors = (
+            aux_tensors is not None
+            and self.mask_mod is cute_arbitrary_mask
+            and self.score_mod is None
+            and self.score_mod_bwd is None
+            and not self.use_block_sparsity
+        )
+        if const_expr(
+            self.use_block_sparsity
+            or (aux_tensors is not None and not supports_varlen_aux_tensors)
+        ):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
             )
@@ -2986,6 +3001,8 @@ class FlashAttentionBackwardSm100:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                mask_arbitrary=self.is_arbitrary,
+                func_num=self.arbitrary_func_num,
                 mask_mod=self.mask_mod,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -3089,12 +3106,17 @@ class FlashAttentionBackwardSm100:
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
-                mask_fn(
-                    tSrS_t2r,
-                    m_block=m_block,
-                    is_full_block=is_full_block,
-                    check_m_boundary=check_m_boundary,
-                )
+                check_n_boundary = (n_block_for_cluster + 1) * self.tile_n > seqlen.seqlen_k
+                apply_mask = True
+                if const_expr(self.use_block_sparsity):
+                    apply_mask = (not is_full_block) or check_m_boundary or check_n_boundary
+                if apply_mask:
+                    mask_fn(
+                        tSrS_t2r,
+                        m_block=m_block,
+                        is_full_block=is_full_block,
+                        check_m_boundary=check_m_boundary,
+                    )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
@@ -3555,16 +3577,12 @@ class FlashAttentionBackwardSm100:
                 process_tile = loop_count > Int32(0)
             if const_expr(self.deterministic and self.use_block_sparsity):
                 assert blocksparse_tensors is not None
-                if const_expr(blocksparse_tensors.dq_write_order is not None):
-                    assert blocksparse_tensors.dq_write_order is not None
-                    curr_dq_write_order = blocksparse_tensors.dq_write_order[
-                        batch_idx, head_idx, n_block, None
-                    ]
-                    if const_expr(blocksparse_tensors.dq_write_order_full is not None):
-                        assert blocksparse_tensors.dq_write_order_full is not None
-                        curr_dq_write_order_full = blocksparse_tensors.dq_write_order_full[
-                            batch_idx, head_idx, n_block, None
-                        ]
+                curr_dq_write_order, curr_dq_write_order_full = get_curr_dq_write_order_bwd(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    n_block,
+                )
 
             # dQacc_reduce mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block

@@ -12,7 +12,7 @@
 #include "cute/tensor.hpp"
 
 #include "seqlen.h"
-#include "mask.h"
+#include "block_sparsity.hpp"
 #include "mask.h"
 #include "softmax.h"
 #include "utils.h"
@@ -25,7 +25,7 @@ template <int Stages, int Stages_dO, class TileShape_MNK_, class Element_, class
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=8, int AtomLayoutMdQ=1,
-        bool V_in_regs=false>
+        bool V_in_regs=false, bool Is_arbitrary_=false, int kNFunc_=1>
 struct CollectiveMainloopBwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -39,6 +39,9 @@ struct CollectiveMainloopBwdSm80 {
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
     static constexpr bool Varlen = Varlen_;
+    static constexpr bool Is_arbitrary = Is_arbitrary_;
+    static constexpr bool Use_block_sparsity = Is_arbitrary_;
+    static constexpr int kNFunc = kNFunc_;
     static constexpr int NumMmaWarps = NumMmaWarpGroups * cutlass::NumWarpsPerWarpGroup;
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
@@ -275,6 +278,10 @@ struct CollectiveMainloopBwdSm80 {
 
     using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
 
+    // Arbitrary mask function: (seqlen_q + 256, func_num, head_q or 1, batch or 1)
+    using ShapeMaskFunc = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
+    using StrideMaskFunc = cute::Stride<_1, int64_t, int64_t, int64_t>;
+
     // Host side kernel arguments
     struct Arguments {
         Element const* const ptr_Q;
@@ -306,6 +313,12 @@ struct CollectiveMainloopBwdSm80 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        // Block sparsity arguments (K2Q direction for backward)
+        BlockSparsityArguments block_sparse{};
+        // Arbitrary mask function parameters
+        int const* const mask_func_ptr = nullptr;
+        ShapeMaskFunc const shape_mask_func = {};              // (seqlen_q + 256, func_num, head_q or 1, batch or 1)
+        StrideMaskFunc const stride_mask_func = {};            // (1, func_nfunc_stride, func_head_stride, func_batch_stride)
     };
 
     // Device side kernel params
@@ -341,6 +354,12 @@ struct CollectiveMainloopBwdSm80 {
         int const *const cu_seqlens_k = nullptr;
         int const *const seqused_q = nullptr;
         int const *const seqused_k = nullptr;
+        // Block sparsity params (K2Q direction for backward)
+        BlockSparsityParams block_sparse{};
+        // Arbitrary mask function parameters
+        int const* const mask_func_ptr = nullptr;
+        ShapeMaskFunc const shape_mask_func = {};
+        StrideMaskFunc const stride_mask_func = {};
     };
 
     static Params
@@ -370,7 +389,13 @@ struct CollectiveMainloopBwdSm80 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                // Block sparsity params - convert from Arguments to Params (same structure)
+                {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
+                 args.block_sparse.full_block_cnt, args.block_sparse.full_block_offset, args.block_sparse.full_block_idx,
+                 args.block_sparse.num_blocks, args.block_sparse.num_heads, args.block_sparse.num_batches},
+                // Arbitrary mask function params
+                args.mask_func_ptr, args.shape_mask_func, args.stride_mask_func};
     }
 
     template <typename SharedStorage, typename FrgTensordKV>
@@ -380,7 +405,8 @@ struct CollectiveMainloopBwdSm80 {
         FrgTensordKV& tdVrdV,
         int thread_idx,
         cute::tuple<int32_t, int32_t, int32_t> block_coord,
-        SharedStorage& shared_storage
+        SharedStorage& shared_storage,
+        BlockSparsityParams const& block_sparse_params = {}
         ) {
         static_assert(is_rmem<FrgTensordKV>::value, "dK and dV tensor must be rmem resident.");
 
@@ -399,6 +425,13 @@ struct CollectiveMainloopBwdSm80 {
         // It's possible to have m_block_max <= m_block_min. Exit early
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return false; }
+        }
+
+        // For block sparsity, check if there are any blocks to process
+        if constexpr (Use_block_sparsity) {
+            BlockSparsityInfoBwd block_sparse_info;
+            block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
+            if (block_sparse_info.is_empty()) { return false; }
         }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -682,28 +715,63 @@ struct CollectiveMainloopBwdSm80 {
         };
 
         int m_block = m_block_min;
+        int smem_pipe_read = 0, smem_pipe_read_do = 0, smem_pipe_write = kStages - 1, smem_pipe_write_do = 0;
 
-        // Note, using the for_each() function here to ensure `stage` is of type Int<x>.
-        for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
-            static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
-            static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
-            if constexpr (!Is_last_stage || kStages == 1) {
-                if (Is_first_stage || m_block + stage < m_block_max) {
-                    load_Q_LSE(m_block + stage, stage);
-                }
+        // Helper to get m_block at index from block sparse info
+        [[maybe_unused]] auto get_sparse_m_block = [&](BlockSparsityInfoBwd const& info, int idx) {
+            if (idx < info.mask_block_cnt) {
+                return info.get_mask_m_block(idx);
+            } else {
+                return info.get_full_m_block(idx - info.mask_block_cnt);
             }
-            // We want the fence outside the if statement to have a fixed number of cp.async commits.
-            // so that we can wait with the correct number of outstanding commits.
-            cute::cp_async_fence();
-            if constexpr (stage < kStages_dO) {
-                if (Is_first_stage || m_block + stage < m_block_max) {
-                    load_dO_dPsum(m_block + stage, stage);
+        };
+
+        // For block sparse, we use a different preload strategy
+        if constexpr (Use_block_sparsity) {
+            BlockSparsityInfoBwd block_sparse_info;
+            block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
+            int const total_blocks = block_sparse_info.get_total_blocks();
+
+            // Preload first kStages blocks
+            for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
+                static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
+                static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
+                if constexpr (!Is_last_stage || kStages == 1) {
+                    if (Is_first_stage || int(stage) < total_blocks) {
+                        int m_block_to_load = get_sparse_m_block(block_sparse_info, stage);
+                        load_Q_LSE(m_block_to_load, stage);
+                    }
                 }
                 cute::cp_async_fence();
-            }
-        });
-
-        int smem_pipe_read = 0, smem_pipe_read_do = 0, smem_pipe_write = kStages - 1, smem_pipe_write_do = 0;
+                if constexpr (stage < kStages_dO) {
+                    if (Is_first_stage || int(stage) < total_blocks) {
+                        int m_block_to_load = get_sparse_m_block(block_sparse_info, stage);
+                        load_dO_dPsum(m_block_to_load, stage);
+                    }
+                    cute::cp_async_fence();
+                }
+            });
+        } else {
+            // Note, using the for_each() function here to ensure `stage` is of type Int<x>.
+            for_each(make_int_sequence<kStages>{}, [&] (auto stage) {
+                static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
+                static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
+                if constexpr (!Is_last_stage || kStages == 1) {
+                    if (Is_first_stage || m_block + stage < m_block_max) {
+                        load_Q_LSE(m_block + stage, stage);
+                    }
+                }
+                // We want the fence outside the if statement to have a fixed number of cp.async commits.
+                // so that we can wait with the correct number of outstanding commits.
+                cute::cp_async_fence();
+                if constexpr (stage < kStages_dO) {
+                    if (Is_first_stage || m_block + stage < m_block_max) {
+                        load_dO_dPsum(m_block + stage, stage);
+                    }
+                    cute::cp_async_fence();
+                }
+            });
+        }
 
         auto load_Q_next = [&] {
             // if (cute::thread0()) { printf("m_block = %d, m_block_max = %d, smem_pipe_write = %d\n", m_block, m_block_max, smem_pipe_write); }
@@ -873,33 +941,244 @@ struct CollectiveMainloopBwdSm80 {
 
         };
 
-        // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
-        // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+        if constexpr (Use_block_sparsity) {
+            // ============================================================
+            // Block Sparse Path
+            // ============================================================
+            BlockSparsityInfoBwd block_sparse_info;
+            block_sparse_info.init(block_sparse_params, bidb, bidh, n_block);
+            int const total_blocks = block_sparse_info.get_total_blocks();
+            int sparse_iter = 0;  // Current iteration index for block sparse
+
+            // Construct gMaskFunc tensor for arbitrary mask (only when Is_arbitrary is true)
+            // mMaskFunc has shape (seqlen_q + 256, func_num, head_q or 1, batch or 1), stride (1, func_nfunc_stride, func_head_stride, func_batch_stride)
+            // After local tile with batch/head/m_block, gMaskFunc has shape (kNFunc, kBlockM)
+            [[maybe_unused]] auto construct_gMaskFunc = [&](int m_block) {
+                // Use kNFunc or 1 (fake) to avoid zero-size shape when Is_arbitrary is false
+                constexpr int kNFuncSafe = Is_arbitrary ? kNFunc : 1;
+                Tensor mMaskFunc = make_tensor(make_gmem_ptr(params.mask_func_ptr),
+                                               params.shape_mask_func, params.stride_mask_func);
+                // Support broadcasting: use _0{} when head/batch dimension is 1
+                // shape_mask_func: (seqlen_q + 256, func_num, head_q or 1, batch or 1)
+                int const Func_head_idx = get<2>(params.shape_mask_func) == 1 ? 0 : bidh;
+                int const Func_batch_idx = get<3>(params.shape_mask_func) == 1 ? 0 : bidb;
+                Tensor gMaskFunc = local_tile(mMaskFunc, Shape<Int<kBlockM>, Int<kNFuncSafe>>{},
+                                              make_coord(m_block, 0, Func_head_idx, Func_batch_idx));
+                return make_tensor(gMaskFunc.data(),
+                                   make_layout(make_shape(Int<kNFuncSafe>{}, Int<kBlockM>{}),
+                                               make_stride(get<1>(gMaskFunc.stride()), get<0>(gMaskFunc.stride()))));
+            };
+
+            // Modified load_Q_next for block sparse (uses sparse_iter index)
+            auto load_Q_next_sparse = [&] {
+                int next_idx = sparse_iter + (kStages > 1 ? kStages - 1 : 1);
+                if (next_idx < total_blocks) {
+                    int m_block_to_load = get_sparse_m_block(block_sparse_info, next_idx);
+                    load_Q_LSE(m_block_to_load, kStages > 1 ? smem_pipe_write : 0);
+                }
+                cute::cp_async_fence();
+            };
+
+            // Modified load_dO_next for block sparse
+            auto load_dO_next_sparse = [&] {
+                int next_idx = sparse_iter + kStages_dO;
+                if (next_idx < total_blocks) {
+                    int m_block_to_load = get_sparse_m_block(block_sparse_info, next_idx);
+                    load_dO_dPsum(m_block_to_load, kStages_dO > 1 ? smem_pipe_write_do : 0);
+                }
+                cute::cp_async_fence();
+            };
+
+            // Block sparse version of bwd_step that uses sparse iteration index for preloading
+            auto bwd_step_sparse = [&](int m_block, auto mask_fn) {
+                Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
+                clear(tSrS);
+                flash::cp_async_wait<(kStages > 1) ? 1 : 0>();
+                __syncthreads();
+                Tensor tSrQ = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sQ(_, _, _0{}));
+                Tensor tSrK = mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sK);
+                flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, SdP_swapAB>(
+                    tSrS, tSrQ, tSrK, tSsQ(_, _, _, kStages > 1 ? smem_pipe_read : 0), tSsK,
+                    tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, nullptr);
+                Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tSsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+                if constexpr (!ShuffleLSE) {
+                    cute::copy(tSsLSE(_, kStages > 1 ? smem_pipe_read : 0), tLSErLSE);
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < kStatsPerThread; ++i) {
+                        tLSErLSE(i) = tSsLSE((thread_idx % 32) / 4 + i * 8, kStages > 1 ? smem_pipe_read : 0);
+                    }
+                }
+                if constexpr (Has_softcap) { flash::apply_softcap(tSrS, params.softcap_val); }
+
+                Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tSrS.layout()));
+                auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
+                mask_fn(tSrS, m_block);
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(scores); ++mi) {
+                    float const lse_scaled = [&] {
+                        if constexpr (!ShuffleLSE) return tLSErLSE(mi);
+                        else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                    }();
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ++ni) {
+                        scores(mi, ni) = exp2f(scores(mi, ni) * params.softmax_scale_log2 - lse_scaled);
+                    }
+                }
+
+                Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
+                clear(tdPrdP);
+                int smem_pipe_read_do_cur = Q_dO_same_stages ? smem_pipe_read : smem_pipe_read_do;
+                flash::cp_async_wait<(kStages_dO > 1) ? 1 : 0>();
+                __syncthreads();
+                auto hook = cute::conditional_return<(kStages > 1)>(load_Q_next_sparse, nullptr);
+                Tensor tdPrdO = mma_partition_fragment_AB</*A=*/!SdP_swapAB>(thr_mma_SdP, sdO(_, _, _0{}));
+                Tensor tdPrV_cur = cute::conditional_return<V_in_regs>(tdPrV, mma_partition_fragment_AB</*A=*/SdP_swapAB>(thr_mma_SdP, sV));
+                flash::gemm_sm80<false /*A_in_regs*/, V_in_regs, SdP_swapAB>(
+                    tdPrdP, tdPrdO, tdPrV_cur, tdPsdO(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0), tdPsV,
+                    tiled_mma_SdP, smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV, hook);
+                Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tSsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+                if constexpr (!ShuffledPsum) {
+                    cute::copy(tSsdPsum(_, kStages_dO > 1 ? smem_pipe_read_do_cur : 0), tLSErdPsum);
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < kStatsPerThread; ++i) {
+                        tLSErdPsum(i) = tSsdPsum((thread_idx % 32) / 4 + i * 8, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
+                    }
+                }
+
+                Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(dS); ++mi) {
+                    float const dP_sum_cur = [&] {
+                        if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
+                        else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+                    }();
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(dS); ++ni) {
+                        dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
+                        if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
+                    }
+                }
+
+                Tensor rP = make_tensor_like<Element>(tSrS);
+                flash::convert_type_out(tSrS, rP);
+                if constexpr (!Mma_dKV_is_RS) {
+                    Tensor tPaP = r2s_thr_copy_PdS.retile_S(rP);
+                    cute::copy(r2s_tiled_copy_PdS, tPaP, tPsP);
+                }
+                Tensor rdS = make_tensor_like<Element>(tdPrdP);
+                flash::convert_type_out(tdPrdP, rdS);
+                if constexpr (!Mma_dKV_is_RS) { __syncthreads(); }
+                Tensor tdSadS = r2s_thr_copy_PdS.retile_S(rdS);
+                cute::copy(r2s_tiled_copy_PdS, tdSadS, tdSsdS);
+
+                Tensor tdVrdO = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sdOt(_, _, _0{}));
+                Tensor tdVsdO_cur = tdVsdOt(_, _, _, kStages_dO > 1 ? smem_pipe_read_do_cur : 0);
+                if constexpr (Mma_dKV_is_RS) {
+                    Tensor tdVrP = make_tensor(rP.data(), convert_layout_acc_Aregs<TiledMmadKV>(tSrS.layout()));
+                    flash::gemm_rs_sm80(tdVrdV, tdVrP, tdVrdO, tdVsdO_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                } else {
+                    Tensor tdVrP = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sPt);
+                    flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
+                        tdVrdV, tdVrP, tdVrdO, tdVsPt, tdVsdO_cur,
+                        tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, nullptr);
+                }
+                __syncthreads();
+                auto do_mma_dQ_sparse = [&] (auto hook) {
+                    Tensor tdQrdQ = partition_fragment_C(tiled_mma_dQ, select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
+                    clear(tdQrdQ);
+                    Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(thr_mma_dQ, sdS);
+                    Tensor tdQrK = mma_partition_fragment_AB</*A=*/dQ_swapAB>(thr_mma_dQ, sKt);
+                    flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dQ_swapAB>(
+                        tdQrdQ, tdQrdS, tdQrK, tdQsdS, tdQsKt, tiled_mma_dQ,
+                        smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt, hook);
+                    Tensor tdQrdQ_atomic = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
+                    Tensor tdQgdQaccum_atomic = tdQgdQaccum(_, _, m_block);
+                    static_assert(CUTE_STATIC_V(size(tdQrdQ_atomic)) == CUTE_STATIC_V(size(tdQgdQaccum_atomic)));
+                    #pragma unroll
+                    for (int i = 0; i < size(tdQrdQ_atomic); ++i) { atomicAdd(&tdQgdQaccum_atomic(i), tdQrdQ_atomic(i)); }
+                };
+                if constexpr (kStages > 1) { do_mma_dQ_sparse(load_dO_next_sparse); }
+                Tensor tdKrQ = mma_partition_fragment_AB</*A=*/dKV_swapAB>(thr_mma_dKV, sQt(_, _, _0{}));
+                Tensor tdKsQ_cur = tdKsQt(_, _, _, kStages > 1 ? smem_pipe_read : 0);
+                if constexpr (Mma_dKV_is_RS) {
+                    Tensor tdKrdS = make_tensor(rdS.data(), convert_layout_acc_Aregs<TiledMmadKV>(tdPrdP.layout()));
+                    flash::gemm_rs_sm80(tdKrdK, tdKrdS, tdKrQ, tdKsQ_cur, tiled_mma_dKV, smem_tiled_copy_QdOt, smem_thr_copy_QdOt);
+                } else {
+                    Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(thr_mma_dKV, sdSt);
+                    flash::gemm_sm80<false /*A_in_regs*/, false /*B_in_regs*/, /*SwapAB=*/dKV_swapAB>(
+                        tdKrdK, tdKrdS, tdKrQ, tdKsdSt, tdKsQ_cur,
+                        tiled_mma_dKV, smem_tiled_copy_PdSt, smem_tiled_copy_QdOt, smem_thr_copy_PdSt, smem_thr_copy_QdOt, cute::conditional_return<(kStages > 1)>(nullptr, load_dO_next_sparse));
+                }
+                if constexpr (kStages == 1) {
+                    __syncthreads();
+                    do_mma_dQ_sparse(load_Q_next_sparse);
+                }
+
+                smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
+                smem_pipe_read_do = smem_pipe_read_do < kStages_dO - 1 ? smem_pipe_read_do + 1 : 0;
+                smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
+                smem_pipe_write_do = smem_pipe_write_do < kStages_dO - 1 ? smem_pipe_write_do + 1 : 0;
+                ++sparse_iter;  // Increment sparse iteration counter
+            };
+
+            // Mask functions for arbitrary block sparsity:
+            // - For mask_blocks: apply arbitrary mask only (Seqlenk info is already in MaskFunc, and need Seqlen_mask)
+            // - For full_blocks: no mask needed
+            // cjerry comment this
+            // TODO: Should the handling of out-of-bounds Seqlen Q be placed in the first mblock, regardless of whether it is full or masked?
+            // TODO: Currently, blocks with out-of-bounds Seqlen Q are treated as mask blocks during the backward pass.
+            // TODO: Alternatively, only the first mblock performs the Seqlen_mask.
+            auto arbitrary_mask_fn = [&](auto& tSrS, int m_block) {
+                if constexpr (Is_arbitrary) {
+                    auto gMaskFunc = construct_gMaskFunc(m_block);
+                    mask.template apply<true /*Seqlenk_mask*/, /*Causal_mask=*/false, /*Local_mask=*/false, /*Arbitrary_mask=*/true, kNFunc>(tSrS, m_block, n_block, &gMaskFunc);
+                }
+            };
+            // No mask function (for full_blocks)
+            auto no_mask_fn = [](auto& tSrS, int m_block) { };
+
+            // Use block sparse consume function with the sparse version of bwd_step
+            flash::consume_block_sparse_mma_bwd(
+                block_sparse_info,
+                bwd_step_sparse,
+                arbitrary_mask_fn,
+                no_mask_fn
+            );
+        } else {
+            // ============================================================
+            // Non-Block Sparse Path (original code)
+            // ============================================================
+
+            // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
+            // this helps quite a bit to not have to do causal masking for most of the iterations.
+            if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
+                auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+                    bwd_step(m_block, mask_fn);
+                }
+            }
+
+            static constexpr int kBlockN = get<1>(TileShape_MNK{});
+            int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
+                ? m_block_max
+                : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
+
+            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < std::min(m_block_max, m_block_masking_max); ++m_block) {
+            for (; m_block < m_block_max_before_local_mask; ++m_block) {
                 bwd_step(m_block, mask_fn);
             }
-        }
 
-        static constexpr int kBlockN = get<1>(TileShape_MNK{});
-        int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
-            ? m_block_max
-            : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
-
-        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
-        CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max_before_local_mask; ++m_block) {
-            bwd_step(m_block, mask_fn);
-        }
-
-        if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; ++m_block) {
-                bwd_step(m_block, mask_fn);
+            if constexpr (Is_local && SeparateMaskingIterations) {
+                auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (; m_block < m_block_max; ++m_block) {
+                    bwd_step(m_block, mask_fn);
+                }
             }
         }
 

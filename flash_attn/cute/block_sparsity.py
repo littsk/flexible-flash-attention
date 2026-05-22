@@ -23,6 +23,8 @@ class BlockSparseTensors(NamedTuple):
     cu_block_idx_offsets: cute.Tensor | None = None
     dq_write_order: cute.Tensor | None = None
     dq_write_order_full: cute.Tensor | None = None
+    mask_block_offset: cute.Tensor | None = None
+    full_block_offset: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -47,6 +49,96 @@ class BlockSparseTensorsTorch(NamedTuple):
     dq_write_order: torch.Tensor | None = None
     dq_write_order_full: torch.Tensor | None = None
     spt: bool | None = None
+    mask_block_offset: torch.Tensor | None = None
+    full_block_offset: torch.Tensor | None = None
+
+
+class LinearBlockSparseTensors(NamedTuple):
+    mask_block_cnt: cute.Tensor
+    mask_block_offset: cute.Tensor
+    mask_block_idx: cute.Tensor
+    full_block_cnt: cute.Tensor | None = None
+    full_block_offset: cute.Tensor | None = None
+    full_block_idx: cute.Tensor | None = None
+
+    def __new_from_mlir_values__(self, values):
+        if len(values) == 3:
+            values = (*values, None, None, None)
+        return LinearBlockSparseTensors(*values)
+
+
+class LinearBlockSparseTensorsTorch(NamedTuple):
+    mask_block_cnt: torch.Tensor
+    mask_block_offset: torch.Tensor
+    mask_block_idx: torch.Tensor
+    full_block_cnt: torch.Tensor | None = None
+    full_block_offset: torch.Tensor | None = None
+    full_block_idx: torch.Tensor | None = None
+    block_size: tuple[int, int] | None = None
+    dq_write_order: torch.Tensor | None = None
+    dq_write_order_full: torch.Tensor | None = None
+    spt: bool | None = None
+
+
+def is_linear_block_sparse_tensors(
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
+) -> bool:
+    return tensors.mask_block_offset is not None
+
+
+def bhqk_to_linear_sparse_tensors(
+    bhqk_tensors: BlockSparseTensorsTorch,
+) -> LinearBlockSparseTensorsTorch:
+    """Convert 4D block-sparse indices to the compact CSR-like representation."""
+    mask_block_cnt = bhqk_tensors.mask_block_cnt
+    batch, nheads, n_blocks = mask_block_cnt.shape
+    mask_block_offset = torch.cat(
+        [
+            torch.zeros(1, device=mask_block_cnt.device, dtype=torch.int32),
+            torch.cumsum(mask_block_cnt.flatten(), dim=0, dtype=torch.int32),
+        ],
+        dim=0,
+    )
+    mask_block_idx_parts = [
+        bhqk_tensors.mask_block_idx[i, j, k, : mask_block_cnt[i, j, k].item()]
+        for i in range(batch)
+        for j in range(nheads)
+        for k in range(n_blocks)
+    ]
+    mask_block_idx = torch.cat(mask_block_idx_parts, dim=0)
+
+    full_block_cnt = bhqk_tensors.full_block_cnt
+    full_block_offset = None
+    full_block_idx = None
+    if full_block_cnt is not None:
+        full_block_offset = torch.cat(
+            [
+                torch.zeros(1, device=full_block_cnt.device, dtype=torch.int32),
+                torch.cumsum(full_block_cnt.flatten(), dim=0, dtype=torch.int32),
+            ],
+            dim=0,
+        )
+        if bhqk_tensors.full_block_idx is not None:
+            full_block_idx_parts = [
+                bhqk_tensors.full_block_idx[i, j, k, : full_block_cnt[i, j, k].item()]
+                for i in range(batch)
+                for j in range(nheads)
+                for k in range(n_blocks)
+            ]
+            full_block_idx = torch.cat(full_block_idx_parts, dim=0)
+
+    return LinearBlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_offset=mask_block_offset,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_offset=full_block_offset,
+        full_block_idx=full_block_idx,
+        block_size=bhqk_tensors.block_size,
+        dq_write_order=bhqk_tensors.dq_write_order,
+        dq_write_order_full=bhqk_tensors.dq_write_order_full,
+        spt=bhqk_tensors.spt,
+    )
 
 
 def _ordered_to_dense_simple(
@@ -179,7 +271,7 @@ def compute_dq_write_order_from_block_mask(
 
 
 def get_sparse_q_block_size(
-    tensors: BlockSparseTensorsTorch | None,
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch | None,
     seqlen_q: int,
 ) -> int | None:
     """Return the Q sparse block size, or None when sparsity is unset or ambiguous."""
@@ -187,7 +279,10 @@ def get_sparse_q_block_size(
         return None
     if tensors.block_size is not None:
         return tensors.block_size[0]
-    num_m_blocks = tensors.mask_block_idx.shape[2]
+    if is_linear_block_sparse_tensors(tensors):
+        num_m_blocks = tensors.mask_block_cnt.shape[2]
+    else:
+        num_m_blocks = tensors.mask_block_idx.shape[2]
     min_block_size = ceildiv(seqlen_q, num_m_blocks)
     max_block_size = seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)
     if min_block_size != max_block_size:
@@ -271,6 +366,91 @@ def _check_and_expand_metadata_tensor(
     if not tensor.is_cuda:
         raise ValueError(f"{name} must live on CUDA")
     return _expand_sparsity_tensor(tensor, expected_shape, name, context, hint)
+
+
+def _check_linear_block(
+    name: str,
+    cnt: torch.Tensor | None,
+    offset: torch.Tensor | None,
+    idx: torch.Tensor | None,
+    expected_count_shape: Tuple[int, ...],
+    context: str | None,
+    hint: str | Callable[[], str] | None,
+    expected_base_shape: Tuple[int, ...] | None = None,
+) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    if cnt is None and offset is None and idx is None:
+        return None, None, None
+    if cnt is None or offset is None or idx is None:
+        raise ValueError(
+            f"{name}_block_cnt, {name}_block_offset, and {name}_block_idx "
+            "must all be provided or all be None for linear block sparsity"
+        )
+    if cnt.dtype != torch.int32 or offset.dtype != torch.int32 or idx.dtype != torch.int32:
+        raise ValueError(f"{name}_block tensors must have dtype torch.int32")
+    if cnt.device != offset.device or cnt.device != idx.device:
+        raise ValueError(f"{name}_block tensors must be on the same device")
+    if not cnt.is_cuda or not offset.is_cuda or not idx.is_cuda:
+        raise ValueError(f"{name}_block tensors must live on CUDA")
+    if cnt.ndim != 3 or offset.ndim != 1 or idx.ndim != 1:
+        raise ValueError(
+            f"{name}_block tensors{f' ({context})' if context else ''} must have shapes "
+            "(B, H, M/N), (B * H * M/N + 1), and (nnz,)."
+        )
+    if expected_base_shape is not None and tuple(cnt.shape) != expected_base_shape:
+        raise ValueError(
+            f"{name}_block_cnt{f' ({context})' if context else ''} must have shape "
+            f"{expected_base_shape} to share CSR offsets with mask_block_cnt."
+        )
+    for dim_name, cur, tgt in (
+        ("batch", cnt.shape[0], expected_count_shape[0]),
+        ("head", cnt.shape[1], expected_count_shape[1]),
+    ):
+        if cur != tgt and cur != 1:
+            resolved_hint = hint() if callable(hint) else hint
+            hint_clause = f" Hint: {resolved_hint}" if resolved_hint else ""
+            raise ValueError(
+                f"{name}_block_cnt{f' ({context})' if context else ''} {dim_name} dim "
+                f"must be {tgt} or 1.{hint_clause}"
+            )
+    if cnt.shape[2] != expected_count_shape[2]:
+        raise ValueError(
+            f"{name}_block_cnt{f' ({context})' if context else ''} block dimension "
+            f"{cnt.shape[2]} does not match expected {expected_count_shape[2]}."
+        )
+    expected_offset_size = cnt.shape[0] * cnt.shape[1] * cnt.shape[2] + 1
+    if offset.numel() != expected_offset_size:
+        raise ValueError(
+            f"{name}_block_offset{f' ({context})' if context else ''} must have "
+            f"{expected_offset_size} elements for count shape {tuple(cnt.shape)}, "
+            f"got {offset.numel()}."
+        )
+    return cnt, offset, idx
+
+
+def _check_linear_metadata_tensor(
+    name: str,
+    tensor: torch.Tensor | None,
+    index_tensor: torch.Tensor | None,
+    context: str | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if index_tensor is None:
+        raise ValueError(f"{name} was provided but the corresponding block index tensor is None")
+    if tensor.dtype != torch.int32:
+        raise ValueError(f"{name} must have dtype torch.int32")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on the same device as block sparse tensors")
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must live on CUDA")
+    if tensor.ndim != 1 or tensor.shape != index_tensor.shape:
+        context_clause = f" ({context})" if context else ""
+        raise ValueError(
+            f"{name}{context_clause} must be a 1D compact tensor with shape "
+            f"{tuple(index_tensor.shape)}, got {tuple(tensor.shape)}."
+        )
+    return tensor
 
 
 def get_block_sparse_expected_shapes(
@@ -384,6 +564,54 @@ def infer_block_sparse_expected_shapes(
     return expected_count_shape, expected_index_shape, q_subtile_factor
 
 
+def infer_linear_block_sparse_expected_shapes(
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
+    *,
+    batch_size: int,
+    num_head: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    q_stage: int,
+    context: str,
+    sparse_block_size_q: int | None = None,
+    sparse_block_size_kv: int | None = None,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int], int]:
+    base_m_block = q_stage * m_block_size
+    base_n_block = n_block_size
+    if sparse_block_size_kv is None:
+        sparse_block_size_kv = base_n_block
+    if sparse_block_size_kv != base_n_block:
+        raise ValueError(f"Linear block sparse tensors {context} require BLOCK_SIZE_KV={base_n_block}.")
+
+    num_m_blocks = tensors.mask_block_cnt.shape[2]
+    if sparse_block_size_q is None:
+        sparse_block_size_q = get_sparse_q_block_size(tensors, seqlen_q)
+        if sparse_block_size_q is None:
+            raise ValueError(
+                f"Linear block sparse tensors {context} require explicit block_size[0] "
+                f"to disambiguate block size for seqlen_q={seqlen_q} and num_blocks={num_m_blocks}."
+            )
+    if sparse_block_size_q % base_m_block != 0:
+        raise ValueError(
+            f"Linear block sparse tensors {context} have block size {sparse_block_size_q}, "
+            f"which must be a multiple of {base_m_block}."
+        )
+
+    expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
+    expected_n_blocks = ceildiv(seqlen_k, sparse_block_size_kv)
+    q_subtile_factor = sparse_block_size_q // base_m_block
+    expected_count_shape = (batch_size, num_head, expected_m_blocks)
+    expected_index_shape = (batch_size, num_head, expected_m_blocks, expected_n_blocks)
+    if expected_m_blocks != num_m_blocks:
+        raise ValueError(
+            f"Linear block sparse tensors {context} block dimension {num_m_blocks} does not match "
+            f"sparse_block_size_q={sparse_block_size_q}."
+        )
+    return expected_count_shape, expected_index_shape, q_subtile_factor
+
+
 def get_block_sparse_expected_shapes_bwd(
     batch_size: int,
     num_head: int,
@@ -478,12 +706,87 @@ def normalize_block_sparse_tensors(
     )
 
 
-def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
+def normalize_linear_block_sparse_tensors(
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
+    *,
+    expected_count_shape: Tuple[int, ...],
+    context: str | None = None,
+    hint: str | Callable[[], str] | None = None,
+) -> BlockSparseTensorsTorch:
+    if (
+        tensors.mask_block_cnt is None
+        or tensors.mask_block_offset is None
+        or tensors.mask_block_idx is None
+    ):
+        raise ValueError(
+            "mask_block_cnt, mask_block_offset, and mask_block_idx must be provided for linear block sparsity."
+        )
+
+    mask_cnt, mask_offset, mask_idx = _check_linear_block(
+        "mask",
+        tensors.mask_block_cnt,
+        tensors.mask_block_offset,
+        tensors.mask_block_idx,
+        expected_count_shape,
+        context,
+        hint,
+    )
+    if mask_cnt is None or mask_offset is None or mask_idx is None:
+        raise ValueError("mask block tensors must be provided for linear block sparsity.")
+
+    full_cnt, full_offset, full_idx = _check_linear_block(
+        "full",
+        tensors.full_block_cnt,
+        tensors.full_block_offset,
+        tensors.full_block_idx,
+        expected_count_shape,
+        context,
+        hint,
+        expected_base_shape=tuple(mask_cnt.shape),
+    )
+
+    dq_write_order = _check_linear_metadata_tensor(
+        "dq_write_order",
+        tensors.dq_write_order,
+        mask_idx,
+        context,
+        mask_cnt.device,
+    )
+    dq_write_order_full = _check_linear_metadata_tensor(
+        "dq_write_order_full",
+        tensors.dq_write_order_full,
+        full_idx,
+        context,
+        mask_cnt.device,
+    )
+    spt = tensors.spt
+    if spt is not None and not isinstance(spt, bool):
+        raise ValueError("spt must be a bool when provided")
+    if spt is not None and dq_write_order is None:
+        raise ValueError("spt requires dq_write_order to be provided")
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_cnt,
+        mask_block_idx=mask_idx,
+        full_block_cnt=full_cnt,
+        full_block_idx=full_idx,
+        block_size=tensors.block_size,
+        dq_write_order=dq_write_order,
+        dq_write_order_full=dq_write_order_full,
+        spt=spt,
+        mask_block_offset=mask_offset,
+        full_block_offset=full_offset,
+    )
+
+
+def is_block_sparsity_enabled(
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
+) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
 
 
 def get_block_sparse_broadcast_pattern(
-    tensors: BlockSparseTensorsTorch,
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
 ) -> Tuple[Tuple[bool, ...], ...] | None:
     """Return broadcast pattern for block sparse tensors by checking actual strides.
 
@@ -508,16 +811,21 @@ def get_block_sparse_broadcast_pattern(
         tensors.full_block_idx,
         tensors.dq_write_order,
         tensors.dq_write_order_full,
+        tensors.mask_block_offset,
+        tensors.full_block_offset,
     ):
         if tensor is not None:
-            patterns.append(get_broadcast_dims(tensor))
+            if is_linear_block_sparse_tensors(tensors) and tensor.ndim == 3:
+                patterns.append((tensor.shape[0] == 1, tensor.shape[1] == 1, False))
+            else:
+                patterns.append(get_broadcast_dims(tensor))
         else:
             patterns.append(None)
     return tuple(patterns)
 
 
 def normalize_block_sparse_config(
-    tensors: BlockSparseTensorsTorch,
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
     *,
     batch_size: int,
     num_head: int,
@@ -541,6 +849,34 @@ def normalize_block_sparse_config(
     if sparse_block_size_kv != n_block_size:
         raise ValueError(
             f"Block sparsity requires sparse_block_size[1]={n_block_size} to match tile_n."
+        )
+    if is_linear_block_sparse_tensors(tensors):
+        expected_count_shape, _, q_subtile_factor = infer_linear_block_sparse_expected_shapes(
+            tensors,
+            batch_size=batch_size,
+            num_head=num_head,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            q_stage=q_stage,
+            context="forward",
+            sparse_block_size_q=sparse_block_size_q,
+            sparse_block_size_kv=sparse_block_size_kv,
+        )
+        normalized_tensors = normalize_linear_block_sparse_tensors(
+            tensors,
+            expected_count_shape=expected_count_shape,
+            context="_flash_attn_fwd",
+            hint=lambda: (
+                "Forward expects Q2K CSR tensors (mask/full KV lists per Q block) "
+                f"with BLOCK_SIZE=({sparse_block_size_q or q_stage * m_block_size}, {n_block_size})."
+            ),
+        )
+        return (
+            normalized_tensors,
+            get_block_sparse_broadcast_pattern(normalized_tensors),
+            q_subtile_factor,
         )
     if tensors.cu_total_m_blocks is not None:
         base_m_block = q_stage * m_block_size
@@ -583,7 +919,7 @@ def normalize_block_sparse_config(
 
 
 def normalize_block_sparse_config_bwd(
-    tensors: BlockSparseTensorsTorch,
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
     *,
     batch_size: int,
     num_head: int,
@@ -615,6 +951,17 @@ def normalize_block_sparse_config_bwd(
         n_block_size,
         subtile_factor,
     )
+    if is_linear_block_sparse_tensors(tensors):
+        normalized_tensors = normalize_linear_block_sparse_tensors(
+            tensors,
+            expected_count_shape=expected_count_shape,
+            context="_flash_attn_bwd",
+            hint=lambda: (
+                f"Backward expects K2Q CSR tensors (mask/full Q lists per KV block). "
+                f"Regenerate with BLOCK_SIZE=({subtile_factor * m_block_size}, {n_block_size})."
+            ),
+        )
+        return normalized_tensors, get_block_sparse_broadcast_pattern(normalized_tensors)
     normalized_tensors = normalize_block_sparse_tensors(
         tensors,
         expected_count_shape=expected_count_shape,
@@ -630,7 +977,8 @@ def normalize_block_sparse_config_bwd(
 
 
 def to_cute_block_sparse_tensors(
-    tensors: BlockSparseTensorsTorch, enable_tvm_ffi: bool = True
+    tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch,
+    enable_tvm_ffi: bool = True,
 ) -> BlockSparseTensors | None:
     """Convert torch block sparsity tensors to CuTe tensors, optionally for tvm ffi"""
     if not is_block_sparsity_enabled(tensors):
@@ -657,6 +1005,12 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.dq_write_order, tensors.dq_write_order_full)
     ]
+    mask_block_offset_tensor, full_block_offset_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.mask_block_offset, tensors.full_block_offset)
+    ]
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -667,7 +1021,16 @@ def to_cute_block_sparse_tensors(
         cu_block_idx_offsets_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+        mask_block_offset_tensor,
+        full_block_offset_tensor,
     )
+
+
+def to_cute_linear_block_sparse_tensors(
+    tensors: LinearBlockSparseTensorsTorch,
+    enable_tvm_ffi: bool = True,
+) -> BlockSparseTensors | None:
+    return to_cute_block_sparse_tensors(tensors, enable_tvm_ffi=enable_tvm_ffi)
 
 
 def fast_sampling(mask_mod):

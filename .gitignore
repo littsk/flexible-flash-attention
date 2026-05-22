@@ -41,3 +41,6 @@ benchmarks/results/
 
 # compile-time generated file
 flash_attn_config.py
+
+# generated files
+hopper/instantiations/*

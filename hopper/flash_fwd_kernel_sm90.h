@@ -19,6 +19,7 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
+#include "block_sparsity.hpp"
 
 namespace flash {
 
@@ -71,6 +72,11 @@ public:
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
+    // Block sparsity derived types
+    using BlockSparsity = flash::BlockSparsity;
+    using BlockSparsityArguments = typename BlockSparsity::Arguments;
+    using BlockSparsityParams = typename BlockSparsity::Params;
+
     static constexpr uint32_t NumLoadWarpGroups = 1;
     static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaPV{})) / cutlass::NumThreadsPerWarpGroup;
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
@@ -79,8 +85,10 @@ public:
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    // Block sparsity also requires more registers for the producer WG.
+    static constexpr bool Use_block_sparsity = CollectiveMainloop::Use_block_sparsity;
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? ((Use_block_sparsity || !Use_TMA_KV) ? 40 : 24) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? ((Use_block_sparsity || !Use_TMA_KV) ? 232 : 240) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
@@ -124,6 +132,7 @@ public:
         EpilogueArguments epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerArguments scheduler{};
+        BlockSparsityArguments block_sparsity{};
     };
 
     // Kernel entry point API
@@ -132,6 +141,7 @@ public:
         EpilogueParams epilogue{};
         cutlass::KernelHardwareInfo hw_info{};
         TileSchedulerParams scheduler{};
+        BlockSparsityParams block_sparsity{};
     };
 
     //
@@ -159,7 +169,8 @@ public:
             CollectiveMainloop::to_underlying_arguments(args.mainloop),
             CollectiveEpilogue::to_underlying_arguments(args.epilogue),
             hw_info,
-            TileScheduler::to_underlying_arguments(args.scheduler)
+            TileScheduler::to_underlying_arguments(args.scheduler),
+            BlockSparsity::to_underlying_arguments(args.block_sparsity)
         };
     }
 
@@ -353,7 +364,7 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                mainloop.load(params.mainloop, params.block_sparsity, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -419,16 +430,16 @@ public:
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                        params.mainloop, params.block_sparsity, pipeline_k, pipeline_v, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
-                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
+                            params.mainloop, params.block_sparsity, pipeline_k, pipeline_v, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
                     } else {
                         tile_valid = mainloop.mma_pv(
-                            params.mainloop, pipeline_v, smem_pipe_read,
+                            params.mainloop, params.block_sparsity, pipeline_v, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
                     }
                 }

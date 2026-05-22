@@ -22,6 +22,7 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 
 
 def _as_bshkrd_tensor(
@@ -114,6 +115,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
+        is_arbitrary: bool = False,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         tile_m_dq: int = 128,
@@ -142,16 +144,20 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert not deterministic, (
             "SM100 backward with head_dim=256 does not support deterministic mode"
         )
-        assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
+        if is_arbitrary:
+            assert has_aux_tensors, "SM100 backward with head_dim=256 arbitrary mask requires aux_tensors"
+        else:
+            assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
         assert cluster_size in (1, 2), (
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
         )
         assert use_2cta_instrs, "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
-        # subtile_factor is accepted for interface parity with FlashAttentionBackwardSm100,
-        # but this dedicated kernel uses fixed internal behavior.
+        self.subtile_factor = subtile_factor
 
         self.acc_dtype = cutlass.Float32
         self.is_causal = is_causal
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_arbitrary = is_arbitrary
         self.window_size_left = (
             None if (window_size_left is None or window_size_left < 0) else window_size_left
         )
@@ -172,6 +178,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.window_size_right,
             False,  # is_persistent
             False,  # split_head
+            qhead_per_kvhead=self.qhead_per_kvhead,
+            is_arbitrary=self.is_arbitrary,
             use_clc_scheduler=self.use_clc_scheduler,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
@@ -180,7 +188,10 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.is_causal,
             self.window_size_left,
             self.window_size_right,
+            qhead_per_kvhead=self.qhead_per_kvhead,
+            is_arbitrary=self.is_arbitrary,
             use_clc_scheduler=self.use_clc_scheduler,
+            subtile_factor=self.subtile_factor,
         )
 
     @cute.jit
@@ -205,8 +216,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
-        aux_tensors: tuple[cute.Tensor] | None = None,
-        block_sparse_tensors: cute.Tensor | None = None,
+        aux_tensors: list | None = None,
+        block_sparse_tensors_dq: BlockSparseTensors | None = None,
+        block_sparse_tensors: BlockSparseTensors | None = None,
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -219,17 +231,35 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
             "SM100 backward with head_dim=256 does not use semaphores"
         )
-        assert block_sparse_tensors is None, (
-            "SM100 backward with head_dim=256 does not support block sparse tensors"
-        )
-        assert aux_tensors is None or len(aux_tensors) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_tensors"
-        )
+        varlen = cumulative_s_q is not None or cumulative_s_k is not None
+        if cutlass.const_expr(block_sparse_tensors_dq is not None):
+            assert self.is_arbitrary, (
+                "SM100 backward with head_dim=256 dQ CSR support requires arbitrary=True"
+            )
+            assert not varlen, "SM100 backward with head_dim=256 dQ CSR support does not support varlen"
+            assert block_sparse_tensors_dq.mask_block_offset is not None, (
+                "SM100 backward with head_dim=256 dQ only supports linear CSR block sparse tensors"
+            )
+        if cutlass.const_expr(block_sparse_tensors is not None):
+            assert self.is_arbitrary, (
+                "SM100 backward with head_dim=256 CSR support requires arbitrary=True"
+            )
+            assert not varlen, "SM100 backward with head_dim=256 CSR support does not support varlen"
+            assert block_sparse_tensors.mask_block_offset is not None, (
+                "SM100 backward with head_dim=256 only supports linear CSR block sparse tensors"
+            )
+        if cutlass.const_expr(self.is_arbitrary):
+            assert aux_tensors is not None and len(aux_tensors) > 0, (
+                "SM100 backward with head_dim=256 arbitrary mask requires aux_tensors"
+            )
+        else:
+            assert aux_tensors is None or len(aux_tensors) == 0, (
+                "SM100 backward with head_dim=256 does not support aux_tensors"
+            )
         assert dQ_accum is not None, (
             "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         )
         dQ = dQ_accum
-        varlen = cumulative_s_q is not None or cumulative_s_k is not None
         q_rank = cute.rank(Q.layout)
         k_rank = cute.rank(K.layout)
         if cutlass.const_expr(q_rank == 5):
@@ -276,6 +306,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_q,
             cumulative_s_k,
             scale_softmax,
+            aux_tensors,
+            block_sparse_tensors_dq,
             stream,
         )
         self.dkdv_kernel(
@@ -290,5 +322,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_q,
             cumulative_s_k,
             scale_softmax,
+            aux_tensors,
+            block_sparse_tensors,
             stream,
         )

@@ -65,6 +65,43 @@ def _get_curr_blocksparse_tensors(
 
 
 @cute.jit
+def _get_curr_blocksparse_tensors_linear(
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
+    """Fixed-length CSR path: counts are [B, H, row], indices are compact 1D."""
+    mask_block_cnt = blocksparse_tensors.mask_block_cnt
+    mask_block_idx = blocksparse_tensors.mask_block_idx
+    full_block_cnt = blocksparse_tensors.full_block_cnt
+    full_block_idx = blocksparse_tensors.full_block_idx
+    mask_block_offset = blocksparse_tensors.mask_block_offset
+    full_block_offset = blocksparse_tensors.full_block_offset
+    assert mask_block_offset is not None
+
+    batch, nheads, n_blocks = mask_block_cnt.shape
+    sparse_batch_idx = 0 if batch == 1 else batch_idx
+    sparse_head_idx = 0 if nheads == 1 else head_idx
+    offset_idx = (
+        (0 if batch == 1 else batch_idx * nheads * n_blocks)
+        + (0 if nheads == 1 else head_idx * n_blocks)
+        + m_block
+    )
+    curr_mask_block_cnt = mask_block_cnt[sparse_batch_idx, sparse_head_idx, m_block]
+    curr_mask_block_idx = cute.domain_offset(mask_block_offset[offset_idx], mask_block_idx)
+    if const_expr(full_block_cnt is not None):
+        assert full_block_offset is not None
+        assert full_block_idx is not None
+        curr_full_block_cnt = full_block_cnt[sparse_batch_idx, sparse_head_idx, m_block]
+        curr_full_block_idx = cute.domain_offset(full_block_offset[offset_idx], full_block_idx)
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_idx = None
+    return (curr_mask_block_cnt, curr_mask_block_idx, curr_full_block_cnt, curr_full_block_idx)
+
+
+@cute.jit
 def get_curr_blocksparse_tensors(
     batch_idx: cutlass.Int32,
     head_idx: cutlass.Int32,
@@ -76,6 +113,23 @@ def get_curr_blocksparse_tensors(
     if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
         return _get_curr_blocksparse_tensors_varlen(
             head_idx, m_block, blocksparse_tensors, seqlen_info
+        )
+    return get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, m_block, blocksparse_tensors
+    )
+
+
+@cute.jit
+def get_curr_blocksparse_tensors_fixed(
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
+    """Extract fixed-length 4D or CSR block-sparse data."""
+    if const_expr(blocksparse_tensors.mask_block_offset is not None):
+        return _get_curr_blocksparse_tensors_linear(
+            batch_idx, head_idx, m_block, blocksparse_tensors
         )
     return _get_curr_blocksparse_tensors(batch_idx, head_idx, m_block, blocksparse_tensors)
 
@@ -706,6 +760,162 @@ def produce_block_sparse_loads_sm100(
 
 
 @cute.jit
+def _get_curr_blocksparse_tensors_linear_raw(
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+):
+    """Fixed-length CSR path with raw compact offsets."""
+    mask_block_cnt = blocksparse_tensors.mask_block_cnt
+    mask_block_idx = blocksparse_tensors.mask_block_idx
+    full_block_cnt = blocksparse_tensors.full_block_cnt
+    full_block_idx = blocksparse_tensors.full_block_idx
+    mask_block_offset = blocksparse_tensors.mask_block_offset
+    full_block_offset = blocksparse_tensors.full_block_offset
+    assert mask_block_offset is not None
+
+    batch, nheads, n_blocks = mask_block_cnt.shape
+    sparse_batch_idx = 0 if batch == 1 else batch_idx
+    sparse_head_idx = 0 if nheads == 1 else head_idx
+    offset_idx = (
+        (0 if batch == 1 else batch_idx * nheads * n_blocks)
+        + (0 if nheads == 1 else head_idx * n_blocks)
+        + m_block
+    )
+
+    curr_mask_block_cnt = mask_block_cnt[sparse_batch_idx, sparse_head_idx, m_block]
+    curr_mask_block_offset = mask_block_offset[offset_idx]
+
+    if const_expr(full_block_cnt is not None):
+        assert full_block_offset is not None
+        assert full_block_idx is not None
+        curr_full_block_cnt = full_block_cnt[sparse_batch_idx, sparse_head_idx, m_block]
+        curr_full_block_offset = full_block_offset[offset_idx]
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_offset = Int32(0)
+        full_block_idx = None
+
+    return (
+        curr_mask_block_cnt,
+        curr_mask_block_offset,
+        mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_offset,
+        full_block_idx,
+    )
+
+
+@cute.jit
+def produce_block_sparse_loads_sm100_linear(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    pipeline_kv,
+    q_stage: cutlass.Constexpr,
+    q_producer_phase: Int32,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
+):
+    """SM100 non-SplitKV load path for fixed-length linear CSR block sparsity."""
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+
+    (
+        curr_mask_block_cnt,
+        curr_mask_block_offset,
+        curr_mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_offset,
+        curr_full_block_idx,
+    ) = _get_curr_blocksparse_tensors_linear_raw(
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        blocksparse_tensors,
+    )
+
+    mask_empty = curr_mask_block_cnt == 0
+    full_empty = curr_full_block_cnt == 0
+    q_phase_flipped = False
+
+    if mask_empty:
+        kv_producer_state = load_block_list_sm100(
+            curr_full_block_idx,
+            curr_full_block_offset,
+            curr_full_block_offset + curr_full_block_cnt,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        q_phase_flipped = not full_empty
+    else:
+        kv_producer_state = load_block_list_sm100(
+            curr_mask_block_idx,
+            curr_mask_block_offset,
+            curr_mask_block_offset + curr_mask_block_cnt,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        q_phase_flipped = True
+
+        if not full_empty:
+            kv_producer_state = load_block_list_sm100(
+                curr_full_block_idx,
+                curr_full_block_offset,
+                curr_full_block_offset + curr_full_block_cnt,
+                load_q_with_first=False,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+
+    if q_phase_flipped:
+        q_producer_phase ^= 1
+
+    return kv_producer_state, q_producer_phase
+
+
+@cute.jit
+def get_total_block_count_linear_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
+):
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    mask_block_cnt = blocksparse_tensors.mask_block_cnt
+    full_block_cnt = blocksparse_tensors.full_block_cnt
+    batch, nheads, _ = mask_block_cnt.shape
+    sparse_batch_idx = 0 if batch == 1 else batch_idx
+    sparse_head_idx = 0 if nheads == 1 else head_idx
+
+    total = mask_block_cnt[sparse_batch_idx, sparse_head_idx, m_block_sparse]
+    if const_expr(full_block_cnt is not None):
+        total = total + full_block_cnt[sparse_batch_idx, sparse_head_idx, m_block_sparse]
+    return total
+
+
+@cute.jit
 def get_total_block_count(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -874,6 +1084,7 @@ def softmax_block_sparse_sm100(
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
+    is_arbitrary: cutlass.Constexpr[bool],
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
@@ -914,7 +1125,11 @@ def softmax_block_sparse_sm100(
                 s0_s1_sequence_phase,
                 mask_n_block,
                 is_first=True,
-                mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
+                mask_fn=partial(
+                    mask_fn,
+                    mask_seqlen=not is_arbitrary,
+                    check_q_boundary=check_m_boundary,
+                ),
             )
             for i in cutlass.range(1, split_mask_block_cnt):
                 mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
@@ -943,9 +1158,7 @@ def softmax_block_sparse_sm100(
                     s0_s1_sequence_phase,
                     full_n_block,
                     is_first=True,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
-                    ),
+                    mask_fn=None,
                 )
             else:
                 (
@@ -958,9 +1171,7 @@ def softmax_block_sparse_sm100(
                     s0_s1_sequence_phase,
                     full_n_block,
                     is_first=False,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
-                    ),
+                    mask_fn=None,
                 )
             for i in cutlass.range(1, split_full_block_cnt):
                 full_n_block = curr_full_block_idx[full_end - 1 - i]
@@ -973,9 +1184,92 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     full_n_block,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
-                    ),
+                    mask_fn=None,
+                )
+
+    return (
+        mma_si_consumer_phase,
+        si_corr_producer_phase,
+        s0_s1_sequence_phase,
+        total_block_cnt == 0,
+    )
+
+
+@cute.jit
+def softmax_block_sparse_sm100_linear(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    softmax_step: Callable,
+    mask_fn: Callable,
+    mask_fn_none: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+    pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    q_stage: cutlass.Constexpr,
+    stage_idx: Int32,
+    check_m_boundary: bool,
+    is_arbitrary: cutlass.Constexpr[bool],
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """SM100 non-SplitKV softmax path for fixed-length linear CSR block sparsity."""
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+
+    (
+        curr_mask_block_cnt,
+        curr_mask_block_offset,
+        curr_mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_offset,
+        curr_full_block_idx,
+    ) = _get_curr_blocksparse_tensors_linear_raw(
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        blocksparse_tensors,
+    )
+    total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
+
+    if total_block_cnt == 0:
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
+    else:
+        if curr_mask_block_cnt > 0:
+            for i in cutlass.range(0, curr_mask_block_cnt):
+                mask_n_block = curr_mask_block_idx[
+                    curr_mask_block_offset + curr_mask_block_cnt - 1 - i
+                ]
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    mask_n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                )
+
+        if curr_full_block_cnt > 0:
+            for i in cutlass.range(0, curr_full_block_cnt):
+                full_n_block = curr_full_block_idx[
+                    curr_full_block_offset + curr_full_block_cnt - 1 - i
+                ]
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    full_n_block,
+                    mask_fn=None,
                 )
 
     return (
@@ -1010,10 +1304,10 @@ def get_total_q_block_count_bwd(
     m_block_max: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
-    q_block_cnt, _, full_block_cnt, _, *_ = blocksparse_tensors
-    total = q_block_cnt[batch_idx, head_idx, n_block]
-    if const_expr(full_block_cnt is not None):
-        total = total + full_block_cnt[batch_idx, head_idx, n_block]
+    curr_q_cnt, _, curr_full_cnt, _ = get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, n_block, blocksparse_tensors
+    )
+    total = curr_q_cnt + curr_full_cnt
     return total * subtile_factor
 
 
@@ -1154,23 +1448,59 @@ def get_block_sparse_iteration_info_bwd(
 
     Returns (curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count).
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, n_block, blocksparse_tensors
+    )
 
     sparse_block_count = curr_q_cnt
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         sparse_block_count = sparse_block_count + curr_full_cnt
     total_count = sparse_block_count * subtile_factor
 
     return curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count
+
+
+@cute.jit
+def get_curr_dq_write_order_bwd(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+):
+    curr_dq_write_order = None
+    curr_dq_write_order_full = None
+    if const_expr(blocksparse_tensors.dq_write_order is not None):
+        assert blocksparse_tensors.dq_write_order is not None
+        if const_expr(blocksparse_tensors.mask_block_offset is not None):
+            mask_block_cnt = blocksparse_tensors.mask_block_cnt
+            mask_block_offset = blocksparse_tensors.mask_block_offset
+            assert mask_block_offset is not None
+            batch, nheads, n_blocks = mask_block_cnt.shape
+            offset_idx = (
+                (0 if batch == 1 else batch_idx * nheads * n_blocks)
+                + (0 if nheads == 1 else head_idx * n_blocks)
+                + n_block
+            )
+            curr_dq_write_order = cute.domain_offset(
+                mask_block_offset[offset_idx], blocksparse_tensors.dq_write_order
+            )
+            if const_expr(blocksparse_tensors.dq_write_order_full is not None):
+                assert blocksparse_tensors.dq_write_order_full is not None
+                full_block_offset = blocksparse_tensors.full_block_offset
+                assert full_block_offset is not None
+                curr_dq_write_order_full = cute.domain_offset(
+                    full_block_offset[offset_idx], blocksparse_tensors.dq_write_order_full
+                )
+        else:
+            curr_dq_write_order = blocksparse_tensors.dq_write_order[
+                batch_idx, head_idx, n_block, None
+            ]
+            if const_expr(blocksparse_tensors.dq_write_order_full is not None):
+                assert blocksparse_tensors.dq_write_order_full is not None
+                curr_dq_write_order_full = blocksparse_tensors.dq_write_order_full[
+                    batch_idx, head_idx, n_block, None
+                ]
+    return curr_dq_write_order, curr_dq_write_order_full
 
 
 @cute.jit
@@ -1278,16 +1608,9 @@ def produce_block_sparse_q_loads_bwd_sm90(
 
     Returns updated (producer_state_Q, producer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, n_block, blocksparse_tensors
+    )
 
     kv_loaded = False
 
@@ -1316,7 +1639,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
             )
             kv_loaded = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
             sparse_idx = iter_idx // subtile_factor
             subtile_offset = iter_idx % subtile_factor
@@ -1373,16 +1696,9 @@ def consume_block_sparse_mma_bwd_sm90(
 
     Returns updated (consumer_state_Q, consumer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, n_block, blocksparse_tensors
+    )
 
     dKV_accumulate = False
 
@@ -1430,7 +1746,7 @@ def consume_block_sparse_mma_bwd_sm90(
             )
             dKV_accumulate = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
             sparse_idx = iter_idx // subtile_factor
             subtile_offset = iter_idx % subtile_factor
@@ -1499,16 +1815,9 @@ def dQaccum_store_block_sparse_bwd_sm90(
 
     Iterates partial blocks first, then full blocks, matching producer/consumer order.
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx = get_curr_blocksparse_tensors_fixed(
+        batch_idx, head_idx, n_block, blocksparse_tensors
+    )
 
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
         sparse_idx = iter_idx // subtile_factor
@@ -1525,7 +1834,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 tma_copy_bytes_dQ,
             )
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
             sparse_idx = iter_idx // subtile_factor
             subtile_offset = iter_idx % subtile_factor
