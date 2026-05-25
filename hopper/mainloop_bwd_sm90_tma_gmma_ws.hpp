@@ -581,14 +581,30 @@ struct CollectiveMainloopBwdSm90 {
                 }
             };
             
-            produce_block_sparse_loads_bwd<Q_dO_same_stages>(
-                block_sparse_info,
-                load_Q_LSE,
-                load_dO_dPsum,
-                load_KV,
-                smem_pipe_write,
-                smem_pipe_write_do
-            );
+            // When deterministic + block-sparse metadata is provided, walk
+            // m_blocks in the precomputed sorted order so the producer's
+            // sdQ slot index matches what store_dq's reduce warpgroup will
+            // later consume (it also iterates sorted_block_idx). Mismatched
+            // iteration orders would write partial-dQ at the wrong m_block.
+            if (block_sparse_info.has_deterministic_order()) {
+                produce_block_sparse_loads_bwd_deterministic<Q_dO_same_stages>(
+                    block_sparse_info,
+                    load_Q_LSE,
+                    load_dO_dPsum,
+                    load_KV,
+                    smem_pipe_write,
+                    smem_pipe_write_do
+                );
+            } else {
+                produce_block_sparse_loads_bwd<Q_dO_same_stages>(
+                    block_sparse_info,
+                    load_Q_LSE,
+                    load_dO_dPsum,
+                    load_KV,
+                    smem_pipe_write,
+                    smem_pipe_write_do
+                );
+            }
             
             scheduler_prefetch();
             if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
@@ -1216,12 +1232,24 @@ struct CollectiveMainloopBwdSm90 {
             };
             auto no_mask_fn = [](auto& tSrS, int m_block) { };
             
-            consume_block_sparse_mma_bwd(
-                block_sparse_info,
-                bwd_step,
-                arbitrary_mask_fn,  // For mask blocks: apply arbitrary mask
-                no_mask_fn          // For full blocks: no mask needed
-            );
+            // Keep the compute warpgroup iteration order in lock-step with
+            // the producer / reduce warpgroups when deterministic metadata
+            // is supplied (see ``produce_block_sparse_loads_bwd_deterministic``).
+            if (block_sparse_info.has_deterministic_order()) {
+                consume_block_sparse_mma_bwd_deterministic(
+                    block_sparse_info,
+                    bwd_step,
+                    arbitrary_mask_fn,
+                    no_mask_fn
+                );
+            } else {
+                consume_block_sparse_mma_bwd(
+                    block_sparse_info,
+                    bwd_step,
+                    arbitrary_mask_fn,  // For mask blocks: apply arbitrary mask
+                    no_mask_fn          // For full blocks: no mask needed
+                );
+            }
         } else {
             // ============================================================
             // Non-Block Sparse Path (original code)

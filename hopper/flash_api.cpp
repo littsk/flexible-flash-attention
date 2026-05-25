@@ -1896,6 +1896,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
             "for Hopper (SM90) in this build; got arch=", params.arch, ".");
     }
 
+    // On Hopper (SM90), the deterministic block-sparse backward pipeline
+    // requires the precomputed sorted iteration metadata so that the
+    // producer / compute / reduce warpgroups all walk m_blocks in the same
+    // order (see ``produce_block_sparse_loads_bwd_deterministic`` and
+    // ``store_dq_block_sparse_deterministic``). Without those tensors the
+    // store warpgroup falls back to ``store_dq_block_sparse`` (mask-then-full),
+    // which uses ``n_block`` as the lock key and silently scatters partial
+    // dQ values across the wrong m_blocks. Refuse to run that combination.
+    if (deterministic && use_block_sparsity && params.arch == 90 && !use_dq_lock) {
+        TORCH_CHECK(false,
+            "Deterministic backward with block sparsity on Hopper (SM90) "
+            "requires dq_lock_values / dq_lock_combined_offset / "
+            "sorted_block_idx / sorted_block_is_full to be provided. "
+            "Without them the kernel silently produces incorrect dQ.");
+    }
+
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel

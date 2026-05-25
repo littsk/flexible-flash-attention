@@ -955,6 +955,50 @@ void load_block_list_bwd(
 }
 
 /**
+ * Deterministic variant of ``produce_block_sparse_loads_bwd``.
+ *
+ * Walks m_blocks in the precomputed global sorted order
+ * (``sorted_block_idx[combined_start..combined_start + combined_total)``)
+ * instead of the legacy mask-then-full order, mirroring
+ * ``store_dq_block_sparse_deterministic`` so the producer / compute /
+ * reduce warpgroups all see the same m_block at iteration ``i``. Required
+ * for correctness of the deterministic dQ reduce pipeline under block
+ * sparsity, where the reduce side stores partial dQ at
+ * ``gdQ[sorted_block_idx[combined_start + i]]`` -- iterating producers in
+ * any other order would write partial-dQ produced for one m_block into a
+ * different m_block's slot.
+ *
+ * Reuses ``load_block_list_bwd`` by passing ``sorted_block_idx`` as the
+ * index array. ``load_kv_with_first=true`` mirrors the non-deterministic
+ * path (KV is loaded once, alongside the first iteration).
+ */
+template <bool Q_dO_same_stages,
+          typename LoadQLSE, typename LoadDODPsum, typename LoadKV,
+          typename PipelineState, typename PipelineStateDO>
+CUTLASS_DEVICE
+void produce_block_sparse_loads_bwd_deterministic(
+    BlockSparsityInfoBwd const& info,
+    LoadQLSE&& load_Q_LSE,
+    LoadDODPsum&& load_dO_dPsum,
+    LoadKV&& load_KV,
+    PipelineState& smem_pipe_write,
+    PipelineStateDO& smem_pipe_write_do
+) {
+    if (info.combined_total == 0) return;
+    load_block_list_bwd<Q_dO_same_stages>(
+        info.sorted_block_idx,
+        info.combined_start,
+        info.combined_total,
+        /*load_kv_with_first=*/true,
+        std::forward<LoadQLSE>(load_Q_LSE),
+        std::forward<LoadDODPsum>(load_dO_dPsum),
+        std::forward<LoadKV>(load_KV),
+        smem_pipe_write,
+        smem_pipe_write_do
+    );
+}
+
+/**
  * Main entry point for block sparse backward loading.
  *
  * Processing order:
@@ -1058,6 +1102,41 @@ void consume_block_sparse_mma_bwd(
     for (int i = 0; i < info.full_block_cnt; ++i) {
         int m_block = info.get_full_m_block(i);
         bwd_step(m_block, non_mask_fn);
+    }
+}
+
+/**
+ * Deterministic variant: walks m_blocks in the precomputed global sorted
+ * order, dispatching ``mask_fn`` vs ``non_mask_fn`` based on
+ * ``sorted_block_is_full`` so the per-entry arbitrary-mask vs full-tile
+ * distinction is preserved despite the reordering.
+ *
+ * Must match the iteration order of
+ * ``produce_block_sparse_loads_bwd_deterministic`` and
+ * ``store_dq_block_sparse_deterministic`` -- all three warpgroups consume
+ * the same sdQ slot at iteration ``i`` as referring to
+ * ``sorted_block_idx[combined_start + i]``. If any of the three drift to a
+ * different iteration order, the consumer/producer barrier hand-off scatters
+ * dQ values across the wrong m_blocks (only dq is affected; dk/dv accumulate
+ * per-CTA without cross-CTA semaphore so they are immune).
+ */
+template <typename BwdStep, typename MaskFn, typename NonMaskFn>
+CUTLASS_DEVICE
+void consume_block_sparse_mma_bwd_deterministic(
+    BlockSparsityInfoBwd const& info,
+    BwdStep&& bwd_step,
+    MaskFn&& mask_fn,
+    NonMaskFn&& non_mask_fn
+) {
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int i = 0; i < info.combined_total; ++i) {
+        int const m_block = info.sorted_block_idx[info.combined_start + i];
+        bool const is_full = info.sorted_block_is_full[info.combined_start + i] != 0;
+        if (is_full) {
+            bwd_step(m_block, non_mask_fn);
+        } else {
+            bwd_step(m_block, mask_fn);
+        }
     }
 }
 
