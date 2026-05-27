@@ -132,6 +132,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.softcap,
         params.b,
         params.dq_semaphore,
+        // dq_accum_split_stride: element count in one dQaccum slice. Non-zero
+        // only on the SM80 deterministic path (see allocation in
+        // ``flash_api_stable.cpp``); the mainloop offsets dQaccum by
+        // ``n_block * dq_accum_split_stride`` so each n_block CTA writes its
+        // own private slice. SM90 has its own lock-chain deterministic path
+        // so the stride is left at 0 there.
+        Arch >= 90 ? int64_t(0) : params.dq_accum_split_stride,
         params.cu_seqlens_q, params.cu_seqlens_k,
         params.seqused_q, params.seqused_k,
         // Block sparsity arguments (K2Q direction for backward). Trailing
@@ -242,6 +249,20 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
         AttnKernel::CollectiveMainloop::dQ_swapAB
         >;
+    // dQaccum split-buffer reduction parameters for SM80 deterministic bwd.
+    //
+    // On SM80, when ``dq_accum_split_stride`` is non-zero, the mainloop has
+    // written ``num_splits`` private dQaccum slices (one per n_block, see
+    // ``flash_api_stable.cpp`` allocation site and ``mainloop_bwd_sm80.hpp``
+    // per-CTA offset). The postprocess kernel sums these slices in fixed
+    // ascending split-index order to produce a bit-exact deterministic dQ.
+    //
+    // SM90 has its own dq_semaphore lock-chain so split-buffer is unused
+    // (``dq_accum_split_stride == 0``); we force ``num_splits == 1`` here so
+    // the postprocess loop degenerates to its single-slice fast path.
+    int const num_dq_accum_splits = (Arch < 90 && params.dq_accum_split_stride != 0)
+        ? cute::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}))
+        : 1;
     typename PostprocessKernel::Arguments postprocess_args {
         static_cast<ElementAccum const*>(params.dq_accum_ptr),
         {seqlen_q_rounded * params.d_rounded, params.h, batch_q},  // shape_dQaccum
@@ -251,7 +272,9 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        num_dq_accum_splits,
+        Arch < 90 ? params.dq_accum_split_stride : int64_t(0)
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
