@@ -309,6 +309,13 @@ struct CollectiveMainloopBwdSm80 {
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
+        // Element count in one dQaccum split slice. When non-zero (SM80
+        // deterministic path) the mainloop offsets its dQaccum pointer by
+        // ``n_block * dq_accum_split_stride`` so each n_block CTA writes to
+        // its own private dQaccum slice and there's no cross-CTA atomicAdd
+        // contention. The postprocess kernel later sums all slices in
+        // deterministic order. Zero == no offset (legacy single-slice path).
+        int64_t const dq_accum_split_stride = 0;
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
@@ -350,6 +357,8 @@ struct CollectiveMainloopBwdSm80 {
         float const softcap_val;
         int const num_batch;
         int *const dq_semaphore;
+        // Element count in one dQaccum split slice; see ``Arguments`` above.
+        int64_t const dq_accum_split_stride = 0;
         int const *const cu_seqlens_q = nullptr;
         int const *const cu_seqlens_k = nullptr;
         int const *const seqused_q = nullptr;
@@ -389,6 +398,7 @@ struct CollectiveMainloopBwdSm80 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
+                args.dq_accum_split_stride,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
                 // Block sparsity params - convert from Arguments to Params (same structure)
                 {args.block_sparse.mask_block_cnt, args.block_sparse.mask_block_offset, args.block_sparse.mask_block_idx,
@@ -459,7 +469,19 @@ struct CollectiveMainloopBwdSm80 {
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), params.shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_LSE, params.stride_dPsum)(_, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
+        // Offset dQaccum pointer by ``n_block * dq_accum_split_stride`` when
+        // running the SM80 deterministic split-buffer path. In non-
+        // deterministic mode ``dq_accum_split_stride`` is 0, so the offset
+        // becomes a no-op and all n_block CTAs share the original single
+        // dQaccum slice (with their racy atomicAdd contention preserved as
+        // the legacy non-deterministic behaviour). When non-zero, each
+        // n_block CTA writes to its own private slice and the postprocess
+        // kernel later sums them in deterministic order. See
+        // ``flash_api_stable.cpp`` / ``flash_bwd_postprocess_kernel.h`` for
+        // the matching allocator / reducer code paths.
+        ElementAccum* dq_accum_ptr_split = reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)
+            + n_block * params.dq_accum_split_stride;
+        Tensor mdQaccum = make_tensor(make_gmem_ptr(dq_accum_ptr_split),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen_q ? bidb : 0);
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (M, K, _)

@@ -1715,10 +1715,47 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
         softmax_lse_log2 = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
     }
     Tensor dq_accum, dk_accum, dv_accum;
+    // dQ-accum split-buffer for SM80 (Ampere / Ada) deterministic bwd.
+    //
+    // Hopper (SM90) achieves bit-exact deterministic dQ via the
+    // ``dq_semaphore`` lock-chain in ``mainloop_bwd_sm90_tma_gmma_ws.hpp``
+    // (each m_block's writers serialize on a per-m_block semaphore). SM80's
+    // mainloop has no such mechanism -- it streams partial dQ from all
+    // (n_block, bidh, bidb) CTAs into the same ``dQaccum[bidh, bidb]`` slice
+    // via ``atomicAdd``, whose cross-CTA ordering is implementation-defined,
+    // making the fp32 reduction non-deterministic.
+    //
+    // To make SM80 truly bit-exact we replicate the strategy used by FA2
+    // (``csrc/flash_attn/src/flash_bwd_kernel.h:122``): allocate
+    // ``num_n_blocks`` private ``dQaccum`` slices, one per n_block, and have
+    // each CTA write to its own slice (no cross-CTA contention). The
+    // post-process kernel then sums the ``num_n_blocks`` slices in a fixed
+    // sequential order, producing identical fp32 reductions across runs.
+    //
+    // We use a conservative ``kBlockN_min = 64`` for the allocation upper
+    // bound since the actual ``kBlockN`` is only resolved inside
+    // ``run_mha_bwd_dispatch`` (after this allocation). When the kernel
+    // picks a larger ``kBlockN``, the trailing slots stay zero (allocated
+    // with ``fill_(0)``) and the postprocess loop only iterates the actual
+    // ``num_n_blocks`` (computed later in ``run_flash_bwd``).
+    bool const use_dq_accum_splits = deterministic && arch < 90;
+    int const num_n_blocks_alloc_upper_bound = use_dq_accum_splits
+        ? (seqlen_k + 63) / 64  // ceil_div(seqlen_k, kBlockN_min=64)
+        : 1;
     if (!is_varlen) {
-        dq_accum = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+        if (use_dq_accum_splits) {
+            dq_accum = torch::stable::new_empty(q, {num_n_blocks_alloc_upper_bound, batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+            dq_accum = torch::stable::fill_(dq_accum, 0.0);
+        } else {
+            dq_accum = torch::stable::new_empty(q, {batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+        }
     } else {
-        dq_accum = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+        if (use_dq_accum_splits) {
+            dq_accum = torch::stable::new_empty(q, {num_n_blocks_alloc_upper_bound, num_heads, total_q_padded_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+            dq_accum = torch::stable::fill_(dq_accum, 0.0);
+        } else {
+            dq_accum = torch::stable::new_empty(q, {num_heads, total_q_padded_rounded * head_size_rounded}, std::make_optional(torch::headeronly::ScalarType::Float));
+        }
     }
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
@@ -1765,6 +1802,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
+
+    // dq_accum_split_stride is the number of fp32 elements in ONE dq_accum
+    // slice (i.e. ``dq_accum.stride(0)`` of the [nsplits, ...] tensor). When
+    // ``use_dq_accum_splits`` is false the value is 0 so the kernel's offset
+    // ``n_block * dq_accum_split_stride`` is a no-op. See top-of-file
+    // comments at the dq_accum allocation site for the design rationale.
+    params.dq_accum_split_stride = use_dq_accum_splits
+        ? (!is_varlen
+               ? static_cast<int64_t>(batch_size) * num_heads * seqlen_q_rounded * head_size_rounded
+               : static_cast<int64_t>(num_heads) * total_q_padded_rounded * head_size_rounded)
+        : 0;
 
     // Set arbitrary mask function parameters for backward
     params.is_arbitrary = is_arbitrary;  // Use the value computed earlier for kBlockM
@@ -1930,10 +1978,13 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
         params.sorted_block_is_full = nullptr;
     }
 
-    if (deterministic && use_block_sparsity && params.arch < 90) {
-        STD_TORCH_CHECK(false,
-            "Deterministic backward with block sparsity is only implemented for SM90 in this build.");
-    }
+    // Intentionally no ``arch < 90`` guard for ``deterministic +
+    // block_sparse`` here: the pre-SM90-determin codebase let the SM80
+    // mainloop run this combination (best-effort determinism via
+    // SPT-reversed iteration, matching upstream Tri Dao FA semantics for
+    // Ampere). A previous guard at this point hard-errored on SM80 and
+    // broke Ampere users; restoring the old behaviour. See ``flash_api.cpp``
+    // for the matching commentary in the non-stable API path.
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::headeronly::ScalarType::Int)) : torch::empty({1}, opts.dtype(torch::headeronly::ScalarType::Int));
     // params.tile_count_semaphore = static_cast<int*>(tile_count_semaphore.data_ptr());

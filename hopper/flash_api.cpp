@@ -1650,10 +1650,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         softmax_lse_log2 = torch::empty({num_heads, total_q_padded_rounded}, opts.dtype(at::kFloat));
     }
     at::Tensor dq_accum, dk_accum, dv_accum;
+    // dQ-accum split-buffer for SM80 (Ampere / Ada) deterministic bwd.
+    // See ``flash_api_stable.cpp`` at the matching site for the full
+    // commentary; the gist is that the SM80 mainloop has no semaphore lock-
+    // chain (which is how Hopper guarantees bit-exact dQ), so we allocate
+    // ``num_n_blocks`` private dQaccum slices and let each n_block CTA write
+    // to its own slice. The postprocess kernel then sums them in fixed order.
+    bool const use_dq_accum_splits = deterministic && arch < 90;
+    int const num_n_blocks_for_split = use_dq_accum_splits
+        ? (seqlen_k + kBlockN - 1) / kBlockN
+        : 1;
     if (!is_varlen) {
-        dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        if (use_dq_accum_splits) {
+            dq_accum = torch::zeros({num_n_blocks_for_split, batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        } else {
+            dq_accum = torch::empty({batch_size, num_heads, seqlen_q_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        }
     } else {
-        dq_accum = torch::empty({num_heads, total_q_padded_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        if (use_dq_accum_splits) {
+            dq_accum = torch::zeros({num_n_blocks_for_split, num_heads, total_q_padded_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        } else {
+            dq_accum = torch::empty({num_heads, total_q_padded_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+        }
     }
     if (num_heads_k != num_heads) {  // MQA / GQA
         if (!is_varlen) {
@@ -1696,6 +1714,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
+
+    // dq_accum_split_stride: element count in one dq_accum slice. The kernel
+    // computes its per-CTA write offset as ``n_block * dq_accum_split_stride``.
+    // Set to 0 when split-buffer is not enabled, so the offset is a no-op.
+    params.dq_accum_split_stride = use_dq_accum_splits
+        ? (!is_varlen
+               ? static_cast<int64_t>(batch_size) * num_heads * seqlen_q_rounded * head_size_rounded
+               : static_cast<int64_t>(num_heads) * total_q_padded_rounded * head_size_rounded)
+        : 0;
 
     // Set arbitrary mask function parameters for backward
     params.is_arbitrary = is_arbitrary;  // Use the value computed earlier for kBlockM
@@ -1887,15 +1914,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
         params.sorted_block_is_full = nullptr;
     }
 
-    // sm80 does not yet implement the sorted/lock-based deterministic bwd for
-    // block sparsity. Guard the unsupported combination explicitly so the user
-    // does not silently get non-deterministic results.
-    if (deterministic && use_block_sparsity && params.arch < 90) {
-        TORCH_CHECK(false,
-            "Deterministic backward with block sparsity is only implemented "
-            "for Hopper (SM90) in this build; got arch=", params.arch, ".");
-    }
-
     // On Hopper (SM90), the deterministic block-sparse backward pipeline
     // requires the precomputed sorted iteration metadata so that the
     // producer / compute / reduce warpgroups all walk m_blocks in the same
@@ -1904,6 +1922,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     // store warpgroup falls back to ``store_dq_block_sparse`` (mask-then-full),
     // which uses ``n_block`` as the lock key and silently scatters partial
     // dQ values across the wrong m_blocks. Refuse to run that combination.
+    //
+    // For SM80 (Ampere / Ada) the mainloop has no warp-specialized store
+    // path, so cross-CTA atomicAdd order to ``dQaccum`` is intrinsically
+    // non-deterministic and the lock-chain protocol does not apply. We
+    // intentionally do NOT block ``deterministic + block_sparse`` on SM80
+    // here -- the pre-SM90-determin behaviour was for the kernel to simply
+    // run (matching the upstream Tri Dao FA semantics where Ampere
+    // ``Deterministic`` is best-effort via SPT-reversed iteration). A
+    // previous guard at this point hard-errored on SM80 and broke users
+    // who were on Ampere; restoring the old behaviour now.
     if (deterministic && use_block_sparsity && params.arch == 90 && !use_dq_lock) {
         TORCH_CHECK(false,
             "Deterministic backward with block sparsity on Hopper (SM90) "

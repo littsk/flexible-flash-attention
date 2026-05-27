@@ -118,6 +118,17 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        // SM80 deterministic dQaccum split-buffer reduction. When
+        // ``num_splits > 1`` the kernel sums ``num_splits`` slices of dQaccum
+        // (each at offset ``split_idx * dq_accum_split_stride``) in fixed
+        // ascending split-index order before converting to fp16/bf16. This
+        // produces a bit-exact deterministic dQ on architectures that lack
+        // the SM90 dq_semaphore lock-chain. See the matching allocator in
+        // ``flash_api_stable.cpp`` and the mainloop per-CTA offset in
+        // ``mainloop_bwd_sm80.hpp``. Defaults below preserve the legacy
+        // single-slice behaviour (num_splits=1, stride=0).
+        int num_splits = 1;
+        int64_t dq_accum_split_stride = 0;
     };
 
     // Kernel entry point API
@@ -131,6 +142,9 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        // See ``Arguments`` above.
+        int num_splits = 1;
+        int64_t dq_accum_split_stride = 0;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -146,7 +160,9 @@ public:
             args.stride_dQ,
             args.softmax_scale,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.num_splits,
+            args.dq_accum_split_stride
         };
     }
 
@@ -171,8 +187,20 @@ public:
         bool const is_varlen = params.cu_seqlens;
         if (is_varlen && m_block * kBlockM >= seqlen_info.seqlen) { return; }
 
-        // Step 1: load dQaccum from gmem to smem
-        Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
+        // Step 1: load dQaccum from gmem to smem.
+        //
+        // SM90 path: single-split bulk copy (Hopper's dq_semaphore lock-chain
+        //   already serialises writes in the mainloop, so there's only one
+        //   slice to read).
+        // SM80 path: when ``params.num_splits > 1`` we sum ``num_splits``
+        //   dQaccum slices in fixed ascending split-index order, matching the
+        //   per-CTA private-slice writes from the mainloop's ``n_block *
+        //   dq_accum_split_stride`` offset. This is what makes SM80 dQ
+        //   bit-exact deterministic in this build (and mirrors the FA2 SM80
+        //   approach in ``csrc/flash_attn/src/flash_bwd_preprocess_kernel.h
+        //   ::convert_dQ``).
+        ElementAccum const* ptr_dQaccum_base = reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum);
+        Tensor mdQaccum = make_tensor(make_gmem_ptr(ptr_dQaccum_base),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
         if constexpr (IsSm90) {  // Use BulkCopy
@@ -191,8 +219,44 @@ public:
             auto g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccumg2s = g2s_thr_copy_dQaccum.partition_S(gdQaccum);
             Tensor tdQsdQaccumg2s = g2s_thr_copy_dQaccum.partition_D(sdQaccum);
+            // Load split 0 directly into smem (same as the legacy
+            // single-slice fast path; for ``num_splits == 1`` this is the
+            // only iteration and behaviour is unchanged).
             cute::copy(g2s_tiled_copy_dQaccum, tdQgdQaccumg2s, tdQsdQaccumg2s);
             __syncthreads();
+            // Sum the remaining splits into smem in strict ascending
+            // split-index order. Each thread accesses its own per-thread
+            // slice of smem (the same partitioning that ``g2s_thr_copy``
+            // applied), so there's no intra-CTA contention and no atomic is
+            // required.
+            for (int split_idx = 1; split_idx < params.num_splits; ++split_idx) {
+                Tensor mdQaccum_s = make_tensor(
+                    make_gmem_ptr(ptr_dQaccum_base + static_cast<int64_t>(split_idx) * params.dq_accum_split_stride),
+                    params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
+                Tensor gdQaccum_s = local_tile(
+                    domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum_s),
+                    Shape<Int<kBlockM * kHeadDim>>{},
+                    make_coord(m_block));
+                Tensor tdQgdQaccumg2s_s = g2s_thr_copy_dQaccum.partition_S(gdQaccum_s);
+                Tensor tdQrdQaccum_s = make_fragment_like(tdQgdQaccumg2s_s);
+                // Plain gmem -> register copy (default cute::copy, no
+                // tiled-copy traits) so we don't accidentally trigger the
+                // SMEM-shared cp.async path that ``g2s_tiled_copy_dQaccum``
+                // would issue. tdQrdQaccum_s already has the per-thread
+                // partition layout from ``g2s_thr_copy_dQaccum.partition_S``.
+                cute::copy(tdQgdQaccumg2s_s, tdQrdQaccum_s);
+                // tdQsdQaccumg2s is this thread's slice of smem; tdQrdQaccum_s
+                // is the matching slice loaded from the current split. Both
+                // have the same per-thread shape, so the accumulation is a
+                // straight per-element add into smem (no atomic needed --
+                // each thread accesses only its own smem partition).
+                CUTE_STATIC_ASSERT_V(size(tdQrdQaccum_s) == size(tdQsdQaccumg2s));
+                #pragma unroll
+                for (int i = 0; i < size(tdQrdQaccum_s); ++i) {
+                    tdQsdQaccumg2s(i) = tdQsdQaccumg2s(i) + tdQrdQaccum_s(i);
+                }
+                __syncthreads();
+            }
         }
 
         // __syncthreads(); if (cute::thread0()) { print_tensor(sdQaccum); }
