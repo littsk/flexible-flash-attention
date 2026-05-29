@@ -323,6 +323,11 @@ struct CollectiveMainloopBwdSm90 {
         float const softcap_val;
         int const num_batch;
         int* const dq_semaphore;
+        // SM90 uses its own lock-chain deterministic path, so this is always
+        // passed as 0 by flash_bwd_launch_template.h. The field only needs to
+        // exist here so the aggregate initializer shared with the SM80 mainloop
+        // (which does use the dQaccum split path) stays positionally aligned.
+        int64_t const dq_accum_split_stride = 0;
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
