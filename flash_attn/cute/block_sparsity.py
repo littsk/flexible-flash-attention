@@ -23,6 +23,11 @@ class BlockSparseTensors(NamedTuple):
     cu_block_idx_offsets: cute.Tensor | None = None
     dq_write_order: cute.Tensor | None = None
     dq_write_order_full: cute.Tensor | None = None
+    # Per-kv-block readiness signal (int32, shape [num_n_blocks]). When provided,
+    # the forward load warp polls signal[n_block] in GMEM and only issues the TMA
+    # load of that K/V block once the value is non-zero. This enables overlapping
+    # remote KV delivery (e.g. context-parallel all-gather) with attention compute.
+    kv_block_signal: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -47,6 +52,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     dq_write_order: torch.Tensor | None = None
     dq_write_order_full: torch.Tensor | None = None
     spt: bool | None = None
+    # Per-kv-block readiness signal (int32, shape [num_n_blocks]); see BlockSparseTensors.
+    kv_block_signal: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -475,6 +482,7 @@ def normalize_block_sparse_tensors(
         dq_write_order=dq_write_order,
         dq_write_order_full=dq_write_order_full,
         spt=spt,
+        kv_block_signal=tensors.kv_block_signal,
     )
 
 
@@ -657,6 +665,13 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.dq_write_order, tensors.dq_write_order_full)
     ]
+    kv_block_signal_tensor = (
+        to_cute_tensor(
+            tensors.kv_block_signal, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+        )
+        if tensors.kv_block_signal is not None
+        else None
+    )
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -667,6 +682,7 @@ def to_cute_block_sparse_tensors(
         cu_block_idx_offsets_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+        kv_block_signal_tensor,
     )
 
 

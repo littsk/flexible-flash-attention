@@ -729,6 +729,7 @@ def _flash_attn_fwd(
         v_descale is not None,
         block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
         block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
+        block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1086,6 +1087,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.cu_block_idx_offsets,
                     normalized_block_sparse_tensors.dq_write_order,
                     normalized_block_sparse_tensors.dq_write_order_full,
+                    normalized_block_sparse_tensors.kv_block_signal,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1912,6 +1914,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.cu_block_idx_offsets,
                 normalized_block_sparse_tensors.dq_write_order,
                 normalized_block_sparse_tensors.dq_write_order_full,
+                normalized_block_sparse_tensors.kv_block_signal,
             )
             if normalized_block_sparse_tensors is not None
             else None,

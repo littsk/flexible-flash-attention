@@ -28,6 +28,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+import cutlass.utils.distributed as cute_dist
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
@@ -1443,6 +1444,16 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
+            # Per-kv-block readiness signal (context-parallel overlap). When present,
+            # the K load of block n polls kv_block_signal[n] in GMEM until it is set
+            # before issuing the TMA load. We gate on K only since K and V of the same
+            # block are loaded back-to-back and the producer marks the signal once both
+            # K and V of that block have arrived.
+            kv_block_signal = (
+                blocksparse_tensors.kv_block_signal
+                if const_expr(blocksparse_tensors is not None)
+                else None
+            )
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1452,6 +1463,7 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                kv_signal=kv_block_signal,
             )
             load_V = partial(
                 self.load_KV,
@@ -3019,8 +3031,22 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        kv_signal: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
+        # Gated KV load: spin on the per-block readiness signal in GMEM before
+        # touching this block's K/V. Mirrors the gate_a_flags pattern used in the
+        # all-gather GEMM example: a peer copy stream fills the block then sets the
+        # signal, and the load warp polls here so compute overlaps the transfer.
+        if const_expr(kv_signal is not None):
+            if cute.arch.lane_idx() == 0:
+                sig_view = cute.make_tensor(
+                    kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
+                )
+                ready = cute_dist.ld_bypass(sig_view)[0]
+                while ready == 0:
+                    ready = cute_dist.ld_bypass(sig_view)[0]
+            cute.arch.sync_warp()
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
         extra_tx_count = (
