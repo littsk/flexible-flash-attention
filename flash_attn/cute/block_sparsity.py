@@ -28,6 +28,10 @@ class BlockSparseTensors(NamedTuple):
     # load of that K/V block once the value is non-zero. This enables overlapping
     # remote KV delivery (e.g. context-parallel all-gather) with attention compute.
     kv_block_signal: cute.Tensor | None = None
+    # Observability trace (int64, shape [num_n_blocks, 3]). When provided, the load
+    # warp records the GPU globaltimer (ns) at three points per kv-block:
+    # [.,0]=wait-start, [.,1]=signal-ready, [.,2]=load-issued. No-op when absent.
+    kv_block_trace: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -54,6 +58,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     spt: bool | None = None
     # Per-kv-block readiness signal (int32, shape [num_n_blocks]); see BlockSparseTensors.
     kv_block_signal: torch.Tensor | None = None
+    # Observability trace (int64, shape [num_n_blocks, 3]); see BlockSparseTensors.
+    kv_block_trace: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -483,6 +489,7 @@ def normalize_block_sparse_tensors(
         dq_write_order_full=dq_write_order_full,
         spt=spt,
         kv_block_signal=tensors.kv_block_signal,
+        kv_block_trace=tensors.kv_block_trace,
     )
 
 
@@ -672,6 +679,13 @@ def to_cute_block_sparse_tensors(
         if tensors.kv_block_signal is not None
         else None
     )
+    kv_block_trace_tensor = (
+        to_cute_tensor(
+            tensors.kv_block_trace, assumed_align=8, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+        )
+        if tensors.kv_block_trace is not None
+        else None
+    )
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -683,6 +697,7 @@ def to_cute_block_sparse_tensors(
         dq_write_order_tensor,
         dq_write_order_full_tensor,
         kv_block_signal_tensor,
+        kv_block_trace_tensor,
     )
 
 

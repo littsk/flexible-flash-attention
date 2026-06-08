@@ -31,6 +31,37 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 import cutlass.utils.distributed as cute_dist
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import T as _mlir_T
+from cutlass._mlir.dialects import llvm as _llvm, nvvm as _nvvm
+
+
+@cute.jit
+def _trace_store_globaltimer(trace, idx):
+    """Observability (--obs): record the GPU %globaltimer (ns) into trace[idx], once.
+
+    `trace` is a 1D int64 GMEM tensor of length num_n_blocks*3; idx = block*3 + slot
+    where slot is 0=wait-start, 1=signal-ready, 2=load-issued. Single-thread store via
+    inline PTX so it adds one global write and never touches the SM compute pipeline.
+
+    First-touch semantics: the persistent scheduler re-loads each kv-block once per
+    q-tile, but only the *first* visit can observe a real wait (later visits find the
+    signal already set). We therefore write only when the slot is still 0, so the trace
+    captures the genuine first-touch wait/ready/consume of each block rather than the
+    last (already-ready) re-load.
+    """
+    view = cute.make_tensor(trace.iterator + idx, cute.make_layout((1,), stride=(1,)))
+    cur = cute_dist.ld_bypass(view)[0]
+    if cur == 0:
+        ts = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+        ptr = trace.iterator + idx
+        _llvm.inline_asm(
+            None,
+            [ptr.toint().ir_value(), ts.ir_value()],
+            "st.global.u64 [$0], $1;",
+            "l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+        )
 
 from quack import copy_utils, layout_utils
 
@@ -1454,6 +1485,11 @@ class FlashAttentionForwardSm100:
                 if const_expr(blocksparse_tensors is not None)
                 else None
             )
+            kv_block_trace = (
+                blocksparse_tensors.kv_block_trace
+                if const_expr(blocksparse_tensors is not None)
+                else None
+            )
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1464,6 +1500,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
                 kv_signal=kv_block_signal,
+                kv_trace=kv_block_trace,
             )
             load_V = partial(
                 self.load_KV,
@@ -3032,6 +3069,7 @@ class FlashAttentionForwardSm100:
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
         kv_signal: Optional[cute.Tensor] = None,
+        kv_trace: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         # Gated KV load: spin on the per-block readiness signal in GMEM before
@@ -3040,12 +3078,18 @@ class FlashAttentionForwardSm100:
         # signal, and the load warp polls here so compute overlaps the transfer.
         if const_expr(kv_signal is not None):
             if cute.arch.lane_idx() == 0:
+                # [.,0] wait-start: kernel reaches this block and begins polling.
+                if const_expr(kv_trace is not None):
+                    _trace_store_globaltimer(kv_trace, block * 3 + 0)
                 sig_view = cute.make_tensor(
                     kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
                 )
                 ready = cute_dist.ld_bypass(sig_view)[0]
                 while ready == 0:
                     ready = cute_dist.ld_bypass(sig_view)[0]
+                # [.,1] signal-ready: producer's push for this block is now visible.
+                if const_expr(kv_trace is not None):
+                    _trace_store_globaltimer(kv_trace, block * 3 + 1)
             cute.arch.sync_warp()
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
@@ -3055,6 +3099,12 @@ class FlashAttentionForwardSm100:
         )
         extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
         pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
+        # [.,2] load-issued: smem stage is free and this block's TMA load is about to
+        # fire. (consume - wait-start) is the per-block stall bubble; (consume - ready)
+        # is post-delivery pipeline backpressure.
+        if const_expr(kv_trace is not None):
+            if cute.arch.lane_idx() == 0:
+                _trace_store_globaltimer(kv_trace, block * 3 + 2)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
