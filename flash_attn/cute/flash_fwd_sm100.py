@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -94,6 +95,8 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerProtocol,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
+    GroupedPersistentTileScheduler,
+    MBlockGroupBatchTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
@@ -267,10 +270,29 @@ class FlashAttentionForwardSm100:
 
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
 
+        # Opt-in grouped tile walk (batch -> kv-head group -> sequence -> intra-group)
+        # for the distributed CP comm pattern; STATIC + dense (non-causal) only. See
+        # GroupedPersistentTileScheduler. Off by default (set FA_TILE_GROUP_INNER=1).
+        # GroupedPersistentTileScheduler is incompatible with pack-GQA: packing folds
+        # the q-heads into the M dimension, so its (group, intra) head split would drop
+        # tiles and silently corrupt the output. Only honor the opt-in for non-packed
+        # GQA/MHA; otherwise fall back to the static walk.
+        self.group_inner_sched = (
+            os.environ.get("FA_TILE_GROUP_INNER", "0") == "1" and not self.pack_gqa
+        )
+        # Opt-in (m_block, group, batch) walk: m_block is the OUTER loop so the
+        # q/sequence frontier advances slowly (consume every group+batch at one
+        # m_block before moving on). Only permutes the coarse axes, so it is
+        # pack-GQA compatible. Off by default (set FA_TILE_MBLOCK_OUTER=1).
+        self.mblock_outer_sched = os.environ.get("FA_TILE_MBLOCK_OUTER", "0") == "1"
         if is_varlen_q:
             self.TileScheduler = SingleTileVarlenScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
+        elif self.is_persistent and self.group_inner_sched:
+            self.TileScheduler = GroupedPersistentTileScheduler
+        elif self.is_persistent and self.mblock_outer_sched:
+            self.TileScheduler = MBlockGroupBatchTileScheduler
         elif self.is_persistent:
             self.TileScheduler = StaticPersistentTileScheduler
         else:
@@ -686,6 +708,7 @@ class FlashAttentionForwardSm100:
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead=self.qhead_per_kvhead,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,

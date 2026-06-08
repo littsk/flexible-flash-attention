@@ -158,6 +158,9 @@ class TileSchedulerArguments(ParamsBase):
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    # True GQA ratio (q-heads / kv-heads), independent of pack_gqa. Used by the
+    # grouped tile scheduler to split head_idx into (kv-head group, intra-group head).
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
@@ -388,6 +391,262 @@ class StaticPersistentTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class GroupedPersistentTileScheduler:
+    """Persistent scheduler with a GQA-group-aware tile walk for distributed CP.
+
+    Decodes the linear tile index with nesting (outer -> inner):
+
+        batch -> kv-head group (inter-group) -> sequence (q m-block) -> intra-group
+
+    vs. ``StaticPersistentTileScheduler`` whose equivalent nesting is
+    ``batch -> group -> intra-group -> sequence`` (sequence innermost). The only
+    change is swapping the two innermost axes, but it is exactly what helps a
+    push/pull KV comm pattern:
+
+      * intra-group innermost: the kernel dwells ``R = qhead_per_kvhead`` tiles at
+        each q-block before advancing the sequence, so its KV-block consumption
+        frontier advances R x slower -- matched to the producer's per-block
+        delivery rate. One head-of-line stall is spread into R small ones (or
+        hidden), instead of head r0 sprinting through all sequence and eating the
+        whole remote-delivery latency as a single bubble (the observed band).
+      * each per-(group, m-block) signal-wait is followed by R compute tiles that
+        reuse the *identical* (hot) KV -> wait:compute ratio 1:R.
+      * inter-group second-outermost: one group's KV is consumed fully before the
+        next, so it is a self-contained comm unit (compute group g while group g+1
+        streams in) and only one group's KV need be resident.
+
+    For MHA (R == 1) the intra axis is trivial and the walk is identical to
+    StaticPersistentTileScheduler (a useful no-regression check). STATIC only and
+    cluster_m == 1 (CLC decides its own order; cluster unpacking not handled here).
+
+    NOT compatible with pack-GQA: when ``pack_gqa`` is on, the q-heads of a group
+    are folded into the M (sequence) dimension, so ``num_head`` becomes the kv-head
+    count and ``num_block`` is the packed q-tile count -- the (group, intra) split
+    below no longer maps to physical heads and would drop tiles. The caller must
+    only select this scheduler when ``pack_gqa`` is False (see flash_fwd_sm100).
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        total_blocks: Int32
+        num_block_divmod: FastDivmodDivisor
+        num_groups_divmod: FastDivmodDivisor
+        qhead_per_kvhead_divmod: FastDivmodDivisor
+        qhead_per_kvhead: Int32
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "GroupedPersistentTileScheduler.Params":
+            assert cute.size(args.cluster_shape_mn) == 1, (
+                "GroupedPersistentTileScheduler only supports cluster_shape == 1"
+            )
+            R = max(1, args.qhead_per_kvhead)
+            num_groups = args.num_head // R
+            return GroupedPersistentTileScheduler.Params(
+                total_blocks=args.num_block * args.num_head * args.num_batch,
+                num_block_divmod=FastDivmodDivisor(args.num_block),
+                num_groups_divmod=FastDivmodDivisor(num_groups),
+                qhead_per_kvhead_divmod=FastDivmodDivisor(R),
+                qhead_per_kvhead=Int32(R),
+            )
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            f"GroupedPersistentTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        return GroupedPersistentTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(
+        params: Params, clc: ClcState | None = None, *, loc=None, ip=None
+    ) -> "GroupedPersistentTileScheduler":
+        return GroupedPersistentTileScheduler(params, cute.arch.block_idx()[0], loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        grid_x = cutlass.min(Int32(sm_count), params.total_blocks)
+        return (grid_x, Int32(1), Int32(1))
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        is_valid = self._tile_idx < self.params.total_blocks
+        # idx = ((batch*num_groups + group)*num_block + block)*R + intra
+        t1, intra = divmod(self._tile_idx, self.params.qhead_per_kvhead_divmod)
+        t2, block = divmod(t1, self.params.num_block_divmod)
+        batch_idx, group_idx = divmod(t2, self.params.num_groups_divmod)
+        head_idx = group_idx * self.params.qhead_per_kvhead + intra
+        return WorkTileInfo(
+            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return GroupedPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class MBlockGroupBatchTileScheduler:
+    """Persistent scheduler whose tile walk is nested ``(m_block, group, batch)``
+    from outer to inner -- i.e. ``batch`` varies fastest, then ``group`` (the
+    kv-head axis), and ``m_block`` (the q/sequence tile) is the slowest, OUTER
+    loop. Decoded as::
+
+        idx = (m_block * num_head + head) * num_batch + batch
+
+    vs. ``StaticPersistentTileScheduler`` whose nesting is ``(batch, head,
+    m_block)`` with m_block innermost. Here we only permute the three coarse axes
+    the scheduler can see, so -- unlike ``GroupedPersistentTileScheduler`` -- it
+    does NOT split the head axis by ``qhead_per_kvhead`` and is therefore fully
+    compatible with pack-GQA (where the intra-group q-heads are already folded
+    into the M dimension and ``head`` == kv-head == inter-group).
+
+    Motivation (distributed CP comm): with m_block as the OUTER loop the kernel
+    advances the q/sequence frontier slowly -- it consumes every group (and
+    batch) at one m_block before moving to the next -- instead of one head
+    sprinting through all of sequence first. This paces the KV-block first-touch
+    closer to the producer's per-block delivery rate while keeping pack-GQA on.
+
+    STATIC only and cluster_m == 1 (CLC manages its own order; cluster unpacking
+    is not handled here).
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        total_blocks: Int32
+        num_head_divmod: FastDivmodDivisor
+        num_batch_divmod: FastDivmodDivisor
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "MBlockGroupBatchTileScheduler.Params":
+            assert cute.size(args.cluster_shape_mn) == 1, (
+                "MBlockGroupBatchTileScheduler only supports cluster_shape == 1"
+            )
+            return MBlockGroupBatchTileScheduler.Params(
+                total_blocks=args.num_block * args.num_head * args.num_batch,
+                num_head_divmod=FastDivmodDivisor(args.num_head),
+                num_batch_divmod=FastDivmodDivisor(args.num_batch),
+            )
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            f"MBlockGroupBatchTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        return MBlockGroupBatchTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(
+        params: Params, clc: ClcState | None = None, *, loc=None, ip=None
+    ) -> "MBlockGroupBatchTileScheduler":
+        return MBlockGroupBatchTileScheduler(params, cute.arch.block_idx()[0], loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        grid_x = cutlass.min(Int32(sm_count), params.total_blocks)
+        return (grid_x, Int32(1), Int32(1))
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        is_valid = self._tile_idx < self.params.total_blocks
+        # idx = (m_block * num_head + head) * num_batch + batch
+        t1, batch_idx = divmod(self._tile_idx, self.params.num_batch_divmod)
+        block, head_idx = divmod(t1, self.params.num_head_divmod)
+        return WorkTileInfo(
+            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return MBlockGroupBatchTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
 class SingleTileLPTScheduler:
