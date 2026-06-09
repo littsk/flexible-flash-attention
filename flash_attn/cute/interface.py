@@ -1293,6 +1293,7 @@ def _flash_attn_bwd(
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    dkv_done_counter: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1582,6 +1583,20 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
+    # Distributed CP backward: per-kv-block "done" counter (mirrors dK_semaphore layout).
+    # Off by default; FA_BWD_DKV_DONE=1 allocates it and the bwd epilogue bumps slot 0 of
+    # [batch, num_head_kv, n_block, :] once per (n_block, head_kv) when dK is finalized.
+    # Per-kv-block "done" counter (flat layout: (batch*num_head_kv+head_kv)*n_block_total + n_block).
+    # If the caller passes one (distributed CP: a SYMMETRIC buffer so owners can multimem-sum
+    # it to gate their reduce), use it; else FA_BWD_DKV_DONE=1 allocates a local one for testing.
+    if dkv_done_counter is not None:
+        dKV_done = dkv_done_counter
+    elif os.environ.get("FA_BWD_DKV_DONE", "0") == "1":
+        n_block_total = seqlen_k_rounded // n_block_size
+        dKV_done = torch.zeros(batch_size * num_head_kv * n_block_total, dtype=torch.int32, device=device)
+    else:
+        dKV_done = None
+
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
     _bwd_preprocess(
@@ -1688,6 +1703,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
         )
     else:
         compile_key = (
@@ -1725,6 +1741,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1746,6 +1763,7 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
+        dKV_done_tensor = to_cute_tensor(dKV_done.detach(), assumed_align=4) if dKV_done is not None else None
         if arch // 10 in [8, 12]:
             flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
             fa_bwd_obj = flash_bwd_obj_cls(
@@ -1880,6 +1898,7 @@ def _flash_attn_bwd(
             dK_semaphore_tensor,
             dV_semaphore_tensor,
             AuxData(cute_aux_tensors, aux_scalars),
+            dKV_done_tensor,  # mdKV_done (distributed CP backward reduce-scatter signal)
             sparse_tensors_compile,
             current_stream,
             options="--enable-tvm-ffi",
@@ -1907,6 +1926,7 @@ def _flash_attn_bwd(
             dK_semaphore,
             dV_semaphore,
             AuxData(aux_tensors, aux_scalars),
+            dKV_done,  # mdKV_done (distributed CP backward reduce-scatter signal)
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
@@ -1921,6 +1941,12 @@ def _flash_attn_bwd(
             if normalized_block_sparse_tensors is not None
             else None,
         )
+        if dKV_done is not None and os.environ.get("FA_BWD_DKV_DONE", "0") == "1":
+            torch.cuda.synchronize()
+            c = dKV_done.reshape(batch_size, num_head_kv, -1)  # [batch, head_kv, n_block]
+            print(f"[FA_BWD_DKV_DONE] shape={tuple(c.shape)} sum={int(c.sum())} "
+                  f"min={int(c.min())} max={int(c.max())} "
+                  f"unique={sorted(set(c.flatten().tolist()))[:6]}", flush=True)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:

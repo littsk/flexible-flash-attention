@@ -459,6 +459,7 @@ class FlashAttentionBackwardSm100:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        mdKV_done: Optional[cute.Tensor] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -952,6 +953,7 @@ class FlashAttentionBackwardSm100:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
+            mdKV_done,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -1035,6 +1037,7 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        mdKV_done: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1594,6 +1597,7 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mdKV_done,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2859,6 +2863,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mdKV_done: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3364,6 +3369,7 @@ class FlashAttentionBackwardSm100:
                         int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
                         mdK_semaphore,
                         "K",
+                        mdKV_done,
                     )
             # Zero dK/dV for empty tiles (local attention or block sparsity)
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
@@ -3869,6 +3875,7 @@ class FlashAttentionBackwardSm100:
         barrier_id: Int32,
         mdKV_semaphore: Optional[cute.Tensor],
         K_or_V: cutlass.Constexpr[str],
+        mdKV_done: Optional[cute.Tensor] = None,
     ) -> cutlass.pipeline.PipelineState:
         assert K_or_V in ("K", "V")
         tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
@@ -4033,6 +4040,30 @@ class FlashAttentionBackwardSm100:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
+
+        # Per-block "done" signal for distributed CP backward reduce-scatter: after this
+        # rank finishes dK for (n_block, head_kv, batch), bump a per-block counter (with
+        # a system-scope release so the dK/dV writes are visible before the count). The
+        # owner of this kv block gates its multimem.ld_reduce on this counter reaching the
+        # number of contributing ranks. Guarded -> default path is byte-for-byte unchanged.
+        if const_expr(mdKV_done is not None and K_or_V == "K"):
+            # One signal per (n_block, head_kv, batch) per rank. Dedupe across:
+            #  - warpgroups: only wg 0 (the dK epilogue runs on both),
+            #  - q-heads of a GQA group: only the last (head % R == R-1), so a kv-head
+            #    is signalled once after all R query heads' dK contributions are in.
+            last_qhead_in_group = (head_idx % self.qhead_per_kvhead) == (self.qhead_per_kvhead - 1)
+            if leader_warp and wg_idx == 0 and last_qhead_in_group:
+                with cute.arch.elect_one():
+                    # Flat 1D counter, explicit index -> avoids the multi-dim cute index
+                    # convention. release-ordered system-scope add: .release orders this
+                    # rank's dK/dV writes before the count is visible to the owner's
+                    # gating load (data-before-signal across GPUs).
+                    num_head_kv = cute.size(mdKV.shape[2])
+                    num_n_block = cute.ceil_div(cute.size(mdKV.shape[0]), self.tile_n)
+                    flat = (batch_idx * num_head_kv + head_idx_kv) * num_n_block + n_block
+                    cute.arch.atomic_add(
+                        mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                    )
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():

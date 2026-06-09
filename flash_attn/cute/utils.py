@@ -19,6 +19,14 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
+# Compat shim: some cute kernels here (notably the SM100 backward dP step and the
+# exp2 emulation below) call quack.activation.{sub,add,fma}_packed_f32x2, but in this
+# quack build those packed-f32x2 helpers live under cute.arch instead. Alias the
+# missing ones from cute.arch so the kernels work out of the box.
+for _packed_name in ("sub_packed_f32x2", "add_packed_f32x2", "fma_packed_f32x2"):
+    if not hasattr(quack.activation, _packed_name) and hasattr(cute.arch, _packed_name):
+        setattr(quack.activation, _packed_name, getattr(cute.arch, _packed_name))
+
 _MIXER_ATTRS = ("__vec_size__",)
 
 
