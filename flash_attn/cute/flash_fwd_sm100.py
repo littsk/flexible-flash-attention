@@ -88,8 +88,12 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        return_max_logits: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
+        # magi / Kimi-K2 QK-Clip: when True, the softmax warps additionally
+        # export a per-head ``max_logits`` (max scaled QK logit) via atomicMax.
+        self.return_max_logits = return_max_logits
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -267,6 +271,12 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # magi / Kimi-K2 QK-Clip ``return_max_logits`` output: per-head max of
+        # the scaled QK logits over the unmasked KV. Shape ``(num_head,)``,
+        # fp32, caller-initialised to ``-inf``; written via atomicMax. Placed at
+        # the tail (after ``aux_tensors``) so the positional kernel/compile arg
+        # list stays AOT-compatible (append-only). ``None`` => feature off.
+        mMaxLogits: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -708,6 +718,7 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            mMaxLogits,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -754,6 +765,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        mMaxLogits: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1061,6 +1073,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                mMaxLogits=mMaxLogits,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1556,6 +1569,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
+        mMaxLogits: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1659,6 +1673,7 @@ class FlashAttentionForwardSm100:
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                 # rescale_threshold=0.0,
                 softmax_scale=softmax_scale,
+                return_max_logits=const_expr(mMaxLogits is not None),
             )
             softmax.reset()
 
@@ -1820,6 +1835,36 @@ class FlashAttentionForwardSm100:
             #     if tidx < seqlen.seqlen_q - (m_block * 2 + stage) * self.m_block_size:
             #         gLSE[tidx] = lse
 
+            # magi / Kimi-K2 QK-Clip ``return_max_logits`` write-out: export the
+            # per-head max_logits = (per-row exact max of the unmasked,
+            # post-softcap, pre-scale raw QK) * softmax_scale, via a cross-CTA
+            # atomicMax into ``mMaxLogits[head_idx]``. In the ``.32x32b`` path
+            # each softmax thread owns one query row, so we atomicMax this
+            # thread's row value directly; the bounds check excludes padding
+            # rows (mirrors the LSE write above). Fully-masked rows and
+            # block-sparse empty tiles hold ``-inf`` and are a no-op against the
+            # ``-inf``-initialised buffer. ``mMaxLogits`` is ``(num_head,)`` with
+            # ``head_idx`` the (q) head (pack_gqa is rejected in interface_base).
+            if const_expr(mMaxLogits is not None):
+                seqlen_q = (
+                    seqlen.seqlen_q
+                    if const_expr(not self.pack_gqa)
+                    else seqlen.seqlen_q * self.qhead_per_kvhead
+                )
+                if tidx < seqlen_q - (self.q_stage * m_block + stage) * self.m_block_size:
+                    row_logit_max = softmax.row_logit_max[0]
+                    if row_logit_max != -Float32.inf:
+                        # ``softmax_scale`` may be None on this path (the kernel
+                        # works in log2 units), so recover the linear scale from
+                        # ``softmax_scale_log2``: scale_log2 = softmax_scale *
+                        # log2(e) => softmax_scale = scale_log2 * ln(2). This
+                        # matches the LSE epilogue's ``row_max * scale_log2 * LN2``.
+                        LN2 = math.log(2.0)
+                        scaled_max = row_logit_max * softmax_scale_log2 * LN2
+                        mMaxLogits_i32 = cute.recast_tensor(mMaxLogits, cutlass.Int32)
+                        ml_ptr = utils.elem_pointer(mMaxLogits_i32, (head_idx,))
+                        utils.atomic_max_f32(scaled_max, ml_ptr)
+
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1894,6 +1939,15 @@ class FlashAttentionForwardSm100:
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+
+        # magi / Kimi-K2 QK-Clip ``return_max_logits``: fold this n_block's
+        # raw-QK max for this row into the EXACT running max BEFORE the
+        # ``scale_subtract_rowmax`` below rewrites ``tSrS_t2r``. At this point
+        # ``tSrS_t2r`` is post-softcap, post-mask (masked == -inf), and
+        # pre-softmax_scale -- exactly the qk-logits domain. Kept separate from
+        # the (lazy, bf16) ``row_max`` for exactness; see ``row_logit_max``.
+        if const_expr(softmax.return_max_logits):
+            softmax.accumulate_max_logit(tSrS_t2r.load())
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

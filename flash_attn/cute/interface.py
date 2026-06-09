@@ -493,6 +493,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    max_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -505,6 +506,12 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        max_logits: Optional pre-allocated, ``-inf``-initialised float32 tensor of
+            shape ``(num_head,)`` (magi / Kimi-K2 QK-Clip). When provided, the
+            kernel writes per (q) head the max scaled QK logit over the unmasked
+            KV (max over all query rows, ``* softmax_scale``) via atomicMax, and
+            this function returns ``(out, lse, max_logits)``. SM100 only; not
+            supported with SplitKV (``num_splits > 1``) or ``pack_gqa``.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -708,6 +715,31 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
+    # magi / Kimi-K2 QK-Clip per-head ``max_logits`` output. The write-out lives
+    # in the SM100 softmax warps (each thread owns one query row), so the feature
+    # is SM100-only and incompatible with SplitKV (a row's KV is split across
+    # CTAs without a stitch-back) and pack_gqa (the simple seqlen row->head
+    # mapping no longer holds). Guard explicitly instead of silently emitting an
+    # uninitialised / wrong tensor.
+    return_max_logits = max_logits is not None
+    if return_max_logits:
+        if compute_capability != 10:
+            raise NotImplementedError(
+                "max_logits (return_max_logits) is only supported on SM100 (FA4 CuTe)"
+            )
+        if is_split_kv:
+            raise NotImplementedError("max_logits is not supported with SplitKV (num_splits > 1)")
+        if pack_gqa:
+            raise NotImplementedError("max_logits is not supported with pack_gqa")
+        expected_ml_shape = (num_head,)
+        assert max_logits.shape == expected_ml_shape, (
+            f"max_logits tensor shape {tuple(max_logits.shape)} does not match "
+            f"expected shape {expected_ml_shape}"
+        )
+        assert max_logits.dtype == torch.float32, "max_logits tensor must be float32"
+        assert max_logits.device == device, "max_logits tensor must be on the input device"
+        assert max_logits.is_cuda, "max_logits tensor must be on CUDA device"
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -780,6 +812,7 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
+        return_max_logits,  # magi QK-Clip: distinct kernel (extra atomicMax write-out)
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         logger.warning(
@@ -836,7 +869,17 @@ def _flash_attn_fwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
-        
+
+        # magi QK-Clip: only build the (num_head,) max_logits cute tensor when the
+        # feature is on. It is appended at the tail of the compile/execute arg
+        # lists below ONLY in that case, so the feature-off path (and every
+        # existing AOT-precompiled kernel) keeps its exact positional signature.
+        max_logits_tensor = (
+            from_dlpack(max_logits.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=0)
+            if return_max_logits
+            else None
+        )
+
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
@@ -887,14 +930,18 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
+                return_max_logits=return_max_logits,
             )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
-        # Compile with from_dlpack tensors, execute with torch tensors directly
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+        # Compile with from_dlpack tensors, execute with torch tensors directly.
+        # ``max_logits`` is appended (append-only) ONLY when the feature is on, so
+        # the default signature -- and every existing AOT-precompiled kernel --
+        # is byte-for-byte unchanged.
+        compile_args = [
             fa_fwd,
             q_tensor,
             k_tensor,
@@ -913,6 +960,11 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             cute_block_sparse_tensors,
             cute_aux_tensors,
+        ]
+        if return_max_logits:
+            compile_args.append(max_logits_tensor)
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            *compile_args,
             options="--enable-tvm-ffi"  
             # ref doc: https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/compile_with_tvm_ffi.html
             # pip install apache-tvm-ffi 
@@ -920,7 +972,7 @@ def _flash_attn_fwd(
         )
     # Execute with torch tensors directly (TVM FFI compiled functions accept DLPack-compatible tensors)
     with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
-        _flash_attn_fwd.compile_cache[compile_key](
+        exec_args = [
             q,
             k,
             v,
@@ -938,7 +990,10 @@ def _flash_attn_fwd(
             learnable_sink,
             block_sparse_tensors,
             aux_tensors,
-        )
+        ]
+        if return_max_logits:
+            exec_args.append(max_logits)
+        _flash_attn_fwd.compile_cache[compile_key](*exec_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -948,6 +1003,8 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
+    if return_max_logits:
+        return out, lse, max_logits
     return out, lse
 
 

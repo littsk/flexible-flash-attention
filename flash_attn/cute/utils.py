@@ -449,6 +449,45 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     )
 
 
+@cute.jit
+def atomic_max_f32(value: float | Float32, gmem_ptr_i32: cute.Pointer) -> None:
+    """Race-safe (cross-thread / cross-CTA) float-max into one gmem fp32 slot.
+
+    NVVM ``atomicrmw`` exposes only integer ``MAX`` / ``UMIN`` (no float
+    ``FMAX``), so we use the classic IEEE-754 sign-branch bit trick instead of
+    a CAS loop: the bit pattern of sign-bit-clear floats (``+0.0 .. +inf``) is
+    monotonic when compared as a *signed* int, and of sign-bit-set floats
+    (``-0.0 .. -inf``) when compared as an *unsigned* int (reversed order).
+    Branching on the sign bit of the new value's bits (not on ``value >= 0.0``,
+    which would mishandle ``-0.0``) keeps it correct for any prior content,
+    including the ``-inf`` initialisation used for ``max_logits``:
+        sign-bit clear -> red ``MAX``  (signed int)
+        sign-bit set   -> red ``UMIN`` (unsigned int)
+
+    ``gmem_ptr_i32`` must be an Int32-typed pointer aliasing the fp32 slot
+    (obtain via ``elem_pointer`` on a ``cute.recast_tensor(t, Int32)`` view);
+    we reinterpret the fp32 bits via a 1-elem fragment recast rather than a
+    value-converting cast.
+    """
+    bits_frg = cute.make_fragment(1, Float32)
+    bits_frg[0] = Float32(value)
+    bits = cute.recast_tensor(bits_frg, cutlass.Int32)[0]
+    if bits >= cutlass.Int32(0):
+        nvvm.atomicrmw(
+            res=T.i32(),
+            op=nvvm.AtomicOpKind.MAX,
+            ptr=gmem_ptr_i32.llvm_ptr,
+            a=cutlass.Int32(bits).ir_value(),
+        )
+    else:
+        nvvm.atomicrmw(
+            res=T.i32(),
+            op=nvvm.AtomicOpKind.UMIN,
+            ptr=gmem_ptr_i32.llvm_ptr,
+            a=cutlass.Int32(bits).ir_value(),
+        )
+
+
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)

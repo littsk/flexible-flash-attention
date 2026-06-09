@@ -159,17 +159,31 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    # FA3-style ``return_max_logits`` (magi / Kimi-K2 QK-Clip): when enabled we
+    # track, per row, the EXACT max of the raw QK logits (post-softcap,
+    # post-mask, pre-softmax_scale) over the unmasked KV. We cannot reuse
+    # ``row_max``: with ``rescale_threshold > 0`` (bf16) the kernel keeps a
+    # *lazy* running max (it skips updates when the O-rescale would be within
+    # threshold), so ``row_max`` can lag the true max by up to
+    # ``rescale_threshold / scale_log2``. ``row_logit_max`` stays ``None``
+    # (zero register cost) when the feature is off.
+    return_max_logits: cutlass.Constexpr[bool] = False
+    row_logit_max: cute.Tensor | None = None
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        return_max_logits: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
         row_max = cute.make_fragment(num_rows, Float32)
         row_sum = cute.make_fragment(num_rows, Float32)
+        row_logit_max = (
+            cute.make_fragment(num_rows, Float32) if return_max_logits else None
+        )
         return SoftmaxSm100(
             scale_log2,
             num_rows,
@@ -178,6 +192,31 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            return_max_logits=return_max_logits,
+            row_logit_max=row_logit_max,
+        )
+
+    def reset(self) -> None:
+        self.row_max.fill(-Float32.inf)
+        self.row_sum.fill(0.0)
+        if cutlass.const_expr(self.return_max_logits):
+            self.row_logit_max.fill(-Float32.inf)
+
+    @cute.jit
+    def accumulate_max_logit(self, acc_S_row: cute.TensorSSA) -> None:
+        """Fold this n_block's raw-QK max for one row into ``row_logit_max``.
+
+        ``acc_S_row`` holds this thread's columns for the row AFTER softcap and
+        mask (masked positions are ``-inf``) and BEFORE ``softmax_scale`` --
+        exactly the magi/FA3 qk-logits domain. ``-inf`` never wins a max, so the
+        raw max over all elements equals the max over the unmasked ones (and
+        stays ``-inf`` for a fully-masked row). In the SM100 ``.32x32b`` path
+        each softmax thread owns one full query row, so no cross-thread reduce
+        is needed here. This is an EXACT running max, independent of the lazy
+        ``row_max`` (see the ``row_logit_max`` field comment).
+        """
+        self.row_logit_max[0] = utils.fmax_reduce(
+            acc_S_row, init_val=self.row_logit_max[0], arch=self.arch
         )
 
     @cute.jit
