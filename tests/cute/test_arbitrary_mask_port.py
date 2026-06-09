@@ -3,18 +3,19 @@ import math
 import pytest
 import torch
 from einops import rearrange
-from torch.nn.attention.flex_attention import create_block_mask
 
-from flash_attn.cute.block_sparsity import (
-    BlockSparseTensorsTorch,
-    bhqk_to_linear_sparse_tensors,
-)
+from flash_attn.cute.block_sparsity import LinearBlockSparseTensorsTorch
 from flash_attn.cute.interface import (
     _tile_size_bwd_sm90,
     _tile_size_fwd_sm90,
     flash_attn_func,
     flash_attn_varlen_func,
 )
+
+try:
+    import create_block_mask_cuda
+except ImportError:
+    create_block_mask_cuda = None
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -65,21 +66,6 @@ def _apply_arbitrary_mask(scores, arbitrary_func):
     )
     valid = (base | interval).expand(batch, heads, seqlen_q, seqlen_k)
     return scores.masked_fill(~valid, float("-inf"))
-
-
-def _make_arbitrary_mask_mod(arbitrary_func):
-    def mask_mod(b, h, q_idx, kv_idx):
-        zero = q_idx * 0
-        b_idx = zero if arbitrary_func.shape[0] == 1 else b
-        h_idx = zero if arbitrary_func.shape[1] == 1 else h
-        value_valid = kv_idx < arbitrary_func[b_idx, h_idx, zero, q_idx]
-        for i in range(arbitrary_func.shape[2] // 2):
-            start = arbitrary_func[b_idx, h_idx, zero + 2 * i + 1, q_idx]
-            end = arbitrary_func[b_idx, h_idx, zero + 2 * i + 2, q_idx]
-            value_valid = value_valid | ((kv_idx >= start) & (kv_idx < end))
-        return value_valid
-
-    return mask_mod
 
 
 def _attention_ref(q, k, v, arbitrary_func):
@@ -152,54 +138,115 @@ def _linear_block_sizes(head_dim, head_dim_v, seqlen_q, qhead_per_kvhead):
         return (fwd_cfg.m_block_size, fwd_cfg.n_block_size), (128, bwd_cfg.n_block_size)
     if major == 10:
         q_stage = 2 if seqlen_q * qhead_per_kvhead > 128 else 1
+        if head_dim in (128, 192) and head_dim_v == 128:
+            return (q_stage * 128, 128), (256, 256)
         return (q_stage * 128, 128), (256, 128)
     pytest.skip("linear arbitrary block-sparse test only runs on SM90/SM100")
 
 
-def _extract_block_sparse_tensors(block_mask, *, backward):
-    block_mask_tuple = block_mask.as_tuple()
-    has_seq_prefix = isinstance(block_mask_tuple[0], int)
-    if backward:
-        start = 6 if has_seq_prefix else 4
-    else:
-        start = 2 if has_seq_prefix else 0
-    mask_cnt, mask_idx, full_cnt, full_idx = block_mask_tuple[start : start + 4]
-    return BlockSparseTensorsTorch(
-        mask_block_cnt=mask_cnt,
-        mask_block_idx=mask_idx,
-        full_block_cnt=full_cnt,
-        full_block_idx=full_idx,
+def _require_create_block_mask_cuda():
+    if create_block_mask_cuda is None:
+        pytest.fail(
+            "create_block_mask_cuda is required for CSR arbitrary-mask tests. "
+            "Build it with `make create_block_mask` from the repo root."
+        )
+    return create_block_mask_cuda
+
+
+def _linear_from_csr_tuple(csr_tensors, block_size):
+    (
+        mask_block_cnt,
+        mask_block_offset,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_offset,
+        full_block_idx,
+    ) = csr_tensors
+    return LinearBlockSparseTensorsTorch(
+        mask_block_cnt=mask_block_cnt,
+        mask_block_offset=mask_block_offset,
+        mask_block_idx=mask_block_idx,
+        full_block_cnt=full_block_cnt,
+        full_block_offset=full_block_offset,
+        full_block_idx=full_block_idx,
+        block_size=block_size,
     )
 
 
 def _make_linear_block_sparse_pair(arbitrary_func, seqlen_q, seqlen_k, fwd_block_size, bwd_block_size):
-    mask_mod = _make_arbitrary_mask_mod(arbitrary_func)
-    mask_batch, mask_heads = arbitrary_func.shape[:2]
-    bm_fwd = create_block_mask(
-        mask_mod,
-        mask_batch,
-        mask_heads,
+    block_mask_cuda = _require_create_block_mask_cuda()
+    q2k_csr = block_mask_cuda.create_q2k_csr_sparse_from_func(
+        arbitrary_func,
         seqlen_q,
         seqlen_k,
-        device="cuda",
-        BLOCK_SIZE=fwd_block_size,
+        Q_BLOCK_SIZE=fwd_block_size[0],
+        KV_BLOCK_SIZE=fwd_block_size[1],
+        check_q_boundary=True,
     )
-    bm_bwd = create_block_mask(
-        mask_mod,
-        mask_batch,
-        mask_heads,
+    k2q_csr = block_mask_cuda.create_k2q_csr_sparse_from_func(
+        arbitrary_func,
         seqlen_q,
         seqlen_k,
-        device="cuda",
-        BLOCK_SIZE=bwd_block_size,
+        Q_BLOCK_SIZE=bwd_block_size[0],
+        KV_BLOCK_SIZE=bwd_block_size[1],
     )
-    linear_k = bhqk_to_linear_sparse_tensors(
-        _extract_block_sparse_tensors(bm_fwd, backward=False)._replace(block_size=fwd_block_size)
-    )
-    linear_q = bhqk_to_linear_sparse_tensors(
-        _extract_block_sparse_tensors(bm_bwd, backward=True)._replace(block_size=bwd_block_size)
-    )
+    linear_k = _linear_from_csr_tuple(q2k_csr, fwd_block_size)
+    linear_q = _linear_from_csr_tuple(k2q_csr, bwd_block_size)
     return linear_k, linear_q
+
+
+def _run_linear_block_sparse_case(kv_mode, head_dim, head_dim_v, seqlen_q, seqlen_k, seed):
+    torch.manual_seed(seed)
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch, heads = 2, 4
+    kv_heads = _kv_heads_for_mode(kv_mode, heads)
+    q = torch.randn(batch, seqlen_q, heads, head_dim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(
+        batch, seqlen_k, kv_heads, head_dim, device=device, dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        batch, seqlen_k, kv_heads, head_dim_v, device=device, dtype=dtype, requires_grad=True
+    )
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    arbitrary_func = _make_arbitrary_func(1, 1, seqlen_q, seqlen_k, device)
+    fwd_block_size, bwd_block_size = _linear_block_sizes(
+        head_dim,
+        head_dim_v,
+        seqlen_q,
+        heads // kv_heads,
+    )
+    linear_k, linear_q = _make_linear_block_sparse_pair(
+        arbitrary_func,
+        seqlen_q,
+        seqlen_k,
+        fwd_block_size,
+        bwd_block_size,
+    )
+
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        arbitrary=True,
+        aux_tensors=[arbitrary_func],
+        linear_k_block_sparse_tensors=linear_k,
+        linear_q_block_sparse_tensors=linear_q,
+        return_lse=True,
+    )
+    out_ref = _attention_ref(q_ref, k_ref, v_ref, arbitrary_func)
+    torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
+
+    if _device_major() == 9 and kv_mode != "mha":
+        return
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    out_ref.backward(grad)
+    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-2, rtol=5e-2)
 
 
 def _run_arbitrary_case(
@@ -342,13 +389,40 @@ def test_arbitrary_mask_linear_block_sparse(kv_mode):
     case = _generic_case_for_arch()
     if case is None:
         pytest.skip("linear arbitrary block-sparse test only runs on SM90/SM100")
-    torch.manual_seed(97 + len(kv_mode))
+    head_dim, head_dim_v = case
+    _run_linear_block_sparse_case(
+        kv_mode,
+        head_dim,
+        head_dim_v,
+        seqlen_q=96,
+        seqlen_k=160,
+        seed=97 + len(kv_mode),
+    )
+
+
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_2cta(kv_mode):
+    if _device_major() != 10:
+        pytest.skip("SM100 hdim128 2CTA linear CSR backward test only runs on SM100")
+    _run_linear_block_sparse_case(
+        kv_mode,
+        head_dim=128,
+        head_dim_v=128,
+        seqlen_q=384,
+        seqlen_k=384,
+        seed=811 + len(kv_mode),
+    )
+
+
+def test_arbitrary_mask_linear_block_sparse_sm100_hdim128_rejects_1cta_csr():
+    if _device_major() != 10:
+        pytest.skip("SM100 hdim128 2CTA linear CSR backward test only runs on SM100")
+    torch.manual_seed(191)
     device = "cuda"
     dtype = torch.bfloat16
-    batch, heads = 2, 4
-    kv_heads = _kv_heads_for_mode(kv_mode, heads)
-    head_dim, head_dim_v = case
-    seqlen_q, seqlen_k = 96, 160
+    batch, heads, kv_heads = 1, 1, 1
+    seqlen_q, seqlen_k = 128, 128
+    head_dim, head_dim_v = 128, 128
     q = torch.randn(batch, seqlen_q, heads, head_dim, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(
         batch, seqlen_k, kv_heads, head_dim, device=device, dtype=dtype, requires_grad=True
@@ -356,24 +430,14 @@ def test_arbitrary_mask_linear_block_sparse(kv_mode):
     v = torch.randn(
         batch, seqlen_k, kv_heads, head_dim_v, device=device, dtype=dtype, requires_grad=True
     )
-    q_ref = q.detach().clone().requires_grad_(True)
-    k_ref = k.detach().clone().requires_grad_(True)
-    v_ref = v.detach().clone().requires_grad_(True)
     arbitrary_func = _make_arbitrary_func(1, 1, seqlen_q, seqlen_k, device)
-    fwd_block_size, bwd_block_size = _linear_block_sizes(
-        head_dim,
-        head_dim_v,
-        seqlen_q,
-        heads // kv_heads,
-    )
     linear_k, linear_q = _make_linear_block_sparse_pair(
         arbitrary_func,
         seqlen_q,
         seqlen_k,
-        fwd_block_size,
-        bwd_block_size,
+        fwd_block_size=(128, 128),
+        bwd_block_size=(256, 128),
     )
-
     out, _ = flash_attn_func(
         q,
         k,
@@ -384,22 +448,8 @@ def test_arbitrary_mask_linear_block_sparse(kv_mode):
         linear_q_block_sparse_tensors=linear_q,
         return_lse=True,
     )
-    out_ref = _attention_ref(q_ref, k_ref, v_ref, arbitrary_func)
-    torch.testing.assert_close(out, out_ref, atol=3e-2, rtol=3e-2)
-
-    if _device_major() == 9 and kv_mode != "mha":
-        return
-    # SM100 generic block-sparse backward disables 2CTA, while the existing
-    # hdim=192/dv=128 backward kernel requires 2CTA. This is a pre-existing
-    # unsupported combination in origin/main rather than a linear CSR issue.
-    if _device_major() == 10 and head_dim == 192:
-        return
-    grad = torch.randn_like(out)
-    out.backward(grad)
-    out_ref.backward(grad)
-    torch.testing.assert_close(q.grad, q_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(k.grad, k_ref.grad, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(v.grad, v_ref.grad, atol=5e-2, rtol=5e-2)
+    with pytest.raises(ValueError, match=r"expects BLOCK_SIZE=\(256, 256\)"):
+        out.backward(torch.randn_like(out))
 
 
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])

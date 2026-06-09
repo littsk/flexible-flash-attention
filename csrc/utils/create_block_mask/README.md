@@ -2,11 +2,35 @@
 
 CUDA extension for converting arbitrary interval-mask metadata into compact block-sparse CSR tensors.
 
-Build:
+Build from the repository root:
+
+```bash
+make create_block_mask
+```
+
+or from `csrc/utils`:
+
+```bash
+make block_mask
+```
+
+or directly from this directory:
 
 ```bash
 cd csrc/utils/create_block_mask
-python setup.py build_ext --inplace
+pip install --no-user -e . --no-build-isolation
+```
+
+Run the module tests:
+
+```bash
+make test_create_block_mask
+```
+
+Run the FA4 arbitrary-mask CSR integration tests:
+
+```bash
+make test_arbitrary_mask_csr
 ```
 
 Forward uses Q2K metadata and backward uses K2Q metadata:

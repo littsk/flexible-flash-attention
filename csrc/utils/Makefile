@@ -4,38 +4,44 @@
 #   make              - Build all extensions (create_block_mask)
 #   make all          - Same as above
 #   make block_mask   - Build only create_block_mask extension
+#   make create_block_mask - Alias for block_mask
 #   make test         - Run create_block_mask tests (manual scripts)
 #   make pytest            - Run create_block_mask pytest tests
 #   make clean        - Clean create_block_mask build artifacts
 
-.PHONY: all block_mask test test_block_mask pytest pytest_block_mask bench bench_block_mask clean
+.PHONY: all install block_mask create_block_mask test test_block_mask test_create_block_mask pytest pytest_block_mask bench bench_block_mask clean
 
 # Default target: build all
 all: block_mask
+
+install: block_mask
 
 # Build create_block_mask extension
 block_mask:
 	@echo "=============================================="
 	@echo "Building create_block_mask CUDA extension..."
 	@echo "=============================================="
-	cd create_block_mask && pip install -e . --no-build-isolation
+	cd create_block_mask && pip install --no-user -e . --no-build-isolation
 	@echo ""
+
+create_block_mask: block_mask
 
 # Run all tests
 test: test_block_mask
 
 # Run create_block_mask tests (manual script)
-test_block_mask:
+test_block_mask: block_mask
 	@echo "=============================================="
 	@echo "Testing create_block_mask..."
 	@echo "=============================================="
 	cd create_block_mask && python test_create_block_mask.py
 	@echo ""
 
+test_create_block_mask: pytest_block_mask
 
 pytest: pytest_block_mask
 # Run create_block_mask pytest (full test suite)
-pytest_block_mask:
+pytest_block_mask: block_mask
 	@echo "=============================================="
 	@echo "Running pytest for create_block_mask..."
 	@echo "=============================================="
@@ -72,9 +78,12 @@ build_and_test: all test
 help:
 	@echo "Available targets:"
 	@echo "  all               - Build all extensions (default)"
+	@echo "  install           - Build/install all extensions"
 	@echo "  block_mask        - Build create_block_mask extension"
+	@echo "  create_block_mask - Alias for block_mask"
 	@echo "  test              - Run all tests (manual scripts)"
 	@echo "  test_block_mask   - Run create_block_mask tests (manual script)"
+	@echo "  test_create_block_mask - Run create_block_mask pytest"
 	@echo "  pytest            - Run all pytest tests"
 	@echo "  pytest_block_mask - Run create_block_mask pytest (full test suite)"
 	@echo "  bench             - Run all benchmarks"

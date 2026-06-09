@@ -1361,76 +1361,97 @@ def produce_block_sparse_q_loads_bwd_sm100(
         blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
     )
 
-    for iter_idx in cutlass.range(loop_count, unroll=1):
-        m_block, _ = get_m_block_from_iter_bwd(
-            iter_idx,
-            curr_q_cnt,
-            curr_q_idx,
-            curr_full_cnt,
-            curr_full_idx,
-            subtile_factor,
-            m_block_max,
-        )
-        m_block_safe = m_block
-        if m_block_max > 0:
-            m_block_safe = cutlass.min(m_block, m_block_max - 1)
+    split_sparse_blocks = const_expr(curr_full_idx is not None)
+    block_group_count: cutlass.Constexpr[int] = 2 if const_expr(split_sparse_blocks) else 1
+    for block_group in cutlass.range_constexpr(block_group_count):
+        group_loop_count = loop_count
+        iter_offset = Int32(0)
+        if const_expr(split_sparse_blocks):
+            group_loop_count = curr_q_cnt * subtile_factor
+            if const_expr(block_group == 1):
+                group_loop_count = curr_full_cnt * subtile_factor
+                iter_offset = curr_q_cnt * subtile_factor
 
-        if iter_idx == 0:
-            # First block: load K/V alongside Q/dO
-            if const_expr(should_load_Q):
-                pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
-                load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
-                load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
-                pipeline_Q.producer_commit(producer_state_Q_LSE)
-                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gLSE[None, m_block_safe],
-                        sLSE[None, producer_state_Q_LSE.index],
-                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
-                    )
-                producer_state_Q_LSE.advance()
-            if const_expr(should_load_dO):
-                pipeline_dO.producer_acquire(
-                    producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes_V
+        for group_iter_idx in cutlass.range(group_loop_count, unroll=1):
+            iter_idx = group_iter_idx + iter_offset
+            if const_expr(split_sparse_blocks):
+                sparse_iter_idx = group_iter_idx // subtile_factor
+                subtile_offset = group_iter_idx % subtile_factor
+                if const_expr(block_group == 0):
+                    m_block = curr_q_idx[sparse_iter_idx] * subtile_factor + subtile_offset
+                else:
+                    assert curr_full_idx is not None
+                    m_block = curr_full_idx[sparse_iter_idx] * subtile_factor + subtile_offset
+            else:
+                m_block, _ = get_m_block_from_iter_bwd(
+                    iter_idx,
+                    curr_q_cnt,
+                    curr_q_idx,
+                    curr_full_cnt,
+                    curr_full_idx,
+                    subtile_factor,
+                    m_block_max,
                 )
-                load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
-                load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
-                pipeline_dO.producer_commit(producer_state_dO_dPsum)
-                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gdPsum[None, m_block_safe],
-                        sdPsum[None, producer_state_dO_dPsum.index],
-                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+            m_block_safe = m_block
+            if m_block_max > 0:
+                m_block_safe = cutlass.min(m_block, m_block_max - 1)
+
+            if iter_idx == 0:
+                # First block: load K/V alongside Q/dO
+                if const_expr(should_load_Q):
+                    pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
+                    load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+                    load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
+                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gLSE[None, m_block_safe],
+                            sLSE[None, producer_state_Q_LSE.index],
+                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                        )
+                    producer_state_Q_LSE.advance()
+                if const_expr(should_load_dO):
+                    pipeline_dO.producer_acquire(
+                        producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes_V
                     )
-                producer_state_dO_dPsum.advance()
-        else:
-            # Subsequent blocks: just load Q/dO (K/V already loaded)
-            if const_expr(should_load_Q):
-                pipeline_Q.producer_acquire(producer_state_Q_LSE)
-                load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
-                pipeline_Q.producer_commit(producer_state_Q_LSE)
-                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gLSE[None, m_block_safe],
-                        sLSE[None, producer_state_Q_LSE.index],
-                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
-                    )
-                producer_state_Q_LSE.advance()
-            if const_expr(should_load_dO):
-                pipeline_dO.producer_acquire(producer_state_dO_dPsum)
-                load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
-                pipeline_dO.producer_commit(producer_state_dO_dPsum)
-                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gdPsum[None, m_block_safe],
-                        sdPsum[None, producer_state_dO_dPsum.index],
-                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
-                    )
-                producer_state_dO_dPsum.advance()
+                    load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
+                    load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
+                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gdPsum[None, m_block_safe],
+                            sdPsum[None, producer_state_dO_dPsum.index],
+                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                        )
+                    producer_state_dO_dPsum.advance()
+            else:
+                # Subsequent blocks: just load Q/dO (K/V already loaded)
+                if const_expr(should_load_Q):
+                    pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                    load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
+                    pipeline_Q.producer_commit(producer_state_Q_LSE)
+                    pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gLSE[None, m_block_safe],
+                            sLSE[None, producer_state_Q_LSE.index],
+                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                        )
+                    producer_state_Q_LSE.advance()
+                if const_expr(should_load_dO):
+                    pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                    load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
+                    pipeline_dO.producer_commit(producer_state_dO_dPsum)
+                    pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gdPsum[None, m_block_safe],
+                            sdPsum[None, producer_state_dO_dPsum.index],
+                            mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                        )
+                    producer_state_dO_dPsum.advance()
 
     return producer_state_Q_LSE, producer_state_dO_dPsum
 
@@ -1512,6 +1533,7 @@ def get_m_block_from_iter_bwd(
     curr_full_idx: Optional[cute.Tensor],
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    full_first: cutlass.Constexpr[bool] = False,
 ):
     """Derive m_block index and is_full_block flag from iteration index.
 
@@ -1525,11 +1547,18 @@ def get_m_block_from_iter_bwd(
     sparse_m_block = Int32(0)
     is_full_block = False
     if const_expr(curr_full_idx is not None):
-        if sparse_iter_idx < curr_q_cnt:
-            sparse_m_block = curr_q_idx[sparse_iter_idx]
+        if const_expr(full_first):
+            if sparse_iter_idx < curr_full_cnt:
+                sparse_m_block = curr_full_idx[sparse_iter_idx]
+                is_full_block = True
+            else:
+                sparse_m_block = curr_q_idx[sparse_iter_idx - curr_full_cnt]
         else:
-            sparse_m_block = curr_full_idx[sparse_iter_idx - curr_q_cnt]
-            is_full_block = True
+            if sparse_iter_idx < curr_q_cnt:
+                sparse_m_block = curr_q_idx[sparse_iter_idx]
+            else:
+                sparse_m_block = curr_full_idx[sparse_iter_idx - curr_q_cnt]
+                is_full_block = True
     else:
         sparse_m_block = curr_q_idx[sparse_iter_idx]
 

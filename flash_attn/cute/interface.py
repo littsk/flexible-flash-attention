@@ -11,8 +11,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
@@ -1475,6 +1473,21 @@ def _flash_attn_bwd(
     head_dim_v = v.shape[-1]
 
     use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
+    use_sm100_hdim192_linear_csr_bwd = (
+        arch // 10 in [10, 11]
+        and head_dim == 192
+        and head_dim_v == 128
+        and _is_linear_csr_block_sparse(block_sparse_tensors)
+    )
+    use_sm100_hdim128_linear_csr_bwd = (
+        arch // 10 in [10, 11]
+        and head_dim == 128
+        and head_dim_v == 128
+        and _is_linear_csr_block_sparse(block_sparse_tensors)
+    )
+    use_sm100_2cta_linear_csr_bwd = (
+        use_sm100_hdim192_linear_csr_bwd or use_sm100_hdim128_linear_csr_bwd
+    )
     arbitrary_func_num = 0
     arbitrary_batch_broadcast = False
     arbitrary_head_broadcast = False
@@ -1560,7 +1573,7 @@ def _flash_attn_bwd(
             or score_mod is not None
             or score_mod_bwd is not None
             or (mask_mod is not None and not arbitrary)
-            or block_sparse_tensors is not None
+            or (block_sparse_tensors is not None and not use_sm100_2cta_linear_csr_bwd)
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
@@ -1608,6 +1621,37 @@ def _flash_attn_bwd(
     if arbitrary and not use_block_sparsity:
         _warn_arbitrary_without_block_sparsity("backward")
     subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
+    if use_sm100_2cta_linear_csr_bwd:
+        if not use_2cta_instrs:
+            raise NotImplementedError(
+                "SM100/SM110 backward with 2CTA linear CSR block sparsity requires "
+                "2CTA mode; disable-2CTA, score_mod, and non-arbitrary mask_mod are unsupported."
+            )
+        if softcap != 0.0 or score_mod is not None or score_mod_bwd is not None:
+            raise NotImplementedError(
+                "SM100/SM110 backward with 2CTA linear CSR block sparsity does not "
+                "support softcap or score_mod yet."
+            )
+        if block_sparse_tensors.block_size != (2 * m_block_size, 2 * n_block_size):
+            raise ValueError(
+                "SM100/SM110 backward with 2CTA linear CSR block "
+                f"sparsity expects BLOCK_SIZE=({2 * m_block_size}, {2 * n_block_size})."
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "SM100/SM110 backward with 2CTA linear CSR block sparsity does not "
+                "support deterministic=True yet."
+            )
+        if (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        ):
+            raise NotImplementedError(
+                "SM100/SM110 backward with 2CTA linear CSR block sparsity does not "
+                "support varlen or seqused tensors yet."
+            )
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
@@ -1814,6 +1858,9 @@ def _flash_attn_bwd(
     normalized_block_sparse_tensors_dq = None
     use_dq_block_sparsity = False
     if block_sparse_tensors is not None:
+        block_sparse_n_block_size_bwd = (
+            cluster_size * n_block_size if use_sm100_2cta_linear_csr_bwd else n_block_size
+        )
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -1823,9 +1870,14 @@ def _flash_attn_bwd(
             num_head=num_head,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
-            block_size=(m_block_size, n_block_size),
+            block_size=(m_block_size, block_sparse_n_block_size_bwd),
             subtile_factor=subtile_factor,
         )
+        if use_sm100_2cta_linear_csr_bwd:
+            if normalized_block_sparse_tensors.mask_block_offset is None:
+                raise NotImplementedError(
+                    "SM100/SM110 backward with 2CTA only supports linear CSR block sparsity"
+                )
         if use_dedicated_hd256_kernel:
             if normalized_block_sparse_tensors.mask_block_offset is None:
                 raise NotImplementedError(
