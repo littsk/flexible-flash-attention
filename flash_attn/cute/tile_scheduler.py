@@ -167,6 +167,11 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    # Distributed-CP local-last backward schedule: cyclic-rotation shift = owned_start +
+    # owned_cnt. LocalLastBwdScheduler maps block_idx = (block_lin + shift) % num_block, which
+    # rotates this rank's contiguous OWNED kv-block range to the END (processed/signalled last).
+    # -1 disables (default scheduler). Constexpr so it bakes into the compiled kernel.
+    owned_shift_ll: cutlass.Constexpr[int] = -1
 
 
 class SingleTileScheduler:
@@ -285,6 +290,98 @@ class SingleTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class LocalLastBwdScheduler:
+    """Distributed-CP backward scheduler: remap the kv-block index so this rank's contiguous
+    OWNED range is traversed LAST, via a pure cyclic rotation block_idx = (block_lin + shift) %
+    num_block with shift = owned_start + owned_cnt. One CTA per (block, head, batch), like
+    SingleTileScheduler (non-persistent), grid = (num_block, num_head, num_batch).
+
+    NOTE on overlap (empirically established): the SM100 bwd kernel uses RAW blockIdx for some
+    addressing, so it hard-requires grid.x == kv-block. Two consequences:
+      * Swapping head onto grid.x (head-inner, non-persistent) -> corrupts dQ/dK/dV (same wrong
+        output for identity vs rotated order, proving it's the grid axis, not the remap).
+      * A PERSISTENT grid.x = #SMs -> 'unspecified launch failure' (raw blockIdx in [0,#SM)
+        used as a block index writes out of bounds when #SM > num_block).
+    So head-INNER readiness (needed to overlap the dK/dV reduce with compute) is NOT reachable at
+    the scheduler level alone; it would require auditing/rewriting the bwd kernel's raw-blockIdx
+    addressing to use the scheduler-provided coords. This rotation alone is correctness-preserving
+    but keeps block on grid.x (block-inner / head-outer) -> blocks ready only near the end -> no
+    reduce/compute overlap yet."""
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block: Int32
+        num_head: Int32
+        num_batch: Int32
+        num_block_divmod: FastDivmodDivisor
+        shift: cutlass.Constexpr[int] = 0
+
+        @staticmethod
+        def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "LocalLastBwdScheduler.Params":
+            return LocalLastBwdScheduler.Params(
+                args.num_block, args.num_head, args.num_batch,
+                FastDivmodDivisor(args.num_block), args.owned_shift_ll,
+            )
+
+    def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
+        self.params = params
+        self._blk_coord = blk_coord
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, scheduling_mode: SchedulingMode = SchedulingMode.STATIC, loc=None, ip=None) -> Params:
+        return LocalLastBwdScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(params: Params, clc: ClcState | None = None, *, loc=None, ip=None) -> "LocalLastBwdScheduler":
+        return LocalLastBwdScheduler(params, cute.arch.block_idx(), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params: Params, *, loc=None, ip=None) -> Tuple[Int32, Int32, Int32]:
+        # block MUST stay on grid.x (the bwd kernel addresses outputs via raw blockIdx.x).
+        return (params.num_block, params.num_head, params.num_batch)
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        block_lin, head_idx, batch_idx = self._blk_coord
+        # cyclic rotation by `shift` -> owned range rotated to the end. block_lin + shift < 2*N
+        # so a single modulo (divmod remainder) suffices.
+        _, block_idx = divmod(block_lin + self.params.shift, self.params.num_block_divmod)
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)),
+            self._is_first_block,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._is_first_block = False
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._blk_coord]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return LocalLastBwdScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
 class StaticPersistentTileScheduler:

@@ -30,6 +30,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
+    LocalLastBwdScheduler,
 )
 
 from flash_attn.cute import barrier
@@ -697,7 +698,10 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
         # TileScheduler = SingleTileScheduler
-        if const_expr(self.is_varlen_k):
+        _ll_shift = getattr(self, "local_last_shift", None)  # distributed-CP local-last bwd
+        if const_expr(_ll_shift is not None):
+            TileScheduler = LocalLastBwdScheduler
+        elif const_expr(self.is_varlen_k):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
@@ -730,6 +734,7 @@ class FlashAttentionBackwardSm100:
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            owned_shift_ll=_ll_shift if _ll_shift is not None else -1,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)

@@ -1295,6 +1295,7 @@ def _flash_attn_bwd(
     dlse: Optional[torch.Tensor] = None,
     dkv_done_counter: Optional[torch.Tensor] = None,
     dkv_done_mc_ptr: Optional[int] = None,
+    bwd_local_last_shift: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1706,6 +1707,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
+            bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
         )
     else:
         compile_key = (
@@ -1745,6 +1747,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
+            bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1877,6 +1880,9 @@ def _flash_attn_bwd(
         # its LOCAL counter. Baked as a constexpr on the kernel object (pointer is stable for the
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
+        # Distributed-CP local-last backward: cyclic-rotation shift = owned_start + owned_cnt.
+        # When set, the bwd uses LocalLastBwdScheduler (head-inner, block-outer, owned-last).
+        fa_bwd_obj.local_last_shift = bwd_local_last_shift
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
@@ -1946,6 +1952,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.dq_write_order,
                 normalized_block_sparse_tensors.dq_write_order_full,
                 normalized_block_sparse_tensors.kv_block_signal,
+                normalized_block_sparse_tensors.kv_block_trace,
             )
             if normalized_block_sparse_tensors is not None
             else None,
