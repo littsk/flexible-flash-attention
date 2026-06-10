@@ -4061,9 +4061,19 @@ class FlashAttentionBackwardSm100:
                     num_head_kv = cute.size(mdKV.shape[2])
                     num_n_block = cute.ceil_div(cute.size(mdKV.shape[0]), self.tile_n)
                     flat = (batch_idx * num_head_kv + head_idx_kv) * num_n_block + n_block
-                    cute.arch.atomic_add(
-                        mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
-                    )
+                    mc_base = getattr(self, "dkv_done_mc_ptr", None)
+                    if const_expr(mc_base is not None):
+                        # PUSH: multimem.red broadcasts +1 to every rank's counter copy
+                        # in-switch, so the owner polls its LOCAL counter (no per-poll
+                        # cross-rank multimem.ld_reduce -> frees NVLink BW for the reduce).
+                        mc = cute.make_ptr(
+                            Int32, Int64(mc_base), cute.AddressSpace.gmem, assumed_align=4
+                        )
+                        barrier.multimem_red_add_release_sys(mc + flat, 1)
+                    else:
+                        cute.arch.atomic_add(
+                            mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                        )
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():

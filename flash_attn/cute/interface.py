@@ -1294,6 +1294,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     dkv_done_counter: Optional[torch.Tensor] = None,
+    dkv_done_mc_ptr: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1704,6 +1705,7 @@ def _flash_attn_bwd(
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
+            dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
         )
     else:
         compile_key = (
@@ -1742,6 +1744,7 @@ def _flash_attn_bwd(
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
+            dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1868,6 +1871,12 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     subtile_factor=subtile_factor,
                 )
+
+        # Distributed CP push-signal: when a multicast pointer for the done-counter is given,
+        # the bwd epilogue broadcasts the per-block signal via multimem.red so the owner polls
+        # its LOCAL counter. Baked as a constexpr on the kernel object (pointer is stable for the
+        # whole run); compile_key carries the flag so a pull/atomic build is not reused.
+        fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None

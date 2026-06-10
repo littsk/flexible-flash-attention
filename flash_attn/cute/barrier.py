@@ -52,6 +52,26 @@ def red_release(
     )
 
 
+@dsl_user_op
+def multimem_red_add_release_sys(
+    mc_ptr: cute.Pointer, val: cutlass.Constexpr[Int32], *, loc=None, ip=None
+) -> None:
+    """Push-signal: atomic-add `val` to a MULTICAST address, broadcasting the increment
+    to every rank's copy in-switch (NVLS). Lets a kv-block owner poll its LOCAL counter
+    (cheap ld.acquire) instead of pulling a cross-rank multimem.ld_reduce each spin.
+    .release.sys orders the producer's dK/dV writes before the signal is visible."""
+    mc_ptr_i64 = mc_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [mc_ptr_i64, Int32(val).ir_value(loc=loc, ip=ip)],
+        "multimem.red.release.sys.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 @cute.jit
 def wait_eq(lock_ptr: cute.Pointer, thread_idx: int | Int32, flag_offset: int, val: Int32) -> None:
     flag_ptr = lock_ptr + flag_offset
