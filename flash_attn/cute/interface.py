@@ -1296,6 +1296,7 @@ def _flash_attn_bwd(
     dkv_done_counter: Optional[torch.Tensor] = None,
     dkv_done_mc_ptr: Optional[int] = None,
     bwd_local_last_shift: Optional[int] = None,
+    bwd_dkv_owned: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1488,12 +1489,14 @@ def _flash_attn_bwd(
 
     if dk is None:
         dk = torch.empty_like(k)
-    else:
+    elif bwd_dkv_owned is None:
         _validate_tensor(dk, "dk", k.shape, out_torch_dtype, device)
+    # else: distributed-CP local-last passes dk with a [+owned_cnt-block] scratch tail; the kernel
+    # addresses it via the store-redirect, so only dtype/seqlen-extension is allowed (caller-owned).
 
     if dv is None:
         dv = torch.empty_like(v)
-    else:
+    elif bwd_dkv_owned is None:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
@@ -1708,6 +1711,7 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
+            bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
         )
     else:
         compile_key = (
@@ -1748,6 +1752,7 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
+            bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1883,6 +1888,15 @@ def _flash_attn_bwd(
         # Distributed-CP local-last backward: cyclic-rotation shift = owned_start + owned_cnt.
         # When set, the bwd uses LocalLastBwdScheduler (head-inner, block-outer, owned-last).
         fa_bwd_obj.local_last_shift = bwd_local_last_shift
+        # local-last reduce-scatter: redirect this rank's OWN kv-blocks' dK/dV to a scratch tail
+        # of mdK/mdV (owned_lo, owned_cnt in n_block units; main_nblk = main region block count),
+        # and skip their done-signal -> owner reduces only the W-1 remote partials (race-free).
+        if bwd_dkv_owned is not None:
+            fa_bwd_obj.dkv_owned_lo = int(bwd_dkv_owned[0])    # constexpr (constant per rank/run)
+            fa_bwd_obj.dkv_owned_cnt = int(bwd_dkv_owned[1])
+            fa_bwd_obj.dkv_main_nblk = int(bwd_dkv_owned[2])
+        else:
+            fa_bwd_obj.dkv_owned_lo = None
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
