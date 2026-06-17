@@ -731,6 +731,7 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
         block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
         block_sparse_tensors is None or block_sparse_tensors.kv_block_trace is None,
+        block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1090,6 +1091,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.dq_write_order_full,
                     normalized_block_sparse_tensors.kv_block_signal,
                     normalized_block_sparse_tensors.kv_block_trace,
+                    normalized_block_sparse_tensors.prof_buf,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1712,6 +1714,8 @@ def _flash_attn_bwd(
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
+            block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
+            block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
         )
     else:
         compile_key = (
@@ -1753,6 +1757,8 @@ def _flash_attn_bwd(
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
+            block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
+            block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1967,6 +1973,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.dq_write_order_full,
                 normalized_block_sparse_tensors.kv_block_signal,
                 normalized_block_sparse_tensors.kv_block_trace,
+                normalized_block_sparse_tensors.prof_buf,
             )
             if normalized_block_sparse_tensors is not None
             else None,

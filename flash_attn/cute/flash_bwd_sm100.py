@@ -38,6 +38,20 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.flash_fwd_sm100 import (
+    _prof_mark,
+    _PROF_MAX_EVENTS,
+    _PROF_PHASE_START,
+    _PROF_PHASE_END,
+)
+
+# Backward warp-role profiler event ids (own namespace; the host Profiler for the
+# backward kernel registers these names). See mega_attention/profiler.
+_PROF_BWD_RELAY = 0
+_PROF_BWD_LOAD = 1
+_PROF_BWD_MMA = 2
+_PROF_BWD_COMPUTE = 3
+_PROF_BWD_REDUCE = 4
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
@@ -1094,6 +1108,15 @@ class FlashAttentionBackwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
+        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
+        # recording at compile time. 16 warps per CTA (reduce/compute/mma/load/relay/empty).
+        prof_buf = (
+            blocksparse_tensors.prof_buf
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        prof_nw = 16
+
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
             with cute.arch.elect_one():
@@ -1439,6 +1462,8 @@ class FlashAttentionBackwardSm100:
                 self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
             )
             if const_expr(self.use_2cta_instrs):
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_RELAY, _PROF_PHASE_START)
                 self.relay(
                     dS_cluster_full_mbar_ptr,
                     dS_cluster_empty_mbar_ptr,
@@ -1448,11 +1473,15 @@ class FlashAttentionBackwardSm100:
                     SeqlenInfoCls,
                     TileSchedulerCls,
                 )
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_RELAY, _PROF_PHASE_END)
 
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_LOAD, _PROF_PHASE_START)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1498,6 +1527,8 @@ class FlashAttentionBackwardSm100:
                 should_load_Q=True,
                 should_load_dO=True,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_LOAD, _PROF_PHASE_END)
 
         #  MMA
         # (12)
@@ -1509,6 +1540,8 @@ class FlashAttentionBackwardSm100:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
 
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_MMA, _PROF_PHASE_START)
             self.mma(
                 tiled_mma_S,
                 tiled_mma_dP,
@@ -1549,6 +1582,8 @@ class FlashAttentionBackwardSm100:
                 is_leader_cta,
                 blocksparse_tensors,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_MMA, _PROF_PHASE_END)
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
@@ -1560,6 +1595,8 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_START)
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1604,6 +1641,8 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 mdKV_done,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
         # Reduce
@@ -1612,6 +1651,8 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_REDUCE, _PROF_PHASE_START)
             self.dQacc_reduce(
                 mdQaccum,
                 sdQaccum,
@@ -1625,6 +1666,8 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore,
                 blocksparse_tensors,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_REDUCE, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
         return

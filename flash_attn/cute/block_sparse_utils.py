@@ -10,6 +10,7 @@ from functools import partial
 import math
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.distributed as cute_dist
 from cutlass import Float32, Int32, const_expr
 
 from quack import copy_utils
@@ -1067,6 +1068,26 @@ def produce_block_sparse_q_loads_bwd_sm100(
     ) = get_block_sparse_iteration_info_bwd(
         blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
     )
+
+    # Gated KV load (context-parallel overlap, design §6.6): before touching this
+    # n_block's K/V, spin on its global readiness signal so the comm-stream pull of
+    # remote KV overlaps the still-running backward compute of earlier blocks. Mirrors
+    # the forward load_KV gate; n_block is the global kv-block id (the bwd mask is
+    # lifted onto the full global layout). No-op when no signal is attached.
+    kv_block_signal = (
+        blocksparse_tensors.kv_block_signal
+        if const_expr(blocksparse_tensors is not None)
+        else None
+    )
+    if const_expr(kv_block_signal is not None):
+        if cute.arch.lane_idx() == 0:
+            sig_view = cute.make_tensor(
+                kv_block_signal.iterator + n_block, cute.make_layout((1,), stride=(1,))
+            )
+            ready = cute_dist.ld_bypass(sig_view)[0]
+            while ready == 0:
+                ready = cute_dist.ld_bypass(sig_view)[0]
+        cute.arch.sync_warp()
 
     for iter_idx in cutlass.range(loop_count, unroll=1):
         m_block, _ = get_m_block_from_iter_bwd(
