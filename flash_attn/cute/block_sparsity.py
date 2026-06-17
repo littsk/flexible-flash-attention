@@ -270,6 +270,115 @@ def compute_dq_write_order_from_block_mask(
     )
 
 
+def compute_dq_write_order_from_linear_csr(
+    tensors: LinearBlockSparseTensorsTorch,
+    spt: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Compute dQ write-order metadata for linear CSR backward sparsity.
+
+    The input CSR is expected to be the Q-direction/backward sparsity:
+    each compact row is an n_block and each entry is an m_block written by that
+    n_block. The returned tensors are compact 1D arrays parallel to
+    mask_block_idx and full_block_idx.
+    """
+    if tensors.mask_block_offset is None:
+        raise ValueError("linear CSR dq_write_order computation requires mask_block_offset")
+    if tensors.mask_block_idx is None:
+        raise ValueError("linear CSR dq_write_order computation requires mask_block_idx")
+    if tensors.mask_block_cnt.ndim != 3:
+        raise ValueError("linear CSR mask_block_cnt must have shape (B, H, N)")
+
+    mask_cnt = tensors.mask_block_cnt
+    mask_offset = tensors.mask_block_offset
+    mask_idx = tensors.mask_block_idx
+    device = mask_idx.device
+    _, _, num_n_blocks = mask_cnt.shape
+    num_rows = mask_cnt.numel()
+    if mask_offset.numel() != num_rows + 1:
+        raise ValueError(
+            "linear CSR mask_block_offset must have one more element than mask_block_cnt"
+        )
+
+    has_full = any(
+        x is not None
+        for x in (tensors.full_block_cnt, tensors.full_block_offset, tensors.full_block_idx)
+    )
+    if has_full and not all(
+        x is not None
+        for x in (tensors.full_block_cnt, tensors.full_block_offset, tensors.full_block_idx)
+    ):
+        raise ValueError(
+            "full_block_cnt, full_block_offset, and full_block_idx must be provided together"
+        )
+
+    def _entry_metadata(offset: torch.Tensor, idx: torch.Tensor):
+        positions = torch.arange(idx.numel(), device=device, dtype=torch.int64)
+        row = torch.searchsorted(offset.to(torch.int64), positions, right=True) - 1
+        bh = row // num_n_blocks
+        n_block = row - bh * num_n_blocks
+        return bh, n_block, idx.to(torch.int64)
+
+    mask_bh, mask_n, mask_m = _entry_metadata(mask_offset, mask_idx)
+    all_bh = [mask_bh]
+    all_n = [mask_n]
+    all_m = [mask_m]
+
+    full_len = 0
+    if has_full:
+        full_cnt = tensors.full_block_cnt
+        full_offset = tensors.full_block_offset
+        full_idx = tensors.full_block_idx
+        assert full_cnt is not None
+        assert full_offset is not None
+        assert full_idx is not None
+        if full_cnt.shape != mask_cnt.shape:
+            raise ValueError("linear CSR full_block_cnt must match mask_block_cnt shape")
+        if full_offset.numel() != num_rows + 1:
+            raise ValueError(
+                "linear CSR full_block_offset must have one more element than full_block_cnt"
+            )
+        full_len = full_idx.numel()
+        full_bh, full_n, full_m = _entry_metadata(full_offset, full_idx)
+        all_bh.append(full_bh)
+        all_n.append(full_n)
+        all_m.append(full_m)
+
+    total = mask_idx.numel() + full_len
+    if total == 0:
+        return (
+            torch.zeros_like(mask_idx),
+            torch.zeros_like(tensors.full_block_idx) if has_full else None,
+        )
+
+    flat_bh = torch.cat(all_bh)
+    flat_n = torch.cat(all_n)
+    flat_m = torch.cat(all_m)
+    max_m = torch.max(flat_m)
+    group_key = flat_bh * (max_m + 1) + flat_m
+    n_order = (num_n_blocks - 1 - flat_n) if spt else flat_n
+    sort_key = group_key * num_n_blocks + n_order
+    sorted_pos = torch.argsort(sort_key, stable=True)
+    sorted_group = group_key[sorted_pos]
+
+    pos = torch.arange(total, device=device, dtype=torch.int64)
+    boundary_pos = torch.full_like(pos, -1)
+    boundary_pos[0] = 0
+    if total > 1:
+        boundary_pos[1:] = torch.where(
+            sorted_group[1:] != sorted_group[:-1],
+            pos[1:],
+            torch.full_like(pos[1:], -1),
+        )
+    last_boundary, _ = torch.cummax(boundary_pos, dim=0)
+    sorted_rank = (pos - last_boundary).to(torch.int32)
+
+    flat_rank = torch.empty(total, device=device, dtype=torch.int32)
+    flat_rank[sorted_pos] = sorted_rank
+    mask_rank = flat_rank[: mask_idx.numel()]
+    full_rank = flat_rank[mask_idx.numel():] if has_full else None
+    return mask_rank, full_rank
+
+
 def get_sparse_q_block_size(
     tensors: BlockSparseTensorsTorch | LinearBlockSparseTensorsTorch | None,
     seqlen_q: int,

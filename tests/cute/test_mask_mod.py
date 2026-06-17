@@ -25,10 +25,12 @@ import torch.nn.functional as F
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_attn_func
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
+    LinearBlockSparseTensorsTorch,
     fast_sampling,
     normalize_block_sparse_config,
     compute_dq_write_order,
     compute_dq_write_order_from_block_mask,
+    compute_dq_write_order_from_linear_csr,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
@@ -1889,6 +1891,112 @@ def _run_write_order_test(mask_mod_flex, seqlen_q, seqlen_k, block_size, B=1, H=
             q_mask_cnt, q_mask_idx, full_q_cnt, full_q_idx,
             dq_wo, dq_wo_full,
         )
+
+
+def _linear_csr_from_rows(mask_rows, full_rows, device):
+    B = len(mask_rows)
+    H = len(mask_rows[0])
+    N = len(mask_rows[0][0])
+
+    def pack_rows(rows):
+        cnt_values = []
+        idx_values = []
+        offsets = [0]
+        for b in range(B):
+            for h in range(H):
+                for n in range(N):
+                    row = rows[b][h][n]
+                    cnt_values.append(len(row))
+                    idx_values.extend(row)
+                    offsets.append(offsets[-1] + len(row))
+        cnt = torch.tensor(cnt_values, dtype=torch.int32, device=device).reshape(B, H, N)
+        offset = torch.tensor(offsets, dtype=torch.int32, device=device)
+        idx = torch.tensor(idx_values, dtype=torch.int32, device=device)
+        return cnt, offset, idx
+
+    mask_cnt, mask_offset, mask_idx = pack_rows(mask_rows)
+    full_cnt = full_offset = full_idx = None
+    if full_rows is not None:
+        full_cnt, full_offset, full_idx = pack_rows(full_rows)
+
+    return LinearBlockSparseTensorsTorch(
+        mask_block_cnt=mask_cnt,
+        mask_block_offset=mask_offset,
+        mask_block_idx=mask_idx,
+        full_block_cnt=full_cnt,
+        full_block_offset=full_offset,
+        full_block_idx=full_idx,
+    )
+
+
+def _expected_linear_dq_write_order(mask_rows, full_rows, spt, device):
+    B = len(mask_rows)
+    H = len(mask_rows[0])
+    N = len(mask_rows[0][0])
+
+    def rank_for(b, h, n, m):
+        contributors = [
+            other_n
+            for other_n in range(N)
+            if (
+                m in mask_rows[b][h][other_n]
+                or (full_rows is not None and m in full_rows[b][h][other_n])
+            )
+        ]
+        contributors = sorted(contributors, reverse=spt)
+        return contributors.index(n)
+
+    def expected_for_rows(rows):
+        values = []
+        for b in range(B):
+            for h in range(H):
+                for n in range(N):
+                    values.extend(rank_for(b, h, n, m) for m in rows[b][h][n])
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    mask_expected = expected_for_rows(mask_rows)
+    full_expected = expected_for_rows(full_rows) if full_rows is not None else None
+    return mask_expected, full_expected
+
+
+@pytest.mark.parametrize("spt", [False, True])
+@pytest.mark.parametrize("include_full", [False, True])
+def test_dq_write_order_linear_csr(spt, include_full):
+    device = "cuda"
+    mask_rows = [
+        [
+            [[0, 2], [2], [0, 1], []],
+            [[1], [1, 2], [], [2]],
+        ],
+        [
+            [[0], [0, 2], [2], []],
+            [[], [1], [1, 2], [2]],
+        ],
+    ]
+    full_rows = [
+        [
+            [[1], [], [2], [0]],
+            [[], [0], [1], []],
+        ],
+        [
+            [[], [1], [], [0]],
+            [[0], [], [], [1]],
+        ],
+    ]
+    full_rows = full_rows if include_full else None
+
+    linear = _linear_csr_from_rows(mask_rows, full_rows, device)
+    dq_wo, dq_wo_full = compute_dq_write_order_from_linear_csr(linear, spt=spt)
+    expected, expected_full = _expected_linear_dq_write_order(
+        mask_rows, full_rows, spt, device
+    )
+
+    torch.testing.assert_close(dq_wo, expected, rtol=0, atol=0)
+    if include_full:
+        assert dq_wo_full is not None
+        torch.testing.assert_close(dq_wo_full, expected_full, rtol=0, atol=0)
+    else:
+        assert dq_wo_full is None
 
 
 def _build_block_sparse_masks_for_bwd(
