@@ -3204,8 +3204,17 @@ class FlashAttentionForwardSm100:
         kv_trace: Optional[cute.Tensor] = None,
         prof_buf: Optional[cute.Tensor] = None,
         prof_nw: int = 0,
+        head_idx: Int32 = Int32(0),
     ):
         assert K_or_V in ("K", "V")
+        # Observability trace row: per-block (legacy) or per-(kv-head, block) when the
+        # signal is 2D [H_kv, n_block] -- so each kv-head's wait/ready/consume is recorded
+        # separately (H_kv*n_block rows) instead of all heads colliding on one block slot.
+        if const_expr(kv_trace is not None):
+            if const_expr(kv_signal is not None and cute.rank(kv_signal) == 2):
+                trace_row = head_idx * cute.size(kv_signal, mode=[1]) + block
+            else:
+                trace_row = block
         # Gated KV load: spin on the per-block readiness signal in GMEM before
         # touching this block's K/V. Mirrors the gate_a_flags pattern used in the
         # all-gather GEMM example: a peer copy stream fills the block then sets the
@@ -3214,18 +3223,28 @@ class FlashAttentionForwardSm100:
             if cute.arch.lane_idx() == 0:
                 # [.,0] wait-start: kernel reaches this block and begins polling.
                 if const_expr(kv_trace is not None):
-                    _trace_store_globaltimer(kv_trace, block * 3 + 0)
+                    _trace_store_globaltimer(kv_trace, trace_row * 3 + 0)
                 if const_expr(prof_buf is not None):
                     _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_START)
-                sig_view = cute.make_tensor(
-                    kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
-                )
+                # Per-(kv-head, block) gate when kv_signal is 2D [H_kv, n_block]: the comm
+                # delivers (and signals) head h's slice of a block independently, so head h's
+                # q-tile only waits for head h's slice -- not the whole block's all-heads
+                # transfer. 1D [n_block] keeps the legacy per-block gate (e.g. backward).
+                if const_expr(cute.rank(kv_signal) == 2):
+                    sig_base = kv_signal[head_idx, None]
+                    sig_view = cute.make_tensor(
+                        sig_base.iterator + block, cute.make_layout((1,), stride=(1,))
+                    )
+                else:
+                    sig_view = cute.make_tensor(
+                        kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
+                    )
                 ready = cute_dist.ld_bypass(sig_view)[0]
                 while ready == 0:
                     ready = cute_dist.ld_bypass(sig_view)[0]
                 # [.,1] signal-ready: producer's push for this block is now visible.
                 if const_expr(kv_trace is not None):
-                    _trace_store_globaltimer(kv_trace, block * 3 + 1)
+                    _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)
                 if const_expr(prof_buf is not None):
                     _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_END)
             cute.arch.sync_warp()
@@ -3242,7 +3261,7 @@ class FlashAttentionForwardSm100:
         # is post-delivery pipeline backpressure.
         if const_expr(kv_trace is not None):
             if cute.arch.lane_idx() == 0:
-                _trace_store_globaltimer(kv_trace, block * 3 + 2)
+                _trace_store_globaltimer(kv_trace, trace_row * 3 + 2)
         # Warp-granular profiler: per-(K/V) block load issued by the load warp.
         if const_expr(prof_buf is not None):
             _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_LOAD, _PROF_PHASE_INSTANT)

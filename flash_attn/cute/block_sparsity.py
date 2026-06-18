@@ -682,7 +682,10 @@ def to_cute_block_sparse_tensors(
     ]
     kv_block_signal_tensor = (
         to_cute_tensor(
-            tensors.kv_block_signal, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+            tensors.kv_block_signal, assumed_align=4,
+            # 1D [n_block] (legacy per-block) is unit-stride on dim 0; 2D [H_kv, n_block]
+            # (per-kv-head) is row-major -> the contiguous (unit-stride) dim is the last.
+            leading_dim=tensors.kv_block_signal.dim() - 1, enable_tvm_ffi=enable_tvm_ffi
         )
         if tensors.kv_block_signal is not None
         else None

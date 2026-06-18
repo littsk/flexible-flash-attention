@@ -573,8 +573,14 @@ def load_block_list_sm100(
     load_K,
     load_V,
     pipeline_kv,
+    head_idx=Int32(0),
 ):
-    """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count)."""
+    """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count).
+
+    ``head_idx`` is forwarded to the gated K load so a per-(kv-head, block) signal
+    (2D ``kv_block_signal``) is polled at this head's row -- enabling per-kv-head KV
+    comm (head h's q-tiles wait only for head h's KV slice).
+    """
     block_count = block_end - block_begin
     if block_count > 0:
         # First iteration: load Q alongside K if requested
@@ -588,7 +594,8 @@ def load_block_list_sm100(
 
         # SM100 doesn't use producer_acquire for pipeline_kv in load path
         # The pipeline barriers are handled inside load_KV
-        load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
+        load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=None,
+               head_idx=head_idx)
         kv_producer_state.advance()
         load_V(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
         kv_producer_state.advance()
@@ -596,7 +603,8 @@ def load_block_list_sm100(
         # Remaining blocks
         for offset in cutlass.range(1, block_count):
             n_block = block_indices[block_end - 1 - offset]
-            load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+            load_K(block=n_block, producer_state=kv_producer_state, page_idx=None,
+                   head_idx=head_idx)
             kv_producer_state.advance()
             load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
             kv_producer_state.advance()
@@ -668,6 +676,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            head_idx=head_idx,
         )
         q_phase_flipped = not full_empty
     else:
@@ -683,6 +692,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            head_idx=head_idx,
         )
         q_phase_flipped = True
 
@@ -699,6 +709,7 @@ def produce_block_sparse_loads_sm100(
                 load_K=load_K,
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
+                head_idx=head_idx,
             )
 
     if q_phase_flipped:
