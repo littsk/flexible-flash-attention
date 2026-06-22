@@ -1485,9 +1485,11 @@ def _flash_attn_bwd(
         and head_dim_v == 128
         and _is_linear_csr_block_sparse(block_sparse_tensors)
     )
-    use_sm100_2cta_linear_csr_bwd = (
-        use_sm100_hdim192_linear_csr_bwd or use_sm100_hdim128_linear_csr_bwd
-    )
+    # magi_attention compat: the 2CTA linear-CSR bwd expects BLOCK_SIZE=(2m,2n)
+    # block-sparse tiles, but magi_attention/calc_meta builds k2q masks with (m,n)
+    # tiles. Disable the 2CTA fast path so hd128/192 use the standard linear-CSR
+    # bwd (correct with (m,n) tiles, as validated for hd64).
+    use_sm100_2cta_linear_csr_bwd = False
     arbitrary_func_num = 0
     arbitrary_batch_broadcast = False
     arbitrary_head_broadcast = False
