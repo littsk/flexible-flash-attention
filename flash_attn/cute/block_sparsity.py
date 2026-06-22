@@ -394,8 +394,9 @@ def get_sparse_q_block_size(
         num_m_blocks = tensors.mask_block_idx.shape[2]
     min_block_size = ceildiv(seqlen_q, num_m_blocks)
     max_block_size = seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)
-    if min_block_size != max_block_size:
-        return None
+    # magi_attention compat: tile-based sparsity uses uniform Q block sizes
+    # (a partial last block makes min!=max, which is not actually ambiguous).
+    # Prefer explicit block_size when set; otherwise the ceildiv tile size is correct.
     return min_block_size
 
 
