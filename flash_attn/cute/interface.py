@@ -2315,6 +2315,9 @@ _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 _flash_attn_bwd.compile_cache_pre = _bwd_preprocess.compile_cache
 _flash_attn_bwd.compile_cache_post = _bwd_postprocess_convert.compile_cache
 
+# magi_attention compat: deterministic bwd dQ lock-values (ported from byted)
+from flash_attn_cute.dq_lock_values import _compute_bwd_dQ_lock_values  # noqa: E402,F401
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
