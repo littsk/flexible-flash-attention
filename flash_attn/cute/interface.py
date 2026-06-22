@@ -2309,6 +2309,12 @@ def _flash_attn_bwd(
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 
+# magi_attention compat shim: upstream fa4_utils expects the bwd pre/post JIT
+# caches as attributes on _flash_attn_bwd; magi_backend keeps them on the
+# _bwd_preprocess / _bwd_postprocess_convert helpers. Alias (same dict objects).
+_flash_attn_bwd.compile_cache_pre = _bwd_preprocess.compile_cache
+_flash_attn_bwd.compile_cache_post = _bwd_postprocess_convert.compile_cache
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
