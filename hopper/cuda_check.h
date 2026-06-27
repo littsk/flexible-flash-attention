@@ -69,3 +69,22 @@
     } while(0)
 
 #define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
+
+// Same recoverable-error treatment for cutlass kernel-launch status. The
+// magi_backend hopper launch templates call ``CHECK_CUTLASS(...)`` but the
+// macro was missing from this header (build error: identifier "CHECK_CUTLASS"
+// is undefined). Mirror ``CHECK_CUDA``: throw on non-success so Python can
+// catch it instead of the process aborting and deadlocking other ranks.
+// ``cutlass::Status`` is in scope at every expansion site (those TUs include
+// <cutlass/cutlass.h> before this header).
+#define CHECK_CUTLASS(call)                                                                          \
+    do {                                                                                             \
+        cutlass::Status status_ = (call);                                                            \
+        if (status_ != cutlass::Status::kSuccess) {                                                  \
+            char _check_cutlass_msg[512];                                                            \
+            snprintf(_check_cutlass_msg, sizeof(_check_cutlass_msg),                                 \
+                "CUTLASS error (%s:%d): status=%d",                                                  \
+                __FILE__, __LINE__, static_cast<int>(status_));                                      \
+            throw std::runtime_error(std::string(_check_cutlass_msg));                               \
+        }                                                                                            \
+    } while(0)
