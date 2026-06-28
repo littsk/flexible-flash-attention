@@ -1475,7 +1475,17 @@ def _flash_attn_bwd(
     dQ_lock_combined_offset: Optional[torch.Tensor] = None,
     sorted_block_idx: Optional[torch.Tensor] = None,
     sorted_block_is_full: Optional[torch.Tensor] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # ``dq``/``dk``/``dv`` may be passed in as pre-allocated output buffers
+    # (same shape/dtype/layout as ``torch.empty_like(q/k/v)`` would produce).
+    # When provided, the kernel writes its gradients directly into them instead
+    # of allocating fresh tensors, which lets an outer caller (e.g. MagiAttention's
+    # dist_attn static buffer pool) own the dq/dk/dv storage. These objects are
+    # never rebound below -- they are the kernel / postprocess output targets and
+    # are returned as-is -- so caller buffers are filled in place.
     compute_capability = torch.cuda.get_device_capability()[0]
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
@@ -1578,9 +1588,9 @@ def _flash_attn_bwd(
 
     device = q.device
     # TODO: check if this is the right rounding
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    dq = torch.empty_like(q) if dq is None else dq
+    dk = torch.empty_like(k) if dk is None else dk
+    dv = torch.empty_like(v) if dv is None else dv
 
     head_dim_rounded = (head_dim + 16 - 1) // 16 * 16
 
