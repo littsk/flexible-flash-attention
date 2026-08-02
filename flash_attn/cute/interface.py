@@ -1297,6 +1297,10 @@ def _flash_attn_bwd(
     dlse: Optional[torch.Tensor] = None,
     dkv_done_counter: Optional[torch.Tensor] = None,
     dkv_done_mc_ptr: Optional[int] = None,
+    dk_accum_external: Optional[torch.Tensor] = None,
+    dv_accum_external: Optional[torch.Tensor] = None,
+    gqa_local_done_counter: Optional[torch.Tensor] = None,
+    skip_dkv_postprocess: bool = False,
     bwd_local_last_shift: Optional[int] = None,
     bwd_dkv_owned: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1540,24 +1544,57 @@ def _flash_attn_bwd(
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    if skip_dkv_postprocess and (
+        not dKV_postprocess
+        or dk_accum_external is None
+        or dv_accum_external is None
+        or gqa_local_done_counter is None
+    ):
+        raise ValueError(
+            "skip_dkv_postprocess requires GQA with caller accumulators and local done counter"
+        )
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
-            dk_accum = torch.zeros(
+            dk_accum_shape = (
                 batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_rounded,
-                dtype=torch.float32,
-                device=device,
             )
-            dv_accum = torch.zeros(
+            dv_accum_shape = (
                 batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_v_rounded,
-                dtype=torch.float32,
-                device=device,
             )
+            if dk_accum_external is not None or dv_accum_external is not None:
+                if dk_accum_external is None or dv_accum_external is None:
+                    raise ValueError(
+                        "dk_accum_external and dv_accum_external must be provided together"
+                    )
+                _validate_tensor(
+                    dk_accum_external, "dk_accum_external", dk_accum_shape, torch.float32, device
+                )
+                _validate_tensor(
+                    dv_accum_external, "dv_accum_external", dv_accum_shape, torch.float32, device
+                )
+                dk_accum = dk_accum_external
+                dv_accum = dv_accum_external
+            else:
+                dk_accum = torch.zeros(
+                    *dk_accum_shape,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                dv_accum = torch.zeros(
+                    *dv_accum_shape,
+                    dtype=torch.float32,
+                    device=device,
+                )
         else:
+            if dk_accum_external is not None or dv_accum_external is not None:
+                raise NotImplementedError(
+                    "caller-provided GQA accumulators are not supported for varlen K"
+                )
             cluster_tile_n = cluster_size * n_block_size
             total_k_rounded_padded = (
                 (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
@@ -1603,6 +1640,19 @@ def _flash_attn_bwd(
         dKV_done = torch.zeros(batch_size * num_head_kv * n_block_total, dtype=torch.int32, device=device)
     else:
         dKV_done = None
+    if gqa_local_done_counter is not None:
+        if not dKV_postprocess:
+            raise ValueError("gqa_local_done_counter requires a GQA dK/dV postprocess path")
+        expected_local_done = batch_size * num_head_kv * num_n_blocks
+        _validate_tensor(
+            gqa_local_done_counter,
+            "gqa_local_done_counter",
+            (expected_local_done,),
+            torch.int32,
+            device,
+        )
+        if batch_size != 1:
+            raise NotImplementedError("CP GQA local finalize currently requires batch_size == 1")
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
@@ -1712,6 +1762,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
+            gqa_local_done_counter is not None,
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
@@ -1755,6 +1806,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
+            gqa_local_done_counter is not None,
             bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
@@ -1781,6 +1833,11 @@ def _flash_attn_bwd(
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
         dKV_done_tensor = to_cute_tensor(dKV_done.detach(), assumed_align=4) if dKV_done is not None else None
+        gqa_local_done_tensor = (
+            to_cute_tensor(gqa_local_done_counter.detach(), assumed_align=4)
+            if gqa_local_done_counter is not None
+            else None
+        )
         if arch // 10 in [8, 12]:
             flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
             fa_bwd_obj = flash_bwd_obj_cls(
@@ -1891,6 +1948,7 @@ def _flash_attn_bwd(
         # its LOCAL counter. Baked as a constexpr on the kernel object (pointer is stable for the
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
+        fa_bwd_obj.gqa_nblk = num_n_blocks if gqa_local_done_counter is not None else None
         # Distributed-CP local-last backward: cyclic-rotation shift = owned_start + owned_cnt.
         # When set, the bwd uses LocalLastBwdScheduler (head-inner, block-outer, owned-last).
         fa_bwd_obj.local_last_shift = bwd_local_last_shift
@@ -1934,6 +1992,11 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             AuxData(cute_aux_tensors, aux_scalars),
             dKV_done_tensor,  # mdKV_done (distributed CP backward reduce-scatter signal)
+            *(
+                [gqa_local_done_tensor]
+                if arch // 10 in [10, 11]
+                else []
+            ),
             sparse_tensors_compile,
             current_stream,
             options="--enable-tvm-ffi",
@@ -1962,6 +2025,11 @@ def _flash_attn_bwd(
             dV_semaphore,
             AuxData(aux_tensors, aux_scalars),
             dKV_done,  # mdKV_done (distributed CP backward reduce-scatter signal)
+            *(
+                [gqa_local_done_counter]
+                if arch // 10 in [10, 11]
+                else []
+            ),
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
@@ -2003,7 +2071,7 @@ def _flash_attn_bwd(
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
         )
 
-        if dKV_postprocess:
+        if dKV_postprocess and not skip_dkv_postprocess:
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
             _bwd_postprocess_convert(
                 dk_accum, dk, softmax_scale,
