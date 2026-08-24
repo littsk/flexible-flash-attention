@@ -727,6 +727,10 @@ class MBlockGroupBatchTileScheduler:
         self._tile_idx += cute.arch.grid_dim()[0]
         return self.get_current_work()
 
+    def reset(self, *, loc=None, ip=None):
+        """Restart this resident CTA's m-block-outer grid-stride walk."""
+        self._tile_idx = cute.arch.block_idx()[0]
+
     def producer_tail(self, *, loc=None, ip=None):
         pass
 
