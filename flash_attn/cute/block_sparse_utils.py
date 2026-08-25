@@ -562,19 +562,6 @@ def split_block_range(block_count, split_idx: Int32, num_splits: Int32):
 
 
 @cute.jit
-def is_two_phase_block_selected(
-    kv_is_local: Optional[cute.Tensor],
-    n_block: Int32,
-    phase: cutlass.Constexpr[int],
-):
-    """Select all blocks normally, or local/remote blocks for phase 0/1."""
-    if const_expr(kv_is_local is None):
-        return True
-    block_is_local = kv_is_local[n_block] != Int32(0)
-    return block_is_local if const_expr(phase == 0) else not block_is_local
-
-
-@cute.jit
 def load_block_list_sm100(
     block_indices: cute.Tensor,
     block_begin,
@@ -587,9 +574,6 @@ def load_block_list_sm100(
     load_V,
     pipeline_kv,
     head_idx=Int32(0),
-    kv_is_local: Optional[cute.Tensor] = None,
-    phase: cutlass.Constexpr[int] = 0,
-    q_loaded=False,
 ):
     """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count).
 
@@ -598,21 +582,34 @@ def load_block_list_sm100(
     comm (head h's q-tiles wait only for head h's KV slice).
     """
     block_count = block_end - block_begin
-    for offset in cutlass.range(block_count):
-        n_block = block_indices[block_end - 1 - offset]
-        if is_two_phase_block_selected(kv_is_local, n_block, phase):
-            if const_expr(load_q_with_first) and not q_loaded:
-                load_Q(block=0, stage=0)
-                if const_expr(q_stage == 2):
-                    load_Q(block=1, stage=1)
-                q_loaded = True
+    if block_count > 0:
+        # First iteration: load Q alongside K if requested
+        n_block_first = block_indices[block_end - 1]
+
+        if const_expr(load_q_with_first):
+            # SM100 loads Q0 and optionally Q1
+            load_Q(block=0, stage=0)
+            if const_expr(q_stage == 2):
+                load_Q(block=1, stage=1)
+
+        # SM100 doesn't use producer_acquire for pipeline_kv in load path
+        # The pipeline barriers are handled inside load_KV
+        load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=None,
+               head_idx=head_idx)
+        kv_producer_state.advance()
+        load_V(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+
+        # Remaining blocks
+        for offset in cutlass.range(1, block_count):
+            n_block = block_indices[block_end - 1 - offset]
             load_K(block=n_block, producer_state=kv_producer_state, page_idx=None,
                    head_idx=head_idx)
             kv_producer_state.advance()
             load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
             kv_producer_state.advance()
 
-    return kv_producer_state, q_loaded
+    return kv_producer_state
 
 
 # SM100-specific tile processor using SM100 helpers
@@ -634,8 +631,6 @@ def produce_block_sparse_loads_sm100(
     q_producer_phase: Int32,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
-    kv_is_local: Optional[cute.Tensor] = None,
-    phase: cutlass.Constexpr[int] = 0,
 ):
     """SM100 entry point for sparse block iteration.
 
@@ -663,25 +658,14 @@ def produce_block_sparse_loads_sm100(
 
     mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
     full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
-    q_loaded = False
-    kv_producer_state, q_loaded = load_block_list_sm100(
-        curr_mask_block_idx,
-        mask_begin,
-        mask_end,
-        load_q_with_first=True,
-        q_stage=q_stage,
-        kv_producer_state=kv_producer_state,
-        load_Q=load_Q,
-        load_K=load_K,
-        load_V=load_V,
-        pipeline_kv=pipeline_kv,
-        head_idx=head_idx,
-        kv_is_local=kv_is_local,
-        phase=phase,
-        q_loaded=q_loaded,
-    )
-    if const_expr(curr_full_block_idx is not None):
-        kv_producer_state, q_loaded = load_block_list_sm100(
+    mask_empty = mask_begin == mask_end
+    full_empty = full_begin == full_end
+
+    q_phase_flipped = False
+
+    if mask_empty:
+        # No masked blocks: process full list with Q loading
+        kv_producer_state = load_block_list_sm100(
             curr_full_block_idx,
             full_begin,
             full_end,
@@ -693,12 +677,42 @@ def produce_block_sparse_loads_sm100(
             load_V=load_V,
             pipeline_kv=pipeline_kv,
             head_idx=head_idx,
-            kv_is_local=kv_is_local,
-            phase=phase,
-            q_loaded=q_loaded,
         )
+        q_phase_flipped = not full_empty
+    else:
+        # Process masked blocks with Q loading
+        kv_producer_state = load_block_list_sm100(
+            curr_mask_block_idx,
+            mask_begin,
+            mask_end,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+            head_idx=head_idx,
+        )
+        q_phase_flipped = True
 
-    if q_loaded:
+        if not full_empty:
+            # Process full blocks without Q loading
+            kv_producer_state = load_block_list_sm100(
+                curr_full_block_idx,
+                full_begin,
+                full_end,
+                load_q_with_first=False,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+                head_idx=head_idx,
+            )
+
+    if q_phase_flipped:
         q_producer_phase ^= 1
 
     return kv_producer_state, q_producer_phase
@@ -715,15 +729,13 @@ def get_total_block_count(
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
     seqlen_info: SeqlenInfoQK,
-    kv_is_local: Optional[cute.Tensor] = None,
-    phase: cutlass.Constexpr[int] = 0,
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
     (
         curr_mask_block_cnt,
-        curr_mask_block_idx,
+        _,
         curr_full_block_cnt,
-        curr_full_block_idx,
+        _,
     ) = get_curr_blocksparse_tensors(
         batch_idx,
         head_idx,
@@ -734,19 +746,7 @@ def get_total_block_count(
 
     mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
     full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
-    if const_expr(kv_is_local is None):
-        return mask_end - mask_begin + full_end - full_begin
-    selected = Int32(0)
-    for offset in cutlass.range(mask_end - mask_begin):
-        n_block = curr_mask_block_idx[mask_begin + offset]
-        if is_two_phase_block_selected(kv_is_local, n_block, phase):
-            selected += 1
-    if const_expr(curr_full_block_idx is not None):
-        for offset in cutlass.range(full_end - full_begin):
-            n_block = curr_full_block_idx[full_begin + offset]
-            if is_two_phase_block_selected(kv_is_local, n_block, phase):
-                selected += 1
-    return selected
+    return mask_end - mask_begin + full_end - full_begin
 
 
 @cute.jit
@@ -782,8 +782,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
     mO_cur: Optional[cute.Tensor] = None,
     gO: Optional[cute.Tensor] = None,
     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
-    mLocalO_cur: Optional[cute.Tensor] = None,
-    merge_local: cutlass.Constexpr[bool] = False,
 ):
     """Handle SM100 forward block-sparse tiles with no active KV blocks.
 
@@ -855,8 +853,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
             mO_cur,
             gO_stage,
             gmem_tiled_copy_O,
-            mLocalO_cur=mLocalO_cur if const_expr(merge_local) else None,
-            local_weight=Float32(1.0) if const_expr(merge_local) else Float32(0.0),
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)
@@ -893,8 +889,6 @@ def softmax_block_sparse_sm100(
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
-    kv_is_local: Optional[cute.Tensor] = None,
-    phase: cutlass.Constexpr[int] = 0,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
@@ -916,14 +910,27 @@ def softmax_block_sparse_sm100(
     full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
     split_mask_block_cnt = mask_end - mask_begin
     split_full_block_cnt = full_end - full_begin
+    total_block_cnt = split_mask_block_cnt + split_full_block_cnt
 
-    if const_expr(kv_is_local is None):
-        total_block_cnt = split_mask_block_cnt + split_full_block_cnt
-        if total_block_cnt == 0:
-            sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
-        else:
-            if split_mask_block_cnt > 0:
-                mask_n_block = curr_mask_block_idx[mask_end - 1]
+    if total_block_cnt == 0:
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
+    else:
+        if split_mask_block_cnt > 0:
+            mask_n_block = curr_mask_block_idx[mask_end - 1]
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                mask_n_block,
+                is_first=True,
+                mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
+            )
+            for i in cutlass.range(1, split_mask_block_cnt):
+                mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -933,92 +940,27 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     mask_n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=False, check_q_boundary=check_m_boundary),
+                )
+
+        if split_full_block_cnt > 0:
+            full_n_block = curr_full_block_idx[full_end - 1]
+            if split_mask_block_cnt == 0:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    full_n_block,
                     is_first=True,
                     mask_fn=partial(
-                        mask_fn,
-                        mask_seqlen=True,
-                        check_q_boundary=check_m_boundary,
+                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
                     ),
                 )
-                for i in cutlass.range(1, split_mask_block_cnt):
-                    mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
-                    (
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                    ) = softmax_step(
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                        mask_n_block,
-                        mask_fn=partial(
-                            mask_fn,
-                            mask_seqlen=False,
-                            check_q_boundary=check_m_boundary,
-                        ),
-                    )
-            if split_full_block_cnt > 0:
-                full_n_block = curr_full_block_idx[full_end - 1]
-                if split_mask_block_cnt == 0:
-                    (
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                    ) = softmax_step(
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                        full_n_block,
-                        is_first=True,
-                        mask_fn=partial(
-                            mask_fn_none,
-                            mask_seqlen=True,
-                            check_q_boundary=check_m_boundary,
-                        ),
-                    )
-                else:
-                    (
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                    ) = softmax_step(
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                        full_n_block,
-                        is_first=False,
-                        mask_fn=partial(
-                            mask_fn_none,
-                            mask_seqlen=True,
-                            check_q_boundary=check_m_boundary,
-                        ),
-                    )
-                for i in cutlass.range(1, split_full_block_cnt):
-                    full_n_block = curr_full_block_idx[full_end - 1 - i]
-                    (
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                    ) = softmax_step(
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                        full_n_block,
-                        mask_fn=partial(
-                            mask_fn_none,
-                            mask_seqlen=False,
-                            check_q_boundary=check_m_boundary,
-                        ),
-                    )
-        empty_tile = total_block_cnt == 0
-    else:
-        # The selected list is data-dependent. Starting from reset (-inf, 0)
-        # makes the regular online update mathematically identical to the
-        # specialized first-block update, while keeping constexpr control flow.
-        selected_block_cnt = Int32(0)
-        for i in cutlass.range(split_mask_block_cnt):
-            mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
-            if is_two_phase_block_selected(kv_is_local, mask_n_block, phase):
+            else:
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -1027,47 +969,33 @@ def softmax_block_sparse_sm100(
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
-                    mask_n_block,
+                    full_n_block,
                     is_first=False,
                     mask_fn=partial(
-                        mask_fn,
-                        mask_seqlen=True,
-                        check_q_boundary=check_m_boundary,
+                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
                     ),
                 )
-                selected_block_cnt += 1
-
-        if const_expr(curr_full_block_idx is not None):
-            for i in cutlass.range(split_full_block_cnt):
+            for i in cutlass.range(1, split_full_block_cnt):
                 full_n_block = curr_full_block_idx[full_end - 1 - i]
-                if is_two_phase_block_selected(kv_is_local, full_n_block, phase):
-                    (
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                    ) = softmax_step(
-                        mma_si_consumer_phase,
-                        si_corr_producer_phase,
-                        s0_s1_sequence_phase,
-                        full_n_block,
-                        is_first=False,
-                        mask_fn=partial(
-                            mask_fn_none,
-                            mask_seqlen=True,
-                            check_q_boundary=check_m_boundary,
-                        ),
-                    )
-                    selected_block_cnt += 1
-
-        if selected_block_cnt == 0:
-            sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
-        empty_tile = selected_block_cnt == 0
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    full_n_block,
+                    mask_fn=partial(
+                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
+                    ),
+                )
 
     return (
         mma_si_consumer_phase,
         si_corr_producer_phase,
         s0_s1_sequence_phase,
-        empty_tile,
+        total_block_cnt == 0,
     )
 
 

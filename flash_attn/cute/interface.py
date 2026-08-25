@@ -329,11 +329,6 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
-    two_phase_forward: bool = False,
-    kv_is_local: Optional[torch.Tensor] = None,
-    local_o_workspace: Optional[torch.Tensor] = None,
-    local_lse_workspace: Optional[torch.Tensor] = None,
-    phase_barrier: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -348,11 +343,6 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
-        two_phase_forward: Enable the SM100 rank-wide local/remote persistent path.
-        kv_is_local: Int32 vector classifying each logical KV block.
-        local_o_workspace: Output-dtype workspace for the normalized local partial.
-        local_lse_workspace: FP32 workspace for the local partial LSE.
-        phase_barrier: Int32 ``[count, generation]`` resident-grid barrier state.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
@@ -448,44 +438,10 @@ def _flash_attn_fwd(
                 seqused_k,
                 page_table,
                 learnable_sink,
-                kv_is_local,
-                local_o_workspace,
-                local_lse_workspace,
-                phase_barrier,
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
-    if two_phase_forward:
-        if arch // 10 != 10:
-            raise NotImplementedError(
-                "two_phase_forward requires SM100 (compute capability 10.x)"
-            )
-        if block_sparse_tensors is None:
-            raise NotImplementedError(
-                "two_phase_forward requires block_sparse_tensors"
-            )
-        if any(
-            t is not None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-        ):
-            raise NotImplementedError(
-                "two_phase_forward does not support varlen inputs"
-            )
-        if num_splits != 1:
-            raise NotImplementedError("two_phase_forward requires num_splits=1")
-        if causal or window_size_left is not None or window_size_right is not None:
-            raise NotImplementedError(
-                "two_phase_forward requires non-causal, non-windowed block-sparse masking"
-            )
-        if page_table is not None or qv is not None:
-            raise NotImplementedError(
-                "two_phase_forward does not support paged KV or qv"
-            )
-        if learnable_sink is not None:
-            raise NotImplementedError(
-                "two_phase_forward does not support learnable_sink"
-            )
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -525,58 +481,16 @@ def _flash_attn_fwd(
     if lse is None:
         lse = (
             torch.empty(lse_shape, dtype=torch.float32, device=device)
-            if requires_grad or return_lse or two_phase_forward
+            if requires_grad or return_lse
             else None
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
-    two_phase_tensors = (
-        kv_is_local,
-        local_o_workspace,
-        local_lse_workspace,
-        phase_barrier,
-    )
-    if two_phase_forward:
-        if any(t is None for t in two_phase_tensors):
-            raise ValueError(
-                "two_phase_forward requires kv_is_local, local_o_workspace, "
-                "local_lse_workspace, and phase_barrier"
-            )
-        _validate_tensor(
-            local_o_workspace,
-            "local_o_workspace",
-            (*q_batch_seqlen_shape, num_head, head_dim_v),
-            out_torch_dtype,
-            device,
-        )
-        _validate_tensor(
-            local_lse_workspace,
-            "local_lse_workspace",
-            lse_shape,
-            torch.float32,
-            device,
-        )
-        _validate_tensor(phase_barrier, "phase_barrier", (2,), torch.int32, device)
-        if not local_o_workspace.is_contiguous() or not local_lse_workspace.is_contiguous():
-            raise ValueError("two-phase local workspaces must be contiguous")
-        if not phase_barrier.is_contiguous():
-            raise ValueError("phase_barrier must be contiguous")
-        if not is_fake_mode():
-            if out.data_ptr() == local_o_workspace.data_ptr():
-                raise ValueError("out and local_o_workspace must not alias")
-            if lse.data_ptr() == local_lse_workspace.data_ptr():
-                raise ValueError("lse and local_lse_workspace must not alias")
-    elif any(t is not None for t in two_phase_tensors):
-        raise ValueError("two-phase tensors require two_phase_forward=True")
-
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             lse.fill_(float("-inf"))
-        if two_phase_forward:
-            local_o_workspace.zero_()
-            local_lse_workspace.fill_(float("-inf"))
         return out, lse
 
     if is_fp8:
@@ -667,7 +581,6 @@ def _flash_attn_fwd(
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
-        and not two_phase_forward
         and not requested_disable_2cta
         and not causal
         and not local
@@ -710,61 +623,6 @@ def _flash_attn_fwd(
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
-
-    if two_phase_forward:
-        if arch // 10 != 10:
-            raise NotImplementedError("two_phase_forward requires SM100 (compute capability 10.x)")
-        if not use_block_sparsity:
-            raise NotImplementedError("two_phase_forward requires block_sparse_tensors")
-        if is_varlen:
-            raise NotImplementedError("two_phase_forward does not support varlen inputs")
-        if num_splits != 1 or is_split_kv:
-            raise NotImplementedError("two_phase_forward requires num_splits=1")
-        if causal or local:
-            raise NotImplementedError(
-                "two_phase_forward requires non-causal, non-windowed block-sparse masking"
-            )
-        if page_table is not None or qv is not None:
-            raise NotImplementedError("two_phase_forward does not support paged KV or qv")
-        if learnable_sink is not None:
-            raise NotImplementedError("two_phase_forward does not support learnable_sink")
-        if requested_use_clc_scheduler:
-            raise NotImplementedError("two_phase_forward does not support the CLC scheduler")
-        if use_dedicated_hd256_kernel:
-            raise NotImplementedError("two_phase_forward does not support the dedicated hd256 kernel")
-        head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-        head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
-        if head_dim_padded == 192 and head_dim_v_padded >= 64:
-            raise NotImplementedError(
-                "two_phase_forward does not support SM100 configurations that overlap sO/sQ"
-            )
-        expected_kv_blocks = (seqlen_k + tile_n - 1) // tile_n
-        _validate_tensor(kv_is_local, "kv_is_local", (expected_kv_blocks,), torch.int32, device)
-        if not kv_is_local.is_contiguous():
-            raise ValueError("kv_is_local must be contiguous")
-        kv_block_signal = block_sparse_tensors.kv_block_signal
-        if kv_block_signal is None:
-            raise NotImplementedError(
-                "two_phase_forward requires block_sparse_tensors.kv_block_signal"
-            )
-        valid_signal_shapes = {
-            (expected_kv_blocks,),
-            (num_head_kv, expected_kv_blocks),
-        }
-        if tuple(kv_block_signal.shape) not in valid_signal_shapes:
-            raise ValueError(
-                "kv_block_signal must have shape "
-                f"({expected_kv_blocks},) or ({num_head_kv}, {expected_kv_blocks})"
-            )
-        if (
-            kv_block_signal.dtype != torch.int32
-            or kv_block_signal.device != device
-            or kv_block_signal.stride(-1) != 1
-        ):
-            raise ValueError(
-                "kv_block_signal must be CUDA int32 on the input device and "
-                "contiguous in its last dimension"
-            )
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -894,11 +752,6 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
-        two_phase_forward,
-        kv_is_local is not None,
-        local_o_workspace is not None,
-        local_lse_workspace is not None,
-        phase_barrier is not None,
         fa_logging.get_fa_log_level(),
     )
 
@@ -970,24 +823,6 @@ def _flash_attn_fwd(
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
         p_tensor = to_cute_tensor(p) if p is not None else None
         row_max_tensor = to_cute_tensor(row_max) if row_max is not None else None
-        kv_is_local_tensor = (
-            to_cute_tensor(kv_is_local, assumed_align=4, leading_dim=0)
-            if kv_is_local is not None
-            else None
-        )
-        local_o_workspace_tensor = (
-            to_cute_tensor(local_o_workspace) if local_o_workspace is not None else None
-        )
-        local_lse_workspace_tensor = (
-            to_cute_tensor(local_lse_workspace, assumed_align=4)
-            if local_lse_workspace is not None
-            else None
-        )
-        phase_barrier_tensor = (
-            to_cute_tensor(phase_barrier, assumed_align=4, leading_dim=0)
-            if phase_barrier is not None
-            else None
-        )
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1109,7 +944,6 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
-                    two_phase_forward=two_phase_forward,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1181,17 +1015,10 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
-            compile_args.append(sparse_tensors)
-            if arch // 10 in [10, 11]:
-                compile_args.extend(
-                    [
-                        kv_is_local_tensor,
-                        local_o_workspace_tensor,
-                        local_lse_workspace_tensor,
-                        phase_barrier_tensor,
-                    ]
-                )
-            compile_args.append(AuxData(cute_aux_tensors, aux_scalars))
+            compile_args.extend([
+                sparse_tensors,
+                AuxData(cute_aux_tensors, aux_scalars),
+            ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1252,7 +1079,7 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
-            call_args.append(
+            call_args.extend([
                 (
                     normalized_block_sparse_tensors.mask_block_cnt,
                     normalized_block_sparse_tensors.mask_block_idx,
@@ -1267,13 +1094,9 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.prof_buf,
                 )
                 if normalized_block_sparse_tensors is not None
-                else None
-            )
-            if arch // 10 in [10, 11]:
-                call_args.extend(
-                    [kv_is_local, local_o_workspace, local_lse_workspace, phase_barrier]
-                )
-            call_args.append(AuxData(aux_tensors, aux_scalars))
+                else None,
+                AuxData(aux_tensors, aux_scalars),
+            ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
