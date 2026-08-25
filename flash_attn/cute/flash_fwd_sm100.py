@@ -87,7 +87,9 @@ _PROF_PHASE_END = 2
 def _prof_mark(prof_buf, num_warps, max_events, event_no, phase):
     """Record one warp-granular profiler event for the calling (block, warp)."""
     if cute.arch.lane_idx() == 0:
-        bidx, _, _ = cute.arch.block_idx()
+        block_x, block_y, block_z = cute.arch.block_idx()
+        grid_x, grid_y, _ = cute.arch.grid_dim()
+        bidx = block_x + grid_x * (block_y + grid_y * block_z)
         warp = cute.arch.warp_idx()
         region = (Int64(bidx) * Int64(num_warps) + Int64(warp)) * Int64(
             1 + max_events * _PROF_EVENT_WORDS
@@ -133,10 +135,13 @@ _PROF_EVT_CORRECTION = 3
 _PROF_EVT_EPILOGUE = 4
 _PROF_EVT_KV_LOAD = 5
 _PROF_EVT_KV_WAIT = 6
-#: per-(block, warp) event capacity; the host Profiler must use the same value.
-#: Large so the busy load warp (one event per KV-block load, across all its tiles)
-#: never overflows/drops; buffer size scales with num_blocks*num_warps*max_events.
-_PROF_MAX_EVENTS = 128 * 1024
+_PROF_EVT_LOCAL_WORK = 7
+_PROF_EVT_REMOTE_WORK = 8
+#: Per-(CTA, warp) event capacity; the host Profiler must use the same value.
+#: Buffer size scales with the full physical grid. Non-persistent semantic
+#: SplitKV records one work per CTA, so 1024 covers its load/wait events while
+#: keeping the 4096-CTA trace allocation bounded.
+_PROF_MAX_EVENTS = 1024
 
 from quack import copy_utils, layout_utils
 
@@ -169,6 +174,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerProtocol,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
+    SemanticSplitSingleTileScheduler,
     GroupedPersistentTileScheduler,
     MBlockGroupBatchTileScheduler,
     SingleTileLPTScheduler,
@@ -231,6 +237,7 @@ class FlashAttentionForwardSm100:
         is_causal: bool = False,
         is_local: bool = False,
         is_split_kv: bool = False,
+        is_two_phase: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int | None = None,
         m_block_size: int = 128,
@@ -288,6 +295,8 @@ class FlashAttentionForwardSm100:
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        self.is_two_phase = is_two_phase
+        assert not self.is_two_phase or self.is_split_kv
         self.pack_gqa = pack_gqa
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
@@ -319,7 +328,10 @@ class FlashAttentionForwardSm100:
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+            (
+                self.head_dim_v_padded >= 128
+                and self.is_split_kv
+            )
         )
         if self.overlap_sO_sQ:
             self.is_persistent = False
@@ -359,7 +371,10 @@ class FlashAttentionForwardSm100:
         # m_block before moving on). Only permutes the coarse axes, so it is
         # pack-GQA compatible. Off by default (set FA_TILE_MBLOCK_OUTER=1).
         self.mblock_outer_sched = os.environ.get("FA_TILE_MBLOCK_OUTER", "0") == "1"
-        if is_varlen_q:
+        if self.is_two_phase:
+            assert not self.is_persistent
+            self.TileScheduler = SemanticSplitSingleTileScheduler
+        elif is_varlen_q:
             self.TileScheduler = SingleTileVarlenScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
@@ -464,7 +479,11 @@ class FlashAttentionForwardSm100:
 
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
         smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+        smem_size_q_o = (
+            smem_size_q + smem_size_o
+            if not self.overlap_sO_sQ
+            else max(smem_size_q, smem_size_o)
+        )
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
@@ -1618,6 +1637,24 @@ class FlashAttentionForwardSm100:
                 else None
             )
             prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
+            if const_expr(prof_buf is not None and self.is_two_phase):
+                if issue_kv_for_this_warp:
+                    if split_idx == 0:
+                        _prof_mark(
+                            prof_buf,
+                            prof_nw,
+                            _PROF_MAX_EVENTS,
+                            _PROF_EVT_LOCAL_WORK,
+                            _PROF_PHASE_INSTANT,
+                        )
+                    else:
+                        _prof_mark(
+                            prof_buf,
+                            prof_nw,
+                            _PROF_MAX_EVENTS,
+                            _PROF_EVT_REMOTE_WORK,
+                            _PROF_PHASE_INSTANT,
+                        )
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,

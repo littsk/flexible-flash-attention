@@ -329,6 +329,8 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    out_partial_workspace: Optional[torch.Tensor] = None,
+    lse_partial_workspace: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -576,8 +578,45 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        expected_out_partial_shape = (
+            num_splits,
+            *q_batch_seqlen_shape,
+            num_head,
+            head_dim_v,
+        )
+        expected_lse_partial_shape = (num_splits, *lse_shape)
+        if out_partial_workspace is None:
+            out_partial = torch.empty(
+                expected_out_partial_shape,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            _validate_tensor(
+                out_partial_workspace,
+                "out_partial_workspace",
+                expected_out_partial_shape,
+                torch.float32,
+                device,
+            )
+            out_partial = out_partial_workspace
+        if lse_partial_workspace is None:
+            lse_partial = torch.empty(
+                expected_lse_partial_shape,
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            _validate_tensor(
+                lse_partial_workspace,
+                "lse_partial_workspace",
+                expected_lse_partial_shape,
+                torch.float32,
+                device,
+            )
+            lse_partial = lse_partial_workspace
+    elif out_partial_workspace is not None or lse_partial_workspace is not None:
+        raise ValueError("partial workspaces require num_splits > 1")
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -652,6 +691,23 @@ def _flash_attn_fwd(
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
         )
+    is_two_phase = (
+        normalized_block_sparse_tensors is not None
+        and normalized_block_sparse_tensors.two_phase_counter is not None
+    )
+    if is_two_phase:
+        if arch // 10 != 10:
+            raise NotImplementedError(
+                "semantic local/remote SplitKV is supported only on SM100"
+            )
+        if num_splits != 2:
+            raise ValueError(
+                f"semantic local/remote SplitKV requires num_splits=2, got {num_splits}"
+            )
+        if is_varlen:
+            raise NotImplementedError(
+                "semantic local/remote SplitKV does not support variable lengths"
+            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -732,6 +788,9 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
         block_sparse_tensors is None or block_sparse_tensors.kv_block_trace is None,
         block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
+        block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
+        block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+        block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         tile_m,
         tile_n,
         q_stage,
@@ -927,6 +986,7 @@ def _flash_attn_fwd(
                     is_causal=causal,
                     is_local=local,
                     is_split_kv=is_split_kv,
+                    is_two_phase=is_two_phase,
                     pack_gqa=pack_gqa,
                     m_block_size=tile_m,
                     n_block_size=tile_n,
@@ -1092,6 +1152,9 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.kv_block_signal,
                     normalized_block_sparse_tensors.kv_block_trace,
                     normalized_block_sparse_tensors.prof_buf,
+                    normalized_block_sparse_tensors.local_mask_block_cnt,
+                    normalized_block_sparse_tensors.local_full_block_cnt,
+                    normalized_block_sparse_tensors.two_phase_counter,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1767,6 +1830,9 @@ def _flash_attn_bwd(
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
+            block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         )
     else:
         compile_key = (
@@ -1811,6 +1877,9 @@ def _flash_attn_bwd(
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
+            block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2042,6 +2111,9 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.kv_block_signal,
                 normalized_block_sparse_tensors.kv_block_trace,
                 normalized_block_sparse_tensors.prof_buf,
+                normalized_block_sparse_tensors.local_mask_block_cnt,
+                normalized_block_sparse_tensors.local_full_block_cnt,
+                normalized_block_sparse_tensors.two_phase_counter,
             )
             if normalized_block_sparse_tensors is not None
             else None,

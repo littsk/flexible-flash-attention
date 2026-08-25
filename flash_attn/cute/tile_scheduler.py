@@ -490,6 +490,335 @@ class StaticPersistentTileScheduler:
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
+def semantic_split_work_coordinates(
+    work_id: int,
+    *,
+    num_block: int,
+    num_head: int,
+    num_batch: int,
+) -> tuple[int, int, int, int]:
+    """Host mirror of the semantic split-major work-id decoder."""
+    if min(num_block, num_head, num_batch) <= 0:
+        raise ValueError("num_block, num_head, and num_batch must be positive")
+    region_size = num_block * num_head * num_batch
+    if not 0 <= work_id < 2 * region_size:
+        raise ValueError(
+            f"work_id must be in [0, {2 * region_size}), got {work_id}"
+        )
+    split_idx, region_idx = divmod(work_id, region_size)
+    batch_head_idx, block_idx = divmod(region_idx, num_block)
+    batch_idx, head_idx = divmod(batch_head_idx, num_head)
+    return block_idx, head_idx, batch_idx, split_idx
+
+
+class SemanticSplitSingleTileScheduler:
+    """One-CTA-per-work split-major grid used to test blockIdx ordering.
+
+    The one-dimensional physical grid is laid out as
+    ``[all local work ids][all remote work ids]``. This is an empirical
+    scheduling experiment only: CUDA does not guarantee increasing blockIdx
+    execution order.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        region_size_divmod: FastDivmodDivisor
+        total_tiles: Int32
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments,
+            *,
+            loc=None,
+            ip=None,
+        ) -> "SemanticSplitSingleTileScheduler.Params":
+            assert cute.size(args.cluster_shape_mn) == 1, (
+                "SemanticSplitSingleTileScheduler requires cluster_shape == 1"
+            )
+            region_size = args.num_block * args.num_head * args.num_batch
+            return SemanticSplitSingleTileScheduler.Params(
+                FastDivmodDivisor(args.num_block),
+                FastDivmodDivisor(args.num_head),
+                FastDivmodDivisor(region_size),
+                region_size * args.num_splits,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._is_first_block = True
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            "SemanticSplitSingleTileScheduler only supports STATIC, "
+            f"got {scheduling_mode!r}"
+        )
+        return SemanticSplitSingleTileScheduler.Params.create(
+            args,
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def create(
+        params: Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "SemanticSplitSingleTileScheduler":
+        assert clc is None
+        return SemanticSplitSingleTileScheduler(
+            params,
+            cute.arch.block_idx()[0],
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        return (params.total_tiles, Int32(1), Int32(1))
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        split_idx, region_idx = divmod(
+            self._tile_idx,
+            self.params.region_size_divmod,
+        )
+        batch_head_idx, block_idx = divmod(
+            region_idx,
+            self.params.num_block_divmod,
+        )
+        batch_idx, head_idx = divmod(
+            batch_head_idx,
+            self.params.num_head_divmod,
+        )
+        return WorkTileInfo(
+            (
+                Int32(block_idx),
+                Int32(head_idx),
+                Int32(batch_idx),
+                Int32(split_idx),
+            ),
+            self._is_first_block,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._is_first_block = False
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in (self.params, self._tile_idx):
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            (self.params, self._tile_idx),
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return SemanticSplitSingleTileScheduler(
+            *(tuple(obj_list)),
+            loc=self._loc,
+        )
+
+
+class SemanticSplitPersistentTileScheduler:
+    """Resident-CTA scheduler with a globally split-major work-id space.
+
+    Work ids ``[0, region_size)`` are all local split-0 tiles; work ids
+    ``[region_size, 2 * region_size)`` are all remote split-1 tiles.  Each
+    resident CTA walks this space with ``gridDim.x`` stride, so it exhausts its
+    statically assigned local subsequence before entering its remote subsequence.
+    No grid barrier is required: a fast CTA may enter remote work while a slower
+    resident CTA finishes its local tail, but remote work can never occupy a CTA
+    that would otherwise be needed to launch queued local work.
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        region_size_divmod: FastDivmodDivisor
+        region_size: Int32
+        total_tiles: Int32
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments,
+            *,
+            loc=None,
+            ip=None,
+        ) -> "SemanticSplitPersistentTileScheduler.Params":
+            assert cute.size(args.cluster_shape_mn) == 1, (
+                "SemanticSplitPersistentTileScheduler requires cluster_shape == 1"
+            )
+            region_size = args.num_block * args.num_head * args.num_batch
+            return SemanticSplitPersistentTileScheduler.Params(
+                FastDivmodDivisor(args.num_block),
+                FastDivmodDivisor(args.num_head),
+                FastDivmodDivisor(region_size),
+                region_size,
+                region_size * args.num_splits,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            "SemanticSplitPersistentTileScheduler only supports STATIC, "
+            f"got {scheduling_mode!r}"
+        )
+        return SemanticSplitPersistentTileScheduler.Params.create(
+            args,
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def create(
+        params: Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "SemanticSplitPersistentTileScheduler":
+        assert clc is None
+        return SemanticSplitPersistentTileScheduler(
+            params,
+            cute.arch.block_idx()[0],
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        return (
+            cutlass.min(Int32(sm_count), params.region_size),
+            Int32(1),
+            Int32(1),
+        )
+
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        split_idx, region_idx = divmod(
+            self._tile_idx,
+            self.params.region_size_divmod,
+        )
+        batch_head_idx, block_idx = divmod(
+            region_idx,
+            self.params.num_block_divmod,
+        )
+        batch_idx, head_idx = divmod(
+            batch_head_idx,
+            self.params.num_head_divmod,
+        )
+        return WorkTileInfo(
+            (
+                Int32(block_idx),
+                Int32(head_idx),
+                Int32(batch_idx),
+                Int32(split_idx),
+            ),
+            self._tile_idx < self.params.total_tiles,
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+    def producer_tail(self, *, loc=None, ip=None):
+        pass
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in (self.params, self._tile_idx):
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            (self.params, self._tile_idx),
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return SemanticSplitPersistentTileScheduler(
+            *(tuple(obj_list)),
+            loc=self._loc,
+        )
+
+
 class GroupedPersistentTileScheduler:
     """Persistent scheduler with a GQA-group-aware tile walk for distributed CP.
 

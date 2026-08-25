@@ -82,6 +82,28 @@ def get_curr_blocksparse_tensors(
     return _get_curr_blocksparse_tensors(batch_idx, head_idx, m_block, blocksparse_tensors)
 
 
+@cute.jit
+def get_curr_local_block_counts(
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+) -> Tuple[cutlass.Int32, cutlass.Int32]:
+    """Load the owned-suffix lengths used by SM100 local->remote SplitKV."""
+    if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
+        raise NotImplementedError("semantic local/remote SplitKV does not support varlen")
+    local_mask = blocksparse_tensors.local_mask_block_cnt
+    local_full = blocksparse_tensors.local_full_block_cnt
+    assert const_expr(local_mask is not None)
+    local_mask_count = local_mask[batch_idx, head_idx, m_block]
+    local_full_count = (
+        local_full[batch_idx, head_idx, m_block]
+        if const_expr(local_full is not None)
+        else Int32(0)
+    )
+    return local_mask_count, local_full_count
+
+
 # NOTE [SM100 block-sparse empty tiles: mbarrier contract]
 #
 # For block-sparse SM100 forward, a given (m_block, stage) Q tile can have zero active
@@ -562,6 +584,49 @@ def split_block_range(block_count, split_idx: Int32, num_splits: Int32):
 
 
 @cute.jit
+def local_remote_block_range(
+    block_count: Int32,
+    local_count: Int32,
+    split_idx: Int32,
+):
+    """Split an ordered sparse row into owned suffix then remote prefix."""
+    remote_end = block_count - local_count
+    block_begin = remote_end
+    block_end = block_count
+    if split_idx != 0:
+        block_begin = Int32(0)
+        block_end = remote_end
+    return block_begin, block_end
+
+
+@cute.jit
+def get_split_block_ranges(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx: Int32,
+    head_idx: Int32,
+    m_block: Int32,
+    mask_count: Int32,
+    full_count: Int32,
+    split_idx: Int32,
+    num_splits: Int32,
+):
+    if const_expr(blocksparse_tensors.two_phase_counter is not None):
+        local_mask_count, local_full_count = get_curr_local_block_counts(
+            batch_idx, head_idx, m_block, blocksparse_tensors
+        )
+        mask_begin, mask_end = local_remote_block_range(
+            mask_count, local_mask_count, split_idx
+        )
+        full_begin, full_end = local_remote_block_range(
+            full_count, local_full_count, split_idx
+        )
+    else:
+        mask_begin, mask_end = split_block_range(mask_count, split_idx, num_splits)
+        full_begin, full_end = split_block_range(full_count, split_idx, num_splits)
+    return mask_begin, mask_end, full_begin, full_end
+
+
+@cute.jit
 def load_block_list_sm100(
     block_indices: cute.Tensor,
     block_begin,
@@ -656,8 +721,16 @@ def produce_block_sparse_loads_sm100(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end, full_begin, full_end = get_split_block_ranges(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        curr_mask_block_cnt,
+        curr_full_block_cnt,
+        split_idx,
+        num_splits,
+    )
     mask_empty = mask_begin == mask_end
     full_empty = full_begin == full_end
 
@@ -744,8 +817,16 @@ def get_total_block_count(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end, full_begin, full_end = get_split_block_ranges(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        curr_mask_block_cnt,
+        curr_full_block_cnt,
+        split_idx,
+        num_splits,
+    )
     return mask_end - mask_begin + full_end - full_begin
 
 
@@ -906,8 +987,16 @@ def softmax_block_sparse_sm100(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end, full_begin, full_end = get_split_block_ranges(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        curr_mask_block_cnt,
+        curr_full_block_cnt,
+        split_idx,
+        num_splits,
+    )
     split_mask_block_cnt = mask_end - mask_begin
     split_full_block_cnt = full_end - full_begin
     total_block_cnt = split_mask_block_cnt + split_full_block_cnt
