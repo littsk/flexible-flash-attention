@@ -610,7 +610,7 @@ def get_split_block_ranges(
     split_idx: Int32,
     num_splits: Int32,
 ):
-    if const_expr(blocksparse_tensors.two_phase_counter is not None):
+    if const_expr(blocksparse_tensors.local_mask_block_cnt is not None):
         local_mask_count, local_full_count = get_curr_local_block_counts(
             batch_idx, head_idx, m_block, blocksparse_tensors
         )

@@ -508,6 +508,27 @@ def _flash_attn_fwd(
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
+    is_varlen = (
+        cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is not None
+    )
+    is_semantic_split = (
+        block_sparse_tensors is not None
+        and block_sparse_tensors.local_mask_block_cnt is not None
+    )
+    if is_semantic_split:
+        if arch // 10 != 10:
+            raise NotImplementedError(
+                "semantic local/remote SplitKV is supported only on SM100"
+            )
+        if is_varlen:
+            raise NotImplementedError(
+                "semantic local/remote SplitKV does not support variable lengths"
+            )
+        # Semantic metadata defines exactly one local and one remote partition.
+        num_splits = 2
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -572,8 +593,11 @@ def _flash_attn_fwd(
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-            num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
-        else:
+            if not is_semantic_split:
+                num_splits = num_splits_heuristic(
+                    total_mblocks, num_SMs, num_n_blocks, 128
+                )
+        elif not is_semantic_split:
             num_splits = 1
 
     is_split_kv = num_splits > 1
@@ -649,13 +673,6 @@ def _flash_attn_fwd(
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
 
-    is_varlen = (
-        cu_seqlens_q is not None
-        or cu_seqlens_k is not None
-        or seqused_q is not None
-        or seqused_k is not None
-    )
-
     # CLC regressed for varlen MHA and dense noncausal. Imbalanced varlen shapes
     # keep more K/V blocks in flight and hurt L2; dense noncausal mostly just
     # pays work-stealing overhead.
@@ -691,23 +708,6 @@ def _flash_attn_fwd(
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
         )
-    is_two_phase = (
-        normalized_block_sparse_tensors is not None
-        and normalized_block_sparse_tensors.two_phase_counter is not None
-    )
-    if is_two_phase:
-        if arch // 10 != 10:
-            raise NotImplementedError(
-                "semantic local/remote SplitKV is supported only on SM100"
-            )
-        if num_splits != 2:
-            raise ValueError(
-                f"semantic local/remote SplitKV requires num_splits=2, got {num_splits}"
-            )
-        if is_varlen:
-            raise NotImplementedError(
-                "semantic local/remote SplitKV does not support variable lengths"
-            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -790,7 +790,6 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
         block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
         block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
-        block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         tile_m,
         tile_n,
         q_stage,
@@ -986,7 +985,7 @@ def _flash_attn_fwd(
                     is_causal=causal,
                     is_local=local,
                     is_split_kv=is_split_kv,
-                    is_two_phase=is_two_phase,
+                    is_semantic_split=is_semantic_split,
                     pack_gqa=pack_gqa,
                     m_block_size=tile_m,
                     n_block_size=tile_n,
@@ -1154,7 +1153,6 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.prof_buf,
                     normalized_block_sparse_tensors.local_mask_block_cnt,
                     normalized_block_sparse_tensors.local_full_block_cnt,
-                    normalized_block_sparse_tensors.two_phase_counter,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1832,7 +1830,6 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
-            block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         )
     else:
         compile_key = (
@@ -1879,7 +1876,6 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
-            block_sparse_tensors is None or block_sparse_tensors.two_phase_counter is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2113,7 +2109,6 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.prof_buf,
                 normalized_block_sparse_tensors.local_mask_block_cnt,
                 normalized_block_sparse_tensors.local_full_block_cnt,
-                normalized_block_sparse_tensors.two_phase_counter,
             )
             if normalized_block_sparse_tensors is not None
             else None,

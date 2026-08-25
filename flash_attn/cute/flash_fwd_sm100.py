@@ -237,7 +237,7 @@ class FlashAttentionForwardSm100:
         is_causal: bool = False,
         is_local: bool = False,
         is_split_kv: bool = False,
-        is_two_phase: bool = False,
+        is_semantic_split: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int | None = None,
         m_block_size: int = 128,
@@ -295,8 +295,8 @@ class FlashAttentionForwardSm100:
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
-        self.is_two_phase = is_two_phase
-        assert not self.is_two_phase or self.is_split_kv
+        self.is_semantic_split = is_semantic_split
+        assert not self.is_semantic_split or self.is_split_kv
         self.pack_gqa = pack_gqa
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
@@ -371,7 +371,7 @@ class FlashAttentionForwardSm100:
         # m_block before moving on). Only permutes the coarse axes, so it is
         # pack-GQA compatible. Off by default (set FA_TILE_MBLOCK_OUTER=1).
         self.mblock_outer_sched = os.environ.get("FA_TILE_MBLOCK_OUTER", "0") == "1"
-        if self.is_two_phase:
+        if self.is_semantic_split:
             assert not self.is_persistent
             self.TileScheduler = SemanticSplitSingleTileScheduler
         elif is_varlen_q:
@@ -1637,7 +1637,7 @@ class FlashAttentionForwardSm100:
                 else None
             )
             prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
-            if const_expr(prof_buf is not None and self.is_two_phase):
+            if const_expr(prof_buf is not None and self.is_semantic_split):
                 if issue_kv_for_this_warp:
                     if split_idx == 0:
                         _prof_mark(

@@ -39,11 +39,9 @@ class BlockSparseTensors(NamedTuple):
     prof_buf: cute.Tensor | None = None
     # SM100 semantic local/remote SplitKV metadata. The two count tensors mirror
     # mask_block_cnt/full_block_cnt and identify the owned suffix of each sparse row.
-    # two_phase_counter is a one-element int32 mode token retained for ABI stability;
-    # it is not read or mutated by the kernel.
+    # The presence of local_mask_block_cnt enables semantic SplitKV.
     local_mask_block_cnt: cute.Tensor | None = None
     local_full_block_cnt: cute.Tensor | None = None
-    two_phase_counter: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -77,7 +75,6 @@ class BlockSparseTensorsTorch(NamedTuple):
     # Optional SM100 semantic local/remote SplitKV metadata; see BlockSparseTensors.
     local_mask_block_cnt: torch.Tensor | None = None
     local_full_block_cnt: torch.Tensor | None = None
-    two_phase_counter: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -505,19 +502,10 @@ def normalize_block_sparse_tensors(
         hint,
         mask_cnt.device,
     )
-    if tensors.two_phase_counter is not None:
-        if tensors.two_phase_counter.device != mask_cnt.device:
-            raise ValueError("two_phase_counter must be on the block-mask device")
-        if tensors.two_phase_counter.dtype != torch.int32:
-            raise TypeError(
-                f"two_phase_counter must use torch.int32, got {tensors.two_phase_counter.dtype}"
-            )
-        if tensors.two_phase_counter.numel() != 1 or not tensors.two_phase_counter.is_contiguous():
-            raise ValueError("two_phase_counter must be a contiguous one-element tensor")
-        if local_mask_block_cnt is None:
-            raise ValueError("two_phase_counter requires local_mask_block_cnt")
-        if full_cnt is not None and local_full_block_cnt is None:
-            raise ValueError("two_phase_counter requires local_full_block_cnt when full blocks exist")
+    if local_mask_block_cnt is not None and full_cnt is not None and local_full_block_cnt is None:
+        raise ValueError(
+            "semantic local/remote SplitKV requires local_full_block_cnt when full blocks exist"
+        )
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -540,7 +528,6 @@ def normalize_block_sparse_tensors(
         prof_buf=tensors.prof_buf,
         local_mask_block_cnt=local_mask_block_cnt,
         local_full_block_cnt=local_full_block_cnt,
-        two_phase_counter=tensors.two_phase_counter,
     )
 
 
@@ -755,17 +742,6 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.local_mask_block_cnt, tensors.local_full_block_cnt)
     ]
-    two_phase_counter_tensor = (
-        to_cute_tensor(
-            tensors.two_phase_counter,
-            assumed_align=4,
-            leading_dim=0,
-            enable_tvm_ffi=enable_tvm_ffi,
-        )
-        if tensors.two_phase_counter is not None
-        else None
-    )
-
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
@@ -780,7 +756,6 @@ def to_cute_block_sparse_tensors(
         prof_buf_tensor,
         local_mask_block_cnt_tensor,
         local_full_block_cnt_tensor,
-        two_phase_counter_tensor,
     )
 
 
