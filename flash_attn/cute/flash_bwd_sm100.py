@@ -32,7 +32,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
-    LocalLastBwdScheduler,
+    ThreePhaseBwdSingleTileScheduler,
 )
 
 from flash_attn.cute import barrier
@@ -730,9 +730,18 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
         # TileScheduler = SingleTileScheduler
-        _ll_shift = getattr(self, "local_last_shift", None)  # distributed-CP local-last bwd
-        if const_expr(_ll_shift is not None):
-            TileScheduler = LocalLastBwdScheduler
+        bwd_kv_order = (
+            blocksparse_tensors.bwd_kv_order
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        bwd_work_map = (
+            blocksparse_tensors.bwd_work_map
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        if const_expr(bwd_kv_order is not None):
+            TileScheduler = ThreePhaseBwdSingleTileScheduler
         elif const_expr(self.is_varlen_k):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
@@ -766,7 +775,9 @@ class FlashAttentionBackwardSm100:
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
             head_swizzle=self.deterministic,
-            owned_shift_ll=_ll_shift if _ll_shift is not None else -1,
+            use_cluster_idx=self.cta_group_size > 1,
+            bwd_kv_order=bwd_kv_order,
+            bwd_work_map=bwd_work_map,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)

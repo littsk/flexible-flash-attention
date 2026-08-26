@@ -42,6 +42,9 @@ class BlockSparseTensors(NamedTuple):
     # The presence of local_mask_block_cnt enables semantic SplitKV.
     local_mask_block_cnt: cute.Tensor | None = None
     local_full_block_cnt: cute.Tensor | None = None
+    # Backward physical work-id -> global KV-block permutation.
+    bwd_kv_order: cute.Tensor | None = None
+    bwd_work_map: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -75,6 +78,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     # Optional SM100 semantic local/remote SplitKV metadata; see BlockSparseTensors.
     local_mask_block_cnt: torch.Tensor | None = None
     local_full_block_cnt: torch.Tensor | None = None
+    bwd_kv_order: torch.Tensor | None = None
+    bwd_work_map: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -506,6 +511,36 @@ def normalize_block_sparse_tensors(
         raise ValueError(
             "semantic local/remote SplitKV requires local_full_block_cnt when full blocks exist"
         )
+    bwd_kv_order = tensors.bwd_kv_order
+    if bwd_kv_order is not None:
+        if bwd_kv_order.device != mask_cnt.device:
+            raise ValueError("bwd_kv_order must be on the block-mask device")
+        if bwd_kv_order.dtype != torch.int32:
+            raise TypeError(
+                f"bwd_kv_order must use torch.int32, got {bwd_kv_order.dtype}"
+            )
+        if bwd_kv_order.dim() != 1 or not bwd_kv_order.is_contiguous():
+            raise ValueError("bwd_kv_order must be a contiguous 1D tensor")
+        if bwd_kv_order.numel() != expected_count_shape[-1]:
+            raise ValueError(
+                f"bwd_kv_order has {bwd_kv_order.numel()} entries, "
+                f"expected {expected_count_shape[-1]}"
+            )
+    bwd_work_map = tensors.bwd_work_map
+    if bwd_work_map is not None:
+        if bwd_kv_order is None:
+            raise ValueError("bwd_work_map requires bwd_kv_order")
+        if (
+            bwd_work_map.device != mask_cnt.device
+            or bwd_work_map.dtype != torch.int32
+        ):
+            raise TypeError("bwd_work_map must be int32 on the block-mask device")
+        if (
+            bwd_work_map.dim() != 2
+            or bwd_work_map.shape[1] != 3
+            or not bwd_work_map.is_contiguous()
+        ):
+            raise ValueError("bwd_work_map must be a contiguous [work, 3] tensor")
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -528,6 +563,8 @@ def normalize_block_sparse_tensors(
         prof_buf=tensors.prof_buf,
         local_mask_block_cnt=local_mask_block_cnt,
         local_full_block_cnt=local_full_block_cnt,
+        bwd_kv_order=bwd_kv_order,
+        bwd_work_map=bwd_work_map,
     )
 
 
@@ -563,6 +600,8 @@ def get_block_sparse_broadcast_pattern(
         tensors.dq_write_order_full,
         tensors.local_mask_block_cnt,
         tensors.local_full_block_cnt,
+        tensors.bwd_kv_order,
+        tensors.bwd_work_map,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -742,6 +781,26 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.local_mask_block_cnt, tensors.local_full_block_cnt)
     ]
+    bwd_kv_order_tensor = (
+        to_cute_tensor(
+            tensors.bwd_kv_order,
+            assumed_align=4,
+            leading_dim=0,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.bwd_kv_order is not None
+        else None
+    )
+    bwd_work_map_tensor = (
+        to_cute_tensor(
+            tensors.bwd_work_map,
+            assumed_align=4,
+            leading_dim=1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.bwd_work_map is not None
+        else None
+    )
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
@@ -756,6 +815,8 @@ def to_cute_block_sparse_tensors(
         prof_buf_tensor,
         local_mask_block_cnt_tensor,
         local_full_block_cnt_tensor,
+        bwd_kv_order_tensor,
+        bwd_work_map_tensor,
     )
 
 

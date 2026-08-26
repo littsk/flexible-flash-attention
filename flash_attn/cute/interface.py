@@ -790,6 +790,8 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
         block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
         block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+        block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
+        block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1153,6 +1155,8 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.prof_buf,
                     normalized_block_sparse_tensors.local_mask_block_cnt,
                     normalized_block_sparse_tensors.local_full_block_cnt,
+                    normalized_block_sparse_tensors.bwd_kv_order,
+                    normalized_block_sparse_tensors.bwd_work_map,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1362,7 +1366,6 @@ def _flash_attn_bwd(
     dv_accum_external: Optional[torch.Tensor] = None,
     gqa_local_done_counter: Optional[torch.Tensor] = None,
     skip_dkv_postprocess: bool = False,
-    bwd_local_last_shift: Optional[int] = None,
     bwd_dkv_owned: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -1824,12 +1827,13 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
-            bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
         )
     else:
         compile_key = (
@@ -1870,12 +1874,13 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
-            bwd_local_last_shift,  # LocalLastBwdScheduler (None=default) + baked shift value
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2014,9 +2019,6 @@ def _flash_attn_bwd(
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
         fa_bwd_obj.gqa_nblk = num_n_blocks if gqa_local_done_counter is not None else None
-        # Distributed-CP local-last backward: cyclic-rotation shift = owned_start + owned_cnt.
-        # When set, the bwd uses LocalLastBwdScheduler (head-inner, block-outer, owned-last).
-        fa_bwd_obj.local_last_shift = bwd_local_last_shift
         # local-last reduce-scatter: redirect this rank's OWN kv-blocks' dK/dV to a scratch tail
         # of mdK/mdV (owned_lo, owned_cnt in n_block units; main_nblk = main region block count),
         # and skip their done-signal -> owner reduces only the W-1 remote partials (race-free).
@@ -2109,6 +2111,8 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.prof_buf,
                 normalized_block_sparse_tensors.local_mask_block_cnt,
                 normalized_block_sparse_tensors.local_full_block_cnt,
+                normalized_block_sparse_tensors.bwd_kv_order,
+                normalized_block_sparse_tensors.bwd_work_map,
             )
             if normalized_block_sparse_tensors is not None
             else None,
