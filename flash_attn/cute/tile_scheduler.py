@@ -167,7 +167,7 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
-    # Optional physical backward work-id -> global KV-block permutation.
+    # Optional physical backward work-id -> compact KV-slot permutation.
     bwd_kv_order: Optional[cute.Tensor] = None
     bwd_work_map: Optional[cute.Tensor] = None
 
@@ -333,7 +333,7 @@ class ThreePhaseBwdSingleTileScheduler:
 
     The native physical grid remains ``(KV work, q_head, batch)``. Only x is
     mapped through the prepared local-front -> remote -> local-back permutation
-    to obtain the global KV block. CUDA does not guarantee increasing blockIdx
+    to obtain the compact KV slot. CUDA does not guarantee increasing blockIdx
     execution order; signals remain the correctness mechanism.
     """
 

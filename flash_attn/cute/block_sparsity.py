@@ -42,7 +42,7 @@ class BlockSparseTensors(NamedTuple):
     # The presence of local_mask_block_cnt enables semantic SplitKV.
     local_mask_block_cnt: cute.Tensor | None = None
     local_full_block_cnt: cute.Tensor | None = None
-    # Backward physical work-id -> global KV-block permutation.
+    # Backward physical work-id -> compact KV-slot permutation.
     bwd_kv_order: cute.Tensor | None = None
     bwd_work_map: cute.Tensor | None = None
 
