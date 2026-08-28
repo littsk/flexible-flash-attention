@@ -3276,9 +3276,21 @@ class FlashAttentionForwardSm100:
                     sig_view = cute.make_tensor(
                         kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
                     )
-                ready = cute_dist.ld_bypass(sig_view)[0]
+                ready = cute.arch.load(
+                    sig_view.iterator,
+                    Int32,
+                    sem="acquire",
+                    scope="sys",
+                    level1_eviction_priority="evict_no_allocate",
+                )
                 while ready == 0:
-                    ready = cute_dist.ld_bypass(sig_view)[0]
+                    ready = cute.arch.load(
+                        sig_view.iterator,
+                        Int32,
+                        sem="acquire",
+                        scope="sys",
+                        level1_eviction_priority="evict_no_allocate",
+                    )
                 # [.,1] signal-ready: producer's push for this block is now visible.
                 if const_expr(kv_trace is not None):
                     _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)
