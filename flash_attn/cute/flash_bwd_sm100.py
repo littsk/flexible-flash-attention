@@ -4181,6 +4181,7 @@ class FlashAttentionBackwardSm100:
                 _do_signal = _do_signal and _is_remote
             if _do_signal:
                 with cute.arch.elect_one():
+                    fence_proxy_async_global()
                     # Flat 1D counter, explicit index -> avoids the multi-dim cute index
                     # convention. release-ordered system-scope add: .release orders this
                     # rank's dK/dV writes before the count is visible to the owner's
@@ -4189,7 +4190,16 @@ class FlashAttentionBackwardSm100:
                     # main region block count (mdKV has an extra owned-scratch tail when local-last)
                     num_n_block = (
                         self.dkv_main_nblk if const_expr(_ll_lo is not None)
-                        else cute.ceil_div(cute.size(mdKV.shape[0]), self.tile_n)
+                        else (
+                            self.dkv_done_nblk
+                            if const_expr(
+                                getattr(self, "dkv_done_nblk", None)
+                                is not None
+                            )
+                            else cute.ceil_div(
+                                cute.size(mdKV.shape[0]), self.tile_n
+                            )
+                        )
                     )
                     flat = (batch_idx * num_head_kv + head_idx_kv) * num_n_block + n_block
                     mc_base = getattr(self, "dkv_done_mc_ptr", None)

@@ -1708,13 +1708,26 @@ def _flash_attn_bwd(
         if not dKV_postprocess:
             raise ValueError("gqa_local_done_counter requires a GQA dK/dV postprocess path")
         expected_local_done = batch_size * num_head_kv * num_n_blocks
-        _validate_tensor(
-            gqa_local_done_counter,
-            "gqa_local_done_counter",
-            (expected_local_done,),
-            torch.int32,
-            device,
-        )
+        if gqa_local_done_counter.ndim == 1:
+            _validate_tensor(
+                gqa_local_done_counter,
+                "gqa_local_done_counter",
+                (expected_local_done,),
+                torch.int32,
+                device,
+            )
+        elif (
+            batch_size != 1
+            or gqa_local_done_counter.dtype != torch.int32
+            or gqa_local_done_counter.device != device
+            or not gqa_local_done_counter.is_contiguous()
+            or gqa_local_done_counter.shape[0] != num_head_kv
+            or gqa_local_done_counter.shape[1] < num_n_blocks
+        ):
+            raise ValueError(
+                "gqa_local_done_counter must be contiguous [Hkv, capacity] "
+                "with capacity >= the local KV block count"
+            )
         if batch_size != 1:
             raise NotImplementedError("CP GQA local finalize currently requires batch_size == 1")
 
@@ -2018,7 +2031,24 @@ def _flash_attn_bwd(
         # its LOCAL counter. Baked as a constexpr on the kernel object (pointer is stable for the
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
-        fa_bwd_obj.gqa_nblk = num_n_blocks if gqa_local_done_counter is not None else None
+        fa_bwd_obj.gqa_nblk = (
+            (
+                gqa_local_done_counter.stride(0)
+                if gqa_local_done_counter.ndim == 2
+                else num_n_blocks
+            )
+            if gqa_local_done_counter is not None
+            else None
+        )
+        fa_bwd_obj.dkv_done_nblk = (
+            (
+                dKV_done.stride(0)
+                if dKV_done.ndim == 2
+                else num_n_blocks
+            )
+            if dKV_done is not None
+            else None
+        )
         # local-last reduce-scatter: redirect this rank's OWN kv-blocks' dK/dV to a scratch tail
         # of mdK/mdV (owned_lo, owned_cnt in n_block units; main_nblk = main region block count),
         # and skip their done-signal -> owner reduces only the W-1 remote partials (race-free).
