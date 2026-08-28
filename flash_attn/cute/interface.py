@@ -1781,6 +1781,19 @@ def _flash_attn_bwd(
     else:
         spt = (causal or local) and deterministic
 
+    block_sparse_layouts = (
+        tuple(
+            (
+                name,
+                None if tensor is None else (tuple(tensor.shape), tensor.stride()),
+            )
+            for name, tensor in normalized_block_sparse_tensors._asdict().items()
+            if name not in {"block_size", "spt"}
+        )
+        if normalized_block_sparse_tensors is not None
+        else None
+    )
+
     if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
@@ -1817,6 +1830,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            block_sparse_layouts,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1826,7 +1840,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
-            gqa_local_done_counter is not None,
+            num_n_blocks if gqa_local_done_counter is not None else None,
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
@@ -1860,6 +1874,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            block_sparse_layouts,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1873,7 +1888,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
-            gqa_local_done_counter is not None,
+            num_n_blocks if gqa_local_done_counter is not None else None,
             bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
