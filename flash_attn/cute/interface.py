@@ -534,7 +534,13 @@ def _flash_attn_fwd(
         causal, window_size_left, window_size_right, mask_mod
     )
 
-    requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
+    is_signal_gated = (
+        block_sparse_tensors is not None
+        and block_sparse_tensors.kv_block_signal is not None
+    )
+    requested_use_clc_scheduler = (
+        utils._get_use_clc_scheduler_default() or is_signal_gated
+    )
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -675,9 +681,10 @@ def _flash_attn_fwd(
 
     # CLC regressed for varlen MHA and dense noncausal. Imbalanced varlen shapes
     # keep more K/V blocks in flight and hurt L2; dense noncausal mostly just
-    # pays work-stealing overhead.
+    # pays work-stealing overhead. Signal-gated block-sparse work is the exception:
+    # dynamic tile admission avoids a static persistent tail while comm owns SMs.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
-    is_dense_noncausal = not is_varlen and not causal and not local
+    is_dense_noncausal = not is_varlen and not causal and not local and not is_signal_gated
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
     if use_block_sparsity:
