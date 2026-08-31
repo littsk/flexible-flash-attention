@@ -3983,23 +3983,11 @@ class FlashAttentionBackwardSm100:
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
         head_idx_kv = head_idx // self.qhead_per_kvhead
-        # Distributed-CP local-last: redirect this rank's OWN kv-blocks' dK/dV store to a scratch
-        # region [main_nblk, main_nblk+owned_cnt) of mdKV, so the owner's slots in the reduced
-        # main region [0, main_nblk) stay 0 (the owner's multimem.ld_reduce then sees only the
-        # W-1 REMOTE partials -> race-free, independent of when the owner computes its own block).
-        # The owner's own partial is recombined from the scratch region in a host post-process.
-        _ll_lo = getattr(self, "dkv_owned_lo", None)
-        if const_expr(_ll_lo is not None):
-            _is_own = (n_block >= _ll_lo) & (n_block < _ll_lo + self.dkv_owned_cnt)
-            _is_remote = (n_block < _ll_lo) | (n_block >= _ll_lo + self.dkv_owned_cnt)
-            n_block_st = n_block + (self.dkv_main_nblk - _ll_lo) * cutlass.Int32(_is_own)
-        else:
-            n_block_st = n_block
         if const_expr(not self.dKV_postprocess):
             assert not seqlen.has_cu_seqlens_k, "varlen uses non tma store path"
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
             gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n, tile_hdim), (n_block_st, 0)
+                mdKV_cur, (self.tile_n, tile_hdim), (n_block, 0)
             )  # (tile_n, hdim) - per CTA
             gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
             gdKV_epi = cute.local_tile(
@@ -4014,7 +4002,7 @@ class FlashAttentionBackwardSm100:
                     (seqlen.padded_offset_k * tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n * tile_hdim,), (n_block_st,)
+                mdKV_cur, (self.tile_n * tile_hdim,), (n_block,)
             )  # (tile_n * hdim)
             gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[
                 ((None, wg_idx),)
@@ -4175,10 +4163,6 @@ class FlashAttentionBackwardSm100:
             #    is signalled once after all R query heads' dK contributions are in.
             last_qhead_in_group = (head_idx % self.qhead_per_kvhead) == (self.qhead_per_kvhead - 1)
             _do_signal = leader_warp and wg_idx == 0 and last_qhead_in_group
-            if const_expr(_ll_lo is not None):
-                # local-last: the owner does NOT signal its OWN kv-blocks, so the counter counts
-                # only the W-1 REMOTE contributors -> the owner gates its reduce on exactly W-1.
-                _do_signal = _do_signal and _is_remote
             if _do_signal:
                 with cute.arch.elect_one():
                     fence_proxy_async_global()
@@ -4187,19 +4171,10 @@ class FlashAttentionBackwardSm100:
                     # rank's dK/dV writes before the count is visible to the owner's
                     # gating load (data-before-signal across GPUs).
                     num_head_kv = cute.size(mdKV.shape[2])
-                    # main region block count (mdKV has an extra owned-scratch tail when local-last)
                     num_n_block = (
-                        self.dkv_main_nblk if const_expr(_ll_lo is not None)
-                        else (
-                            self.dkv_done_nblk
-                            if const_expr(
-                                getattr(self, "dkv_done_nblk", None)
-                                is not None
-                            )
-                            else cute.ceil_div(
-                                cute.size(mdKV.shape[0]), self.tile_n
-                            )
-                        )
+                        self.dkv_done_nblk
+                        if const_expr(getattr(self, "dkv_done_nblk", None) is not None)
+                        else cute.ceil_div(cute.size(mdKV.shape[0]), self.tile_n)
                     )
                     flat = (batch_idx * num_head_kv + head_idx_kv) * num_n_block + n_block
                     mc_base = getattr(self, "dkv_done_mc_ptr", None)

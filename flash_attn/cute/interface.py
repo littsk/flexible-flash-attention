@@ -1366,7 +1366,6 @@ def _flash_attn_bwd(
     dv_accum_external: Optional[torch.Tensor] = None,
     gqa_local_done_counter: Optional[torch.Tensor] = None,
     skip_dkv_postprocess: bool = False,
-    bwd_dkv_owned: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1559,14 +1558,12 @@ def _flash_attn_bwd(
 
     if dk is None:
         dk = torch.empty_like(k)
-    elif bwd_dkv_owned is None:
+    else:
         _validate_tensor(dk, "dk", k.shape, out_torch_dtype, device)
-    # else: distributed-CP local-last passes dk with a [+owned_cnt-block] scratch tail; the kernel
-    # addresses it via the store-redirect, so only dtype/seqlen-extension is allowed (caller-owned).
 
     if dv is None:
         dv = torch.empty_like(v)
-    elif bwd_dkv_owned is None:
+    else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
@@ -1794,6 +1791,29 @@ def _flash_attn_bwd(
     else:
         spt = (causal or local) and deterministic
 
+    gqa_nblk = (
+        gqa_local_done_counter.stride(0)
+        if gqa_local_done_counter is not None
+        and gqa_local_done_counter.ndim == 2
+        else num_n_blocks
+    )
+    dkv_done_nblk = (
+        dKV_done.stride(0)
+        if dKV_done is not None and dKV_done.ndim == 2
+        else num_n_blocks
+    )
+    block_sparse_layouts = (
+        tuple(
+            (
+                name,
+                None if tensor is None else (tuple(tensor.shape), tensor.stride()),
+            )
+            for name, tensor in normalized_block_sparse_tensors._asdict().items()
+            if name not in {"block_size", "spt"}
+        )
+        if normalized_block_sparse_tensors is not None
+        else None
+    )
     if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
@@ -1830,6 +1850,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            block_sparse_layouts,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1840,7 +1861,8 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
-            bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
+            gqa_nblk,
+            dkv_done_nblk,
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
@@ -1873,6 +1895,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            block_sparse_layouts,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1887,7 +1910,8 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
-            bwd_dkv_owned,  # local-last owned-block store-redirect + signal-skip (baked)
+            gqa_nblk,
+            dkv_done_nblk,
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
             block_sparse_tensors is None or block_sparse_tensors.prof_buf is None,
             block_sparse_tensors is None or block_sparse_tensors.local_mask_block_cnt is None,
@@ -2032,33 +2056,11 @@ def _flash_attn_bwd(
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
         fa_bwd_obj.gqa_nblk = (
-            (
-                gqa_local_done_counter.stride(0)
-                if gqa_local_done_counter.ndim == 2
-                else num_n_blocks
-            )
-            if gqa_local_done_counter is not None
-            else None
+            gqa_nblk if gqa_local_done_counter is not None else None
         )
         fa_bwd_obj.dkv_done_nblk = (
-            (
-                dKV_done.stride(0)
-                if dKV_done.ndim == 2
-                else num_n_blocks
-            )
-            if dKV_done is not None
-            else None
+            dkv_done_nblk if dKV_done is not None else None
         )
-        # local-last reduce-scatter: redirect this rank's OWN kv-blocks' dK/dV to a scratch tail
-        # of mdK/mdV (owned_lo, owned_cnt in n_block units; main_nblk = main region block count),
-        # and skip their done-signal -> owner reduces only the W-1 remote partials (race-free).
-        if bwd_dkv_owned is not None:
-            fa_bwd_obj.dkv_owned_lo = int(bwd_dkv_owned[0])    # constexpr (constant per rank/run)
-            fa_bwd_obj.dkv_owned_cnt = int(bwd_dkv_owned[1])
-            fa_bwd_obj.dkv_main_nblk = int(bwd_dkv_owned[2])
-        else:
-            fa_bwd_obj.dkv_owned_lo = None
-
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
         if normalized_block_sparse_tensors is not None:
