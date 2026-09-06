@@ -1365,6 +1365,8 @@ def _flash_attn_bwd(
     dk_accum_external: Optional[torch.Tensor] = None,
     dv_accum_external: Optional[torch.Tensor] = None,
     gqa_local_done_counter: Optional[torch.Tensor] = None,
+    gqa_local_expected: Optional[torch.Tensor] = None,
+    gqa_finalize_work_state: Optional[torch.Tensor] = None,
     skip_dkv_postprocess: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -1727,6 +1729,27 @@ def _flash_attn_bwd(
             )
         if batch_size != 1:
             raise NotImplementedError("CP GQA local finalize currently requires batch_size == 1")
+    if (gqa_local_expected is None) != (gqa_finalize_work_state is None):
+        raise ValueError(
+            "gqa_local_expected and gqa_finalize_work_state must be provided together"
+        )
+    if gqa_local_expected is not None:
+        if gqa_local_done_counter is None:
+            raise ValueError("GQA finalizer publication requires a local done counter")
+        _validate_tensor(
+            gqa_local_expected,
+            "gqa_local_expected",
+            (expected_local_done,),
+            torch.int32,
+            device,
+        )
+        _validate_tensor(
+            gqa_finalize_work_state,
+            "gqa_finalize_work_state",
+            (4 + expected_local_done,),
+            torch.int32,
+            device,
+        )
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
@@ -1861,6 +1884,7 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
+            gqa_finalize_work_state is not None,
             gqa_nblk,
             dkv_done_nblk,
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
@@ -1910,6 +1934,7 @@ def _flash_attn_bwd(
             dKV_done is not None,  # per-kv-block done-counter changes the compiled kernel
             dkv_done_mc_ptr is not None,  # push-signal (multimem.red) vs local atomic_add
             gqa_local_done_counter is not None,
+            gqa_finalize_work_state is not None,
             gqa_nblk,
             dkv_done_nblk,
             block_sparse_tensors is None or block_sparse_tensors.kv_block_signal is None,
@@ -1943,6 +1968,16 @@ def _flash_attn_bwd(
         gqa_local_done_tensor = (
             to_cute_tensor(gqa_local_done_counter.detach(), assumed_align=4)
             if gqa_local_done_counter is not None
+            else None
+        )
+        gqa_local_expected_tensor = (
+            to_cute_tensor(gqa_local_expected.detach(), assumed_align=4)
+            if gqa_local_expected is not None
+            else None
+        )
+        gqa_finalize_state_tensor = (
+            to_cute_tensor(gqa_finalize_work_state.detach(), assumed_align=4)
+            if gqa_finalize_work_state is not None
             else None
         )
         if arch // 10 in [8, 12]:
@@ -2092,7 +2127,11 @@ def _flash_attn_bwd(
             AuxData(cute_aux_tensors, aux_scalars),
             dKV_done_tensor,  # mdKV_done (distributed CP backward reduce-scatter signal)
             *(
-                [gqa_local_done_tensor]
+                [
+                    gqa_local_done_tensor,
+                    gqa_local_expected_tensor,
+                    gqa_finalize_state_tensor,
+                ]
                 if arch // 10 in [10, 11]
                 else []
             ),
@@ -2125,7 +2164,11 @@ def _flash_attn_bwd(
             AuxData(aux_tensors, aux_scalars),
             dKV_done,  # mdKV_done (distributed CP backward reduce-scatter signal)
             *(
-                [gqa_local_done_counter]
+                [
+                    gqa_local_done_counter,
+                    gqa_local_expected,
+                    gqa_finalize_work_state,
+                ]
                 if arch // 10 in [10, 11]
                 else []
             ),
