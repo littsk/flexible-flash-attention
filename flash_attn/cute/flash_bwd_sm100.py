@@ -4147,11 +4147,14 @@ class FlashAttentionBackwardSm100:
         if const_expr(mdGQA_local_done is not None and K_or_V == "K"):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-            cute.arch.barrier(
-                barrier_id=barrier_id + wg_idx,
-                number_of_threads=128,
-            )
+                # The signal permits another CTA to read the global accumulator.
+                # A read-only wait only permits reuse of the source shared memory.
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+            # Both compute warpgroups own part of dK/dV. The single publisher
+            # must observe completion of every issuing warpgroup first.
+            self.compute_sync_barrier.arrive_and_wait()
             _do_local_done = leader_warp and wg_idx == 0
             if _do_local_done:
                 with cute.arch.elect_one():
