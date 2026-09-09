@@ -251,7 +251,7 @@ class SoftmaxSm100(Softmax):
         row_min = self.row_logit_min[0]
         row_sum = self.row_logit_sum[0]
         row_count = self.row_logit_count[0]
-        for i in cutlass.range_constexpr(cute.size(acc_S_row)):
+        for i in cutlass.range_constexpr(cute.size(acc_S_row.shape)):
             value = acc_S_row[i]
             is_valid = value != neg_inf
             row_max = value if value > row_max else row_max
