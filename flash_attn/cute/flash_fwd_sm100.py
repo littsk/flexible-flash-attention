@@ -89,11 +89,13 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         return_max_logits: bool = False,
+        return_qk_logits: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # magi / Kimi-K2 QK-Clip: when True, the softmax warps additionally
         # export a per-head ``max_logits`` (max scaled QK logit) via atomicMax.
         self.return_max_logits = return_max_logits
+        self.return_qk_logits = return_qk_logits
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -277,6 +279,9 @@ class FlashAttentionForwardSm100:
         # the tail (after ``aux_tensors``) so the positional kernel/compile arg
         # list stays AOT-compatible (append-only). ``None`` => feature off.
         mMaxLogits: Optional[cute.Tensor] = None,
+        mQKMax: Optional[cute.Tensor] = None,
+        mQKMin: Optional[cute.Tensor] = None,
+        mQKMean: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -327,6 +332,12 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        mQKMax, mQKMin, mQKMean = [
+            cute.make_tensor(tensor.iterator, cute.select(tensor.layout, mode=LSE_layout_transpose))
+            if const_expr(tensor is not None)
+            else None
+            for tensor in (mQKMax, mQKMin, mQKMean)
+        ]
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -719,6 +730,9 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             mMaxLogits,
+            mQKMax,
+            mQKMin,
+            mQKMean,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -766,6 +780,9 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         mMaxLogits: Optional[cute.Tensor] = None,
+        mQKMax: Optional[cute.Tensor] = None,
+        mQKMin: Optional[cute.Tensor] = None,
+        mQKMean: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1074,6 +1091,9 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
                 mMaxLogits=mMaxLogits,
+                mQKMax=mQKMax,
+                mQKMin=mQKMin,
+                mQKMean=mQKMean,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1570,6 +1590,9 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[LinearBlockSparseTensors] = None,
         mMaxLogits: Optional[cute.Tensor] = None,
+        mQKMax: Optional[cute.Tensor] = None,
+        mQKMin: Optional[cute.Tensor] = None,
+        mQKMean: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1674,6 +1697,7 @@ class FlashAttentionForwardSm100:
                 # rescale_threshold=0.0,
                 softmax_scale=softmax_scale,
                 return_max_logits=const_expr(mMaxLogits is not None),
+                return_qk_logits=const_expr(mQKMax is not None),
             )
             softmax.reset()
 
@@ -1865,6 +1889,45 @@ class FlashAttentionForwardSm100:
                         ml_ptr = utils.elem_pointer(mMaxLogits_i32, (head_idx,))
                         utils.atomic_max_f32(scaled_max, ml_ptr)
 
+            if const_expr(mQKMax is not None):
+                row_count = softmax.row_logit_count[0]
+                has_valid = row_count > Float32(0.0)
+                qk_max = softmax.row_logit_max[0]
+                qk_min = softmax.row_logit_min[0] if has_valid else Float32.inf
+                qk_mean = (
+                    softmax.row_logit_sum[0] / row_count
+                    if has_valid
+                    else Float32(0.0)
+                )
+                qk_tile_idx = self.q_stage * m_block + stage
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    mQKMax_cur = mQKMax[None, head_idx, batch_idx]
+                    mQKMin_cur = mQKMin[None, head_idx, batch_idx]
+                    mQKMean_cur = mQKMean[None, head_idx, batch_idx]
+                else:
+                    mQKMax_cur = cute.domain_offset(
+                        (seqlen.offset_q,), mQKMax[None, head_idx]
+                    )
+                    mQKMin_cur = cute.domain_offset(
+                        (seqlen.offset_q,), mQKMin[None, head_idx]
+                    )
+                    mQKMean_cur = cute.domain_offset(
+                        (seqlen.offset_q,), mQKMean[None, head_idx]
+                    )
+                gQKMax = cute.local_tile(
+                    mQKMax_cur, (self.m_block_size,), (qk_tile_idx,)
+                )
+                gQKMin = cute.local_tile(
+                    mQKMin_cur, (self.m_block_size,), (qk_tile_idx,)
+                )
+                gQKMean = cute.local_tile(
+                    mQKMean_cur, (self.m_block_size,), (qk_tile_idx,)
+                )
+                if tidx < seqlen.seqlen_q - qk_tile_idx * self.m_block_size:
+                    gQKMax[tidx] = qk_max
+                    gQKMin[tidx] = qk_min
+                    gQKMean[tidx] = qk_mean
+
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1946,7 +2009,9 @@ class FlashAttentionForwardSm100:
         # ``tSrS_t2r`` is post-softcap, post-mask (masked == -inf), and
         # pre-softmax_scale -- exactly the qk-logits domain. Kept separate from
         # the (lazy, bf16) ``row_max`` for exactness; see ``row_logit_max``.
-        if const_expr(softmax.return_max_logits):
+        if const_expr(softmax.return_qk_logits):
+            softmax.accumulate_qk_logit_stats(tSrS_t2r.load())
+        elif const_expr(softmax.return_max_logits):
             softmax.accumulate_max_logit(tSrS_t2r.load())
 
         if const_expr(not is_first):

@@ -494,7 +494,10 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     max_logits: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    qk_max: Optional[torch.Tensor] = None,
+    qk_min: Optional[torch.Tensor] = None,
+    qk_mean: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, ...]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -512,6 +515,10 @@ def _flash_attn_fwd(
             KV (max over all query rows, ``* softmax_scale``) via atomicMax, and
             this function returns ``(out, lse, max_logits)``. SM100 only; not
             supported with SplitKV (``num_splits > 1``) or ``pack_gqa``.
+        qk_max/qk_min/qk_mean: Optional pre-allocated float32 tensors with the
+            same shape as ``lse``. When all three are provided, the SM100 kernel
+            writes per-query-row raw QK max/min/mean over unmasked KV positions,
+            before ``softmax_scale``, and appends them to the return tuple.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -740,6 +747,36 @@ def _flash_attn_fwd(
         assert max_logits.device == device, "max_logits tensor must be on the input device"
         assert max_logits.is_cuda, "max_logits tensor must be on CUDA device"
 
+    qk_tensors = (qk_max, qk_min, qk_mean)
+    return_qk_logits = any(tensor is not None for tensor in qk_tensors)
+    if return_qk_logits:
+        if not all(tensor is not None for tensor in qk_tensors):
+            raise ValueError(
+                "qk_max, qk_min, and qk_mean must be provided together"
+            )
+        if compute_capability != 10:
+            raise NotImplementedError(
+                "qk logits statistics are only supported on SM100 (FA4 CuTe)"
+            )
+        if is_split_kv:
+            raise NotImplementedError(
+                "qk logits statistics are not supported with SplitKV"
+            )
+        if pack_gqa:
+            raise NotImplementedError(
+                "qk logits statistics are not supported with pack_gqa"
+            )
+        assert qk_max is not None and qk_min is not None and qk_mean is not None
+        qk_tensors = (qk_max, qk_min, qk_mean)
+        for tensor, name in zip(qk_tensors, ("qk_max", "qk_min", "qk_mean")):
+            assert tensor.shape == lse_shape, (
+                f"{name} tensor shape {tuple(tensor.shape)} does not match "
+                f"expected shape {lse_shape}"
+            )
+            assert tensor.dtype == torch.float32, f"{name} tensor must be float32"
+            assert tensor.device == device, f"{name} tensor must be on the input device"
+            assert tensor.is_cuda, f"{name} tensor must be on CUDA device"
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -813,6 +850,7 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         return_max_logits,  # magi QK-Clip: distinct kernel (extra atomicMax write-out)
+        return_qk_logits,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         logger.warning(
@@ -879,6 +917,14 @@ def _flash_attn_fwd(
             if return_max_logits
             else None
         )
+        qk_max_tensor, qk_min_tensor, qk_mean_tensor = [
+            from_dlpack(tensor.detach(), assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+                leading_dim=tensor.ndim - 1
+            )
+            if tensor is not None
+            else None
+            for tensor in qk_tensors
+        ]
 
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -931,6 +977,7 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
                 return_max_logits=return_max_logits,
+                return_qk_logits=return_qk_logits,
             )
         else:
             raise ValueError(
@@ -961,8 +1008,15 @@ def _flash_attn_fwd(
             cute_block_sparse_tensors,
             cute_aux_tensors,
         ]
-        if return_max_logits:
-            compile_args.append(max_logits_tensor)
+        if return_max_logits or return_qk_logits:
+            compile_args.extend(
+                [
+                    max_logits_tensor,
+                    qk_max_tensor,
+                    qk_min_tensor,
+                    qk_mean_tensor,
+                ]
+            )
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
             options="--enable-tvm-ffi"  
@@ -991,8 +1045,8 @@ def _flash_attn_fwd(
             block_sparse_tensors,
             aux_tensors,
         ]
-        if return_max_logits:
-            exec_args.append(max_logits)
+        if return_max_logits or return_qk_logits:
+            exec_args.extend([max_logits, qk_max, qk_min, qk_mean])
         _flash_attn_fwd.compile_cache[compile_key](*exec_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1003,9 +1057,13 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
+    outputs = [out, lse]
     if return_max_logits:
-        return out, lse, max_logits
-    return out, lse
+        outputs.append(max_logits)
+    if return_qk_logits:
+        assert qk_max is not None and qk_min is not None and qk_mean is not None
+        outputs.extend([qk_max, qk_min, qk_mean])
+    return tuple(outputs)
 
 
 _flash_attn_fwd.compile_cache = {}

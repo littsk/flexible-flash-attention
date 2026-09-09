@@ -168,7 +168,11 @@ class SoftmaxSm100(Softmax):
     # ``rescale_threshold / scale_log2``. ``row_logit_max`` stays ``None``
     # (zero register cost) when the feature is off.
     return_max_logits: cutlass.Constexpr[bool] = False
+    return_qk_logits: cutlass.Constexpr[bool] = False
     row_logit_max: cute.Tensor | None = None
+    row_logit_min: cute.Tensor | None = None
+    row_logit_sum: cute.Tensor | None = None
+    row_logit_count: cute.Tensor | None = None
 
     @staticmethod
     def create(
@@ -176,13 +180,24 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         return_max_logits: cutlass.Constexpr[bool] = False,
+        return_qk_logits: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
         row_max = cute.make_fragment(num_rows, Float32)
         row_sum = cute.make_fragment(num_rows, Float32)
+        track_exact_max = return_max_logits or return_qk_logits
         row_logit_max = (
-            cute.make_fragment(num_rows, Float32) if return_max_logits else None
+            cute.make_fragment(num_rows, Float32) if track_exact_max else None
+        )
+        row_logit_min = (
+            cute.make_fragment(num_rows, Float32) if return_qk_logits else None
+        )
+        row_logit_sum = (
+            cute.make_fragment(num_rows, Float32) if return_qk_logits else None
+        )
+        row_logit_count = (
+            cute.make_fragment(num_rows, Float32) if return_qk_logits else None
         )
         return SoftmaxSm100(
             scale_log2,
@@ -193,14 +208,22 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             return_max_logits=return_max_logits,
+            return_qk_logits=return_qk_logits,
             row_logit_max=row_logit_max,
+            row_logit_min=row_logit_min,
+            row_logit_sum=row_logit_sum,
+            row_logit_count=row_logit_count,
         )
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
         self.row_sum.fill(0.0)
-        if cutlass.const_expr(self.return_max_logits):
+        if cutlass.const_expr(self.return_max_logits or self.return_qk_logits):
             self.row_logit_max.fill(-Float32.inf)
+        if cutlass.const_expr(self.return_qk_logits):
+            self.row_logit_min.fill(Float32.inf)
+            self.row_logit_sum.fill(0.0)
+            self.row_logit_count.fill(0.0)
 
     @cute.jit
     def accumulate_max_logit(self, acc_S_row: cute.TensorSSA) -> None:
@@ -218,6 +241,30 @@ class SoftmaxSm100(Softmax):
         self.row_logit_max[0] = utils.fmax_reduce(
             acc_S_row, init_val=self.row_logit_max[0], arch=self.arch
         )
+
+    @cute.jit
+    def accumulate_qk_logit_stats(self, acc_S_row: cute.TensorSSA) -> None:
+        """Fold one raw-QK tile into exact max/min/sum/count row statistics."""
+        neg_inf = -Float32.inf
+        pos_inf = Float32.inf
+        row_max = self.row_logit_max[0]
+        row_min = self.row_logit_min[0]
+        row_sum = self.row_logit_sum[0]
+        row_count = self.row_logit_count[0]
+        for i in cutlass.range_constexpr(cute.size(acc_S_row)):
+            value = acc_S_row[i]
+            is_valid = value != neg_inf
+            row_max = value if value > row_max else row_max
+            min_candidate = value if is_valid else pos_inf
+            row_min = min_candidate if min_candidate < row_min else row_min
+            row_sum = row_sum + (value if is_valid else Float32(0.0))
+            row_count = row_count + (
+                Float32(1.0) if is_valid else Float32(0.0)
+            )
+        self.row_logit_max[0] = row_max
+        self.row_logit_min[0] = row_min
+        self.row_logit_sum[0] = row_sum
+        self.row_logit_count[0] = row_count
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
