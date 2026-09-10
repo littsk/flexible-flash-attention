@@ -1665,6 +1665,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
                 kv_signal=kv_block_signal,
+                signal_head_idx=head_idx_kv,
                 kv_trace=kv_block_trace,
                 prof_buf=prof_buf,
                 prof_nw=prof_nw,
@@ -3242,14 +3243,18 @@ class FlashAttentionForwardSm100:
         prof_buf: Optional[cute.Tensor] = None,
         prof_nw: int = 0,
         head_idx: Int32 = Int32(0),
+        signal_head_idx: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
+        # Sparse traversal's head_idx addresses Q-head masks when PackGQA is
+        # disabled. Readiness always addresses the KV head of the actual K/V.
+        ready_head = signal_head_idx if const_expr(signal_head_idx is not None) else head_idx
         # Observability trace row: per-block (legacy) or per-(kv-head, block) when the
         # signal is 2D [H_kv, n_block] -- so each kv-head's wait/ready/consume is recorded
         # separately (H_kv*n_block rows) instead of all heads colliding on one block slot.
         if const_expr(kv_trace is not None):
             if const_expr(kv_signal is not None and cute.rank(kv_signal) == 2):
-                trace_row = head_idx * cute.size(kv_signal, mode=[1]) + block
+                trace_row = ready_head * cute.size(kv_signal, mode=[1]) + block
             else:
                 trace_row = block
         # Gated KV load: spin on the per-block readiness signal in GMEM before
@@ -3268,7 +3273,7 @@ class FlashAttentionForwardSm100:
                 # q-tile only waits for head h's slice -- not the whole block's all-heads
                 # transfer. 1D [n_block] keeps the legacy per-block gate (e.g. backward).
                 if const_expr(cute.rank(kv_signal) == 2):
-                    sig_base = kv_signal[head_idx, None]
+                    sig_base = kv_signal[ready_head, None]
                     sig_view = cute.make_tensor(
                         sig_base.iterator + block, cute.make_layout((1,), stride=(1,))
                     )

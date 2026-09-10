@@ -254,6 +254,15 @@ class FlashAttentionBackwardSm100:
                 self.num_regs_load = 128 - 24
                 self.num_regs_mma = self.num_regs_load
 
+        # E345: the 1CTA D128 deterministic compute path spills six scalars
+        # at 136 registers. Keep the same CTA register budget, but give the
+        # two compute warpgroups eight more registers each.
+        if self.deterministic and not self.use_2cta_instrs and self.tile_hdim == 128 and self.tile_hdimv == 128:
+            self.num_regs_reduce = 144
+            self.num_regs_compute = 144
+            self.num_regs_load = 80
+            self.num_regs_mma = 80
+
         assert (
             self.num_regs_reduce
             + self.num_regs_compute * 2
@@ -3465,6 +3474,22 @@ class FlashAttentionBackwardSm100:
                         mdGQA_local_expected,
                         mdGQA_finalize_state,
                     )
+            if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+                if not process_tile:
+                    # Empty sparse Q heads perform no add, but later heads must
+                    # not wait forever for their deterministic epilogue ticket.
+                    assert mdV_semaphore is not None and mdK_semaphore is not None
+                    wg_idx_empty = cute.arch.make_warp_uniform(tidx // 128)
+                    head_kv_empty = head_idx // self.qhead_per_kvhead
+                    v_sem = mdV_semaphore[n_block, None, head_kv_empty, batch_idx]
+                    k_sem = mdK_semaphore[n_block, None, head_kv_empty, batch_idx]
+                    barrier.wait_eq(v_sem.iterator, dp_idx, wg_idx_empty,
+                                    head_idx % self.qhead_per_kvhead)
+                    barrier.arrive_inc(v_sem.iterator, dp_idx, wg_idx_empty, 1)
+                    barrier.wait_eq(k_sem.iterator, dp_idx, wg_idx_empty,
+                                    head_idx % self.qhead_per_kvhead)
+                    barrier.arrive_inc(k_sem.iterator, dp_idx, wg_idx_empty, 1)
+
             # Zero dK/dV for empty tiles (local attention or block sparsity)
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
             if const_expr(not self.dKV_postprocess):
