@@ -3148,11 +3148,18 @@ class FlashAttentionBackwardSm100:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                mask_mod=self.mask_mod,
+                mask_mod=(self.mask_mod._paired_sparse_source_mask
+                          if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                          else self.mask_mod),
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_data=aux_data,
+                aux_data=(AuxData(aux_data.tensors[:-1], aux_data.scalars)
+                          if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                          else aux_data),
                 fastdiv_mods=fastdiv_mods,
+                paired_original_bits=(aux_data.tensors[-1]
+                          if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                          else None),
             )
 
             # prefetch_LSE = not self.is_causal
