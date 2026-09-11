@@ -393,6 +393,10 @@ class ThreePhaseBwdSingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         work_idx = self._blk_coord[0]
         block_idx = self.params.bwd_work_map[work_idx, 0]
+        if const_expr(self.params.use_cluster_idx):
+            # The prepared work map contains one even physical K base per
+            # cluster. Its second CTA handles the adjacent physical K row.
+            block_idx += cute.arch.block_in_cluster_idx()[0]
         head_idx = self.params.bwd_work_map[work_idx, 1]
         batch_idx = self.params.bwd_work_map[work_idx, 2]
         return WorkTileInfo(

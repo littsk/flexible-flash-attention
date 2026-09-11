@@ -792,6 +792,7 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
         block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
         block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1157,6 +1158,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.local_full_block_cnt,
                     normalized_block_sparse_tensors.bwd_kv_order,
                     normalized_block_sparse_tensors.bwd_work_map,
+                normalized_block_sparse_tensors.bwd_original_active,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1368,6 +1370,7 @@ def _flash_attn_bwd(
     gqa_local_expected: Optional[torch.Tensor] = None,
     gqa_finalize_work_state: Optional[torch.Tensor] = None,
     skip_dkv_postprocess: bool = False,
+    paired_sparse_bwd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1447,10 +1450,25 @@ def _flash_attn_bwd(
         requested_disable_2cta = utils._get_disable_2cta_default()
         disable_2cta = (
             requested_disable_2cta
-            or block_sparse_tensors is not None
+            or (block_sparse_tensors is not None and not paired_sparse_bwd)
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
+
+    if paired_sparse_bwd:
+        assert arch // 10 in (10, 11) and use_2cta_instrs
+        assert deterministic and head_dim == head_dim_v == 128
+        assert cu_seqlens_q is None and cu_seqlens_k is None
+        assert k.shape[1] % 128 == 0 and q.shape[1] % 256 == 0
+        assert block_sparse_tensors is not None
+        assert block_sparse_tensors.block_size == (256, 128)
+        assert block_sparse_tensors.bwd_work_map is not None
+        # Original active flags preserve arrivals for paired and odd-K work.
+        assert dkv_done_counter is None and dkv_done_mc_ptr is None
+        if gqa_local_done_counter is not None:
+            assert block_sparse_tensors.bwd_original_active is not None
+            assert q.shape[0] == 1 and q.shape[2] > k.shape[2]
+            assert dk_accum_external is not None and dv_accum_external is not None
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
@@ -1630,6 +1648,11 @@ def _flash_attn_bwd(
                 seqlen_k_rounded * head_dim_v_rounded,
             )
             if dk_accum_external is not None or dv_accum_external is not None:
+                if paired_sparse_bwd:
+                    # The extra physical CTA must not change the runtime's logical
+                    # head stride. Its dKV writes are suppressed in the epilogue.
+                    dk_accum_shape = (batch_size, num_head_kv, num_n_blocks*n_block_size*head_dim_rounded)
+                    dv_accum_shape = (batch_size, num_head_kv, num_n_blocks*n_block_size*head_dim_v_rounded)
                 if dk_accum_external is None or dv_accum_external is None:
                     raise ValueError(
                         "dk_accum_external and dv_accum_external must be provided together"
@@ -1785,7 +1808,7 @@ def _flash_attn_bwd(
             batch_size=batch_size,
             num_head=num_head,
             seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
+            seqlen_k=seqlen_k_rounded if paired_sparse_bwd else seqlen_k,
             block_size=(m_block_size, n_block_size),
             subtile_factor=subtile_factor,
         )
@@ -1893,6 +1916,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
         )
     else:
         compile_key = (
@@ -1943,6 +1967,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+            block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2188,6 +2213,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.local_full_block_cnt,
                 normalized_block_sparse_tensors.bwd_kv_order,
                 normalized_block_sparse_tensors.bwd_work_map,
+                normalized_block_sparse_tensors.bwd_original_active,
             )
             if normalized_block_sparse_tensors is not None
             else None,

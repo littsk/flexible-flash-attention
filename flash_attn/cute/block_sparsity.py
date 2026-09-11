@@ -45,6 +45,8 @@ class BlockSparseTensors(NamedTuple):
     # Backward physical work-id -> compact KV-slot permutation.
     bwd_kv_order: cute.Tensor | None = None
     bwd_work_map: cute.Tensor | None = None
+    # Original per-Q-head active flag, before paired CSR union.
+    bwd_original_active: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -80,6 +82,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     local_full_block_cnt: torch.Tensor | None = None
     bwd_kv_order: torch.Tensor | None = None
     bwd_work_map: torch.Tensor | None = None
+    # Original per-Q-head active flag, before paired CSR union.
+    bwd_original_active: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -565,6 +569,10 @@ def normalize_block_sparse_tensors(
         local_full_block_cnt=local_full_block_cnt,
         bwd_kv_order=bwd_kv_order,
         bwd_work_map=bwd_work_map,
+        bwd_original_active=_check_and_expand_metadata_tensor(
+            "bwd_original_active", tensors.bwd_original_active,
+            tuple(mask_cnt.shape), context, hint, mask_cnt.device,
+        ),
     )
 
 
@@ -602,6 +610,7 @@ def get_block_sparse_broadcast_pattern(
         tensors.local_full_block_cnt,
         tensors.bwd_kv_order,
         tensors.bwd_work_map,
+        tensors.bwd_original_active,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -801,6 +810,11 @@ def to_cute_block_sparse_tensors(
         if tensors.bwd_work_map is not None
         else None
     )
+    bwd_original_active_tensor = (
+        to_cute_tensor(tensors.bwd_original_active, assumed_align=4,
+                       leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
+        if tensors.bwd_original_active is not None else None
+    )
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
@@ -817,6 +831,7 @@ def to_cute_block_sparse_tensors(
         local_full_block_cnt_tensor,
         bwd_kv_order_tensor,
         bwd_work_map_tensor,
+        bwd_original_active_tensor,
     )
 
 
