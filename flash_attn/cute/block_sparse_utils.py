@@ -14,6 +14,7 @@ import cutlass.utils.distributed as cute_dist
 from cutlass import Float32, Int32, const_expr
 
 from quack import copy_utils
+from flash_attn.cute import barrier
 
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -256,6 +257,8 @@ def produce_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    split_idx: Int32 = Int32(0),
+    num_splits: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -287,6 +290,17 @@ def produce_block_sparse_loads(
         blocksparse_tensors,
         seqlen_info,
     )
+
+    if const_expr(num_splits > 1):
+        mb, me, fb, fe = get_split_block_ranges(
+            blocksparse_tensors, batch_idx, head_idx, m_block_sparse,
+            curr_mask_block_cnt, curr_full_block_cnt, split_idx, num_splits,
+        )
+        curr_mask_block_idx = cute.domain_offset((mb,), curr_mask_block_idx)
+        curr_mask_block_cnt = me - mb
+        if const_expr(curr_full_block_idx is not None):
+            curr_full_block_idx = cute.domain_offset((fb,), curr_full_block_idx)
+        curr_full_block_cnt = fe - fb
 
     mask_empty = curr_mask_block_cnt == 0
     full_empty = curr_full_block_cnt == 0
@@ -407,6 +421,8 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    split_idx: Int32 = Int32(0),
+    num_splits: cutlass.Constexpr[int] = 1,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -431,6 +447,17 @@ def consume_block_sparse_loads(
         blocksparse_tensors,
         seqlen_info,
     )
+
+    if const_expr(num_splits > 1):
+        mb, me, fb, fe = get_split_block_ranges(
+            blocksparse_tensors, batch_idx, head_idx, m_block_sparse,
+            curr_mask_block_cnt, curr_full_block_cnt, split_idx, num_splits,
+        )
+        curr_mask_block_idx = cute.domain_offset((mb,), curr_mask_block_idx)
+        curr_mask_block_cnt = me - mb
+        if const_expr(curr_full_block_idx is not None):
+            curr_full_block_idx = cute.domain_offset((fb,), curr_full_block_idx)
+        curr_full_block_cnt = fe - fb
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
 
@@ -1353,6 +1380,10 @@ def _load_q_do_block_sm90(
     else:
         pipeline_Q.producer_acquire(producer_state_Q)
     load_Q(m_block, producer_state=producer_state_Q)
+    if load_kv:
+        # Match the dense SM90 path: PDL may start us before preprocess has
+        # written LSE/dPsum and cleared dQ accumulators. TMA must wait first.
+        cute.arch.griddepcontrol_wait()
     load_LSE(m_block, producer_state=producer_state_Q)
 
     producer_state_dO_cur = (
@@ -1574,21 +1605,32 @@ def consume_block_sparse_mma_bwd_sm90(
 
 
 @cute.jit
-def _store_one_dQaccum_sm90(
+def _store_one_dQaccum_early_release_sm90(
     m_block,
+    previous_m_block,
     sdQaccum: cute.Tensor,
     gdQaccum: cute.Tensor,
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    semaphore: cute.Tensor,
+    lock_value: Int32,
 ):
-    """Store dQaccum for a single m_block."""
+    # Source reuse only requires TMA read completion. Signal each empty
+    # buffer before waiting for prior global accumulation completion.
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
         )
+    if previous_m_block >= 0:
+        cute.arch.cp_async_bulk_wait_group(0, read=False)
+        barrier.arrive_inc(semaphore[(previous_m_block, None)].iterator,
+                           cute.arch.thread_idx()[0] % 32, 0, 1)
+    # The global dQ write order and semaphore release semantics stay exact.
+    barrier.wait_eq(semaphore[(m_block, None)].iterator,
+                    cute.arch.thread_idx()[0] % 32, 0, lock_value)
     for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
@@ -1604,6 +1646,48 @@ def _store_one_dQaccum_sm90(
 
 
 @cute.jit
+def _store_one_dQaccum_sm90(
+    m_block,
+    sdQaccum: cute.Tensor,
+    gdQaccum: cute.Tensor,
+    num_dQ_warp_groups: cutlass.Constexpr,
+    num_threads_per_warp_group: cutlass.Constexpr,
+    tma_copy_bytes_dQ,
+    semaphore: Optional[cute.Tensor] = None,
+    lock_value: Int32 = 0,
+):
+    """Store dQaccum for a single m_block."""
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+    if const_expr(semaphore is not None):
+        barrier.wait_eq(semaphore[(m_block, None)].iterator,
+                        cute.arch.thread_idx()[0] % 32, 0, lock_value)
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+        with cute.arch.elect_one():
+            copy_utils.cpasync_reduce_bulk_add_f32(
+                sdQaccum[None, warp_group_idx].iterator,
+                gdQaccum[(None, warp_group_idx), m_block].iterator,
+                tma_copy_bytes_dQ,
+            )
+        cute.arch.cp_async_bulk_commit_group()
+
+
+    if const_expr(semaphore is not None):
+        # The next KV tile may add only after both WGMMA groups reached memory.
+        cute.arch.cp_async_bulk_wait_group(0, read=False)
+        barrier.arrive_inc(semaphore[(m_block, None)].iterator,
+                           cute.arch.thread_idx()[0] % 32, 0, 1)
+
+
+@cute.jit
 def dQaccum_store_block_sparse_bwd_sm90(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -1616,6 +1700,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
+    semaphore: Optional[cute.Tensor] = None,
 ):
     """SM90 backward block sparse dQaccum store with separate partial/full loops.
 
@@ -1632,20 +1717,40 @@ def dQaccum_store_block_sparse_bwd_sm90(
         curr_full_cnt = Int32(0)
         curr_full_idx = None
 
+    previous_m_block = Int32(-1)
+
     for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
         sparse_idx = iter_idx // subtile_factor
         subtile_offset = iter_idx % subtile_factor
         m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
 
         if m_block < m_block_max:
-            _store_one_dQaccum_sm90(
-                m_block,
-                sdQaccum,
-                gdQaccum,
-                num_dQ_warp_groups,
-                num_threads_per_warp_group,
-                tma_copy_bytes_dQ,
-            )
+            lock_value = Int32(0)
+            if const_expr(semaphore is not None):
+                assert blocksparse_tensors.dq_write_order is not None
+                lock_value = blocksparse_tensors.dq_write_order[batch_idx, head_idx, n_block, sparse_idx]
+            if const_expr(semaphore is not None):
+                _store_one_dQaccum_early_release_sm90(
+                    m_block,
+                    previous_m_block,
+                    sdQaccum,
+                    gdQaccum,
+                    num_dQ_warp_groups,
+                    num_threads_per_warp_group,
+                    tma_copy_bytes_dQ,
+                    semaphore, lock_value,
+                )
+                previous_m_block = m_block
+            else:
+                _store_one_dQaccum_sm90(
+                    m_block,
+                    sdQaccum,
+                    gdQaccum,
+                    num_dQ_warp_groups,
+                    num_threads_per_warp_group,
+                    tma_copy_bytes_dQ,
+                    semaphore, lock_value,
+                )
 
     if const_expr(full_cnt is not None):
         for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
@@ -1654,11 +1759,37 @@ def dQaccum_store_block_sparse_bwd_sm90(
             m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
 
             if m_block < m_block_max:
-                _store_one_dQaccum_sm90(
-                    m_block,
-                    sdQaccum,
-                    gdQaccum,
-                    num_dQ_warp_groups,
-                    num_threads_per_warp_group,
-                    tma_copy_bytes_dQ,
-                )
+                lock_value = Int32(0)
+                if const_expr(semaphore is not None):
+                    assert blocksparse_tensors.dq_write_order_full is not None
+                    lock_value = blocksparse_tensors.dq_write_order_full[batch_idx, head_idx, n_block, sparse_idx]
+                if const_expr(semaphore is not None):
+                    _store_one_dQaccum_early_release_sm90(
+                        m_block,
+                        previous_m_block,
+                        sdQaccum,
+                        gdQaccum,
+                        num_dQ_warp_groups,
+                        num_threads_per_warp_group,
+                        tma_copy_bytes_dQ,
+                        semaphore, lock_value,
+                    )
+                    previous_m_block = m_block
+                else:
+                    _store_one_dQaccum_sm90(
+                        m_block,
+                        sdQaccum,
+                        gdQaccum,
+                        num_dQ_warp_groups,
+                        num_threads_per_warp_group,
+                        tma_copy_bytes_dQ,
+                        semaphore, lock_value,
+                    )
+
+    if const_expr(semaphore is not None):
+        # Drain the last pending write before leaving this KV work tile;
+        # no speculative empty-barrier arrivals leak to the next tile.
+        if previous_m_block >= 0:
+            cute.arch.cp_async_bulk_wait_group(0, read=False)
+            barrier.arrive_inc(semaphore[(previous_m_block, None)].iterator,
+                               cute.arch.thread_idx()[0] % 32, 0, 1)

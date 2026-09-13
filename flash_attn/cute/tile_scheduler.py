@@ -170,6 +170,7 @@ class TileSchedulerArguments(ParamsBase):
     # Optional physical backward work-id -> compact KV-slot permutation.
     bwd_kv_order: Optional[cute.Tensor] = None
     bwd_work_map: Optional[cute.Tensor] = None
+    fwd_work_order: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:
@@ -575,6 +576,7 @@ class SemanticSplitSingleTileScheduler:
         num_head_divmod: FastDivmodDivisor
         region_size_divmod: FastDivmodDivisor
         total_tiles: Int32
+        fwd_work_order: Optional[cute.Tensor]
 
         @staticmethod
         def create(
@@ -587,11 +589,13 @@ class SemanticSplitSingleTileScheduler:
                 "SemanticSplitSingleTileScheduler requires cluster_shape == 1"
             )
             region_size = args.num_block * args.num_head * args.num_batch
+            # Work-order length is checked against concrete shapes in the host interface.
             return SemanticSplitSingleTileScheduler.Params(
                 FastDivmodDivisor(args.num_block),
                 FastDivmodDivisor(args.num_head),
                 FastDivmodDivisor(region_size),
                 region_size * 2,
+                args.fwd_work_order,
             )
 
     def __init__(
@@ -652,8 +656,11 @@ class SemanticSplitSingleTileScheduler:
         return (params.total_tiles, Int32(1), Int32(1))
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        work_idx = self._tile_idx
+        if const_expr(self.params.fwd_work_order is not None):
+            work_idx = self.params.fwd_work_order[work_idx]
         split_idx, region_idx = divmod(
-            self._tile_idx,
+            work_idx,
             self.params.region_size_divmod,
         )
         batch_head_idx, block_idx = divmod(

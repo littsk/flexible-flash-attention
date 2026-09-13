@@ -58,6 +58,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    validate_fwd_work_order_size,
 )
 
 def _parse_arch_str(arch_str):
@@ -519,9 +520,9 @@ def _flash_attn_fwd(
         and block_sparse_tensors.local_mask_block_cnt is not None
     )
     if is_semantic_split:
-        if arch // 10 != 10:
+        if arch // 10 not in [9, 10]:
             raise NotImplementedError(
-                "semantic local/remote SplitKV is supported only on SM100"
+                "semantic local/remote SplitKV is supported on SM90 and SM100"
             )
         if is_varlen:
             raise NotImplementedError(
@@ -708,6 +709,20 @@ def _flash_attn_fwd(
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
         )
+        if normalized_block_sparse_tensors.fwd_work_order is not None:
+            from flash_attn.cute.semantic_work_order import lower_semantic_work_order
+            normalized_block_sparse_tensors = lower_semantic_work_order(
+                normalized_block_sparse_tensors, batch_size=batch_size,
+                num_head=num_head, seqlen_q=seqlen_q,
+                native_block_m=q_stage * tile_m,
+                packed_heads=qhead_per_kvhead if pack_gqa else 1,
+            )
+            validate_fwd_work_order_size(
+                normalized_block_sparse_tensors, batch_size=batch_size,
+                num_head=num_head, seqlen_q=seqlen_q,
+                m_block_size=q_stage * tile_m,
+                qhead_per_kvhead_packgqa=qhead_per_kvhead if pack_gqa else 1,
+            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -793,6 +808,7 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
         block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
+            block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         tile_m,
         tile_n,
         q_stage,
@@ -906,7 +922,8 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
-            assert not is_split_kv, "SplitKV not supported on SM 9.0"
+            if is_split_kv and (not use_block_sparsity or is_varlen):
+                raise NotImplementedError("SM90 SplitKV currently requires fixed-length block-sparse inputs")
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
                 head_dim,
@@ -928,6 +945,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                num_splits=num_splits,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1159,6 +1177,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.bwd_kv_order,
                     normalized_block_sparse_tensors.bwd_work_map,
                 normalized_block_sparse_tensors.bwd_original_active,
+                normalized_block_sparse_tensors.fwd_work_order,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1917,6 +1936,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
+            block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
     else:
         compile_key = (
@@ -1968,6 +1988,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_original_active is None,
+            block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2114,6 +2135,7 @@ def _flash_attn_bwd(
         # the bwd epilogue broadcasts the per-block signal via multimem.red so the owner polls
         # its LOCAL counter. Baked as a constexpr on the kernel object (pointer is stable for the
         # whole run); compile_key carries the flag so a pull/atomic build is not reused.
+        fa_bwd_obj.spt_override = spt
         fa_bwd_obj.dkv_done_mc_ptr = dkv_done_mc_ptr
         fa_bwd_obj.gqa_nblk = (
             gqa_nblk if gqa_local_done_counter is not None else None
@@ -2157,7 +2179,7 @@ def _flash_attn_bwd(
                     gqa_local_expected_tensor,
                     gqa_finalize_state_tensor,
                 ]
-                if arch // 10 in [10, 11]
+                if arch // 10 in [9, 10, 11]
                 else []
             ),
             sparse_tensors_compile,
@@ -2194,7 +2216,7 @@ def _flash_attn_bwd(
                     gqa_local_expected,
                     gqa_finalize_work_state,
                 ]
-                if arch // 10 in [10, 11]
+                if arch // 10 in [9, 10, 11]
                 else []
             ),
             (
@@ -2214,6 +2236,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.bwd_kv_order,
                 normalized_block_sparse_tensors.bwd_work_map,
                 normalized_block_sparse_tensors.bwd_original_active,
+                normalized_block_sparse_tensors.fwd_work_order,
             )
             if normalized_block_sparse_tensors is not None
             else None,

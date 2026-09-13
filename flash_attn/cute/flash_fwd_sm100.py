@@ -782,6 +782,12 @@ class FlashAttentionForwardSm100:
 
         TileScheduler = self.TileScheduler
         _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
+        fwd_work_order = (
+            blocksparse_tensors.fwd_work_order
+            if const_expr(blocksparse_tensors is not None) else None
+        )
+        if const_expr(fwd_work_order is not None):
+            assert self.is_semantic_split
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
             cute.size(mQ.shape[2]),
@@ -808,6 +814,7 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
+            fwd_work_order=fwd_work_order,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode

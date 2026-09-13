@@ -47,6 +47,9 @@ class BlockSparseTensors(NamedTuple):
     bwd_work_map: cute.Tensor | None = None
     # Original per-Q-head active flag, before paired CSR union.
     bwd_original_active: cute.Tensor | None = None
+    # Physical semantic-split FWD work id -> original work id.
+    # Reorders CTA issuance without reordering Q/K/V or backward work.
+    fwd_work_order: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -84,6 +87,9 @@ class BlockSparseTensorsTorch(NamedTuple):
     bwd_work_map: torch.Tensor | None = None
     # Original per-Q-head active flag, before paired CSR union.
     bwd_original_active: torch.Tensor | None = None
+    # Physical semantic-split FWD work id -> original work id.
+    # Reorders CTA issuance without reordering Q/K/V or backward work.
+    fwd_work_order: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -545,6 +551,16 @@ def normalize_block_sparse_tensors(
             or not bwd_work_map.is_contiguous()
         ):
             raise ValueError("bwd_work_map must be a contiguous [work, 3] tensor")
+    fwd_work_order = tensors.fwd_work_order
+    if fwd_work_order is not None:
+        if local_mask_block_cnt is None:
+            raise ValueError("fwd_work_order requires semantic local/remote SplitKV")
+        if fwd_work_order.device != mask_cnt.device or fwd_work_order.dtype != torch.int32:
+            raise TypeError("fwd_work_order must be int32 on the block-mask device")
+        if fwd_work_order.dim() != 1 or not fwd_work_order.is_contiguous():
+            raise ValueError("fwd_work_order must be a contiguous 1D tensor")
+        # The planner checks permutation contents outside capture/timing. Actual
+        # grid length is checked when constructing the semantic scheduler.
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -569,6 +585,7 @@ def normalize_block_sparse_tensors(
         local_full_block_cnt=local_full_block_cnt,
         bwd_kv_order=bwd_kv_order,
         bwd_work_map=bwd_work_map,
+        fwd_work_order=fwd_work_order,
         bwd_original_active=_check_and_expand_metadata_tensor(
             "bwd_original_active", tensors.bwd_original_active,
             tuple(mask_cnt.shape), context, hint, mask_cnt.device,
@@ -578,6 +595,20 @@ def normalize_block_sparse_tensors(
 
 def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
+
+
+def validate_fwd_work_order_size(tensors, *, batch_size, num_head, seqlen_q,
+                                 m_block_size, qhead_per_kvhead_packgqa=1):
+    """Host-only length check before converting shapes to dynamic CuTe values."""
+    order = tensors.fwd_work_order
+    if order is None:
+        return
+    group = qhead_per_kvhead_packgqa
+    if min(batch_size, num_head, seqlen_q, m_block_size, group) <= 0 or num_head % group:
+        raise ValueError("Invalid semantic forward work-grid dimensions")
+    expected = 2 * batch_size * (num_head // group) * ceildiv(seqlen_q * group, m_block_size)
+    if order.numel() != expected:
+        raise ValueError(f"fwd_work_order has {order.numel()} elements; expected {expected}")
 
 
 def get_block_sparse_broadcast_pattern(
@@ -815,6 +846,11 @@ def to_cute_block_sparse_tensors(
                        leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
         if tensors.bwd_original_active is not None else None
     )
+    fwd_work_order_tensor = (
+        to_cute_tensor(tensors.fwd_work_order, assumed_align=4,
+                       leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
+        if tensors.fwd_work_order is not None else None
+    )
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
@@ -832,6 +868,7 @@ def to_cute_block_sparse_tensors(
         bwd_kv_order_tensor,
         bwd_work_map_tensor,
         bwd_original_active_tensor,
+        fwd_work_order_tensor,
     )
 
 
