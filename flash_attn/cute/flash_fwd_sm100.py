@@ -3277,9 +3277,10 @@ class FlashAttentionForwardSm100:
                     sig_view = cute.make_tensor(
                         kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
                     )
-                ready = ld_acquire(sig_view.iterator)
+                # Compact transport may publish from a different GPU.
+                ready = ld_acquire(sig_view.iterator, scope="sys")
                 while ready == 0:
-                    ready = ld_acquire(sig_view.iterator)
+                    ready = ld_acquire(sig_view.iterator, scope="sys")
                 # [.,1] signal-ready: producer's push for this block is now visible.
                 if const_expr(kv_trace is not None):
                     _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)

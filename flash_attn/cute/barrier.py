@@ -6,12 +6,15 @@ from cutlass._mlir.dialects import llvm
 
 
 @dsl_user_op
-def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
+def ld_acquire(
+    lock_ptr: cute.Pointer, *, scope: str = "gpu", loc=None, ip=None
+) -> cutlass.Int32:
+    assert scope in ("gpu", "sys")
     lock_ptr_i64 = lock_ptr.toint(loc=loc, ip=ip).ir_value()
     state = llvm.inline_asm(
         T.i32(),
         [lock_ptr_i64],
-        "ld.global.acquire.gpu.b32 $0, [$1];",
+        f"ld.global.acquire.{scope}.b32 $0, [$1];",
         "=r,l",
         has_side_effects=True,
         is_align_stack=False,
