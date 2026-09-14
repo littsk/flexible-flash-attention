@@ -45,6 +45,8 @@ class BlockSparseTensors(NamedTuple):
     # Backward physical work-id -> compact KV-slot permutation.
     bwd_kv_order: cute.Tensor | None = None
     bwd_work_map: cute.Tensor | None = None
+    # Physical CTA id -> logical semantic SplitKV work id (caller-owned permutation).
+    fwd_work_order: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -80,6 +82,7 @@ class BlockSparseTensorsTorch(NamedTuple):
     local_full_block_cnt: torch.Tensor | None = None
     bwd_kv_order: torch.Tensor | None = None
     bwd_work_map: torch.Tensor | None = None
+    fwd_work_order: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -541,6 +544,14 @@ def normalize_block_sparse_tensors(
             or not bwd_work_map.is_contiguous()
         ):
             raise ValueError("bwd_work_map must be a contiguous [work, 3] tensor")
+    fwd_work_order = tensors.fwd_work_order
+    if fwd_work_order is not None:
+        if local_mask_block_cnt is None:
+            raise ValueError("fwd_work_order requires semantic SplitKV")
+        if fwd_work_order.device != mask_cnt.device or fwd_work_order.dtype != torch.int32:
+            raise TypeError("fwd_work_order must be int32 on the block-mask device")
+        if fwd_work_order.dim() != 1 or not fwd_work_order.is_contiguous():
+            raise ValueError("fwd_work_order must be a contiguous 1D permutation")
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -565,6 +576,7 @@ def normalize_block_sparse_tensors(
         local_full_block_cnt=local_full_block_cnt,
         bwd_kv_order=bwd_kv_order,
         bwd_work_map=bwd_work_map,
+        fwd_work_order=fwd_work_order,
     )
 
 
@@ -602,6 +614,7 @@ def get_block_sparse_broadcast_pattern(
         tensors.local_full_block_cnt,
         tensors.bwd_kv_order,
         tensors.bwd_work_map,
+        tensors.fwd_work_order,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -817,6 +830,10 @@ def to_cute_block_sparse_tensors(
         local_full_block_cnt_tensor,
         bwd_kv_order_tensor,
         bwd_work_map_tensor,
+        to_cute_tensor(
+            tensors.fwd_work_order, assumed_align=4, leading_dim=0,
+            enable_tvm_ffi=enable_tvm_ffi,
+        ) if tensors.fwd_work_order is not None else None,
     )
 
 

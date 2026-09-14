@@ -690,6 +690,17 @@ def _flash_attn_fwd(
                 "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
             )
 
+    if block_sparse_tensors is not None and block_sparse_tensors.fwd_work_order is not None:
+        if not is_semantic_split:
+            raise ValueError("fwd_work_order requires SM100 semantic SplitKV")
+        packed_ratio = qhead_per_kvhead if pack_gqa else 1
+        work_count = (
+            2 * batch_size * (num_head // packed_ratio)
+            * math.ceil(seqlen_q * packed_ratio / (tile_m * q_stage))
+        )
+        if block_sparse_tensors.fwd_work_order.numel() != work_count:
+            raise ValueError(f"fwd_work_order must contain {work_count} logical work ids")
+
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -792,6 +803,7 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
         block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
         block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+        block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1157,6 +1169,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.local_full_block_cnt,
                     normalized_block_sparse_tensors.bwd_kv_order,
                     normalized_block_sparse_tensors.bwd_work_map,
+                    normalized_block_sparse_tensors.fwd_work_order,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1893,6 +1906,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+            block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
     else:
         compile_key = (
@@ -1943,6 +1957,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.local_full_block_cnt is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_kv_order is None,
             block_sparse_tensors is None or block_sparse_tensors.bwd_work_map is None,
+            block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2188,6 +2203,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.local_full_block_cnt,
                 normalized_block_sparse_tensors.bwd_kv_order,
                 normalized_block_sparse_tensors.bwd_work_map,
+                normalized_block_sparse_tensors.fwd_work_order,
             )
             if normalized_block_sparse_tensors is not None
             else None,

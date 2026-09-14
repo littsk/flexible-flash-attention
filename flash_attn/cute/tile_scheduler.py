@@ -170,6 +170,7 @@ class TileSchedulerArguments(ParamsBase):
     # Optional physical backward work-id -> compact KV-slot permutation.
     bwd_kv_order: Optional[cute.Tensor] = None
     bwd_work_map: Optional[cute.Tensor] = None
+    fwd_work_order: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:
@@ -563,6 +564,7 @@ class SemanticSplitSingleTileScheduler:
     ``[all local work ids][all remote work ids]``. This is an empirical
     local-first optimization: CUDA does not guarantee increasing blockIdx
     execution order, while remote-work signal gating preserves correctness.
+    An optional permutation remaps physical CTAs without changing logical output IDs.
     """
 
     @dataclass
@@ -571,6 +573,7 @@ class SemanticSplitSingleTileScheduler:
         num_head_divmod: FastDivmodDivisor
         region_size_divmod: FastDivmodDivisor
         total_tiles: Int32
+        work_order: Optional[cute.Tensor] = None
 
         @staticmethod
         def create(
@@ -588,6 +591,7 @@ class SemanticSplitSingleTileScheduler:
                 FastDivmodDivisor(args.num_head),
                 FastDivmodDivisor(region_size),
                 region_size * 2,
+                args.fwd_work_order,
             )
 
     def __init__(
@@ -648,8 +652,11 @@ class SemanticSplitSingleTileScheduler:
         return (params.total_tiles, Int32(1), Int32(1))
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        work_id = self._tile_idx
+        if const_expr(self.params.work_order is not None):
+            work_id = self.params.work_order[work_id]
         split_idx, region_idx = divmod(
-            self._tile_idx,
+            work_id,
             self.params.region_size_divmod,
         )
         batch_head_idx, block_idx = divmod(
