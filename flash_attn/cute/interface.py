@@ -528,8 +528,8 @@ def _flash_attn_fwd(
             raise NotImplementedError(
                 "semantic local/remote SplitKV does not support variable lengths"
             )
-        # Semantic metadata defines exactly one local and one remote partition.
-        num_splits = 2
+        # Semantic metadata defines local/remote or local/intra/inter partitions.
+        num_splits = 3 if block_sparse_tensors.intra_mask_block_cnt is not None else 2
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -1178,6 +1178,8 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.bwd_work_map,
                 normalized_block_sparse_tensors.bwd_original_active,
                 normalized_block_sparse_tensors.fwd_work_order,
+                normalized_block_sparse_tensors.intra_mask_block_cnt,
+                normalized_block_sparse_tensors.intra_full_block_cnt,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -2237,6 +2239,8 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.bwd_work_map,
                 normalized_block_sparse_tensors.bwd_original_active,
                 normalized_block_sparse_tensors.fwd_work_order,
+                normalized_block_sparse_tensors.intra_mask_block_cnt,
+                normalized_block_sparse_tensors.intra_full_block_cnt,
             )
             if normalized_block_sparse_tensors is not None
             else None,

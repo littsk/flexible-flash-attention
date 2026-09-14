@@ -627,6 +627,19 @@ def local_remote_block_range(
 
 
 @cute.jit
+def local_intra_inter_block_range(block_count: Int32, local_count: Int32,
+                                  intra_count: Int32, split_idx: Int32):
+    local_begin = block_count - local_count
+    intra_begin = local_begin - intra_count
+    block_begin, block_end = local_begin, block_count
+    if split_idx == 1:
+        block_begin, block_end = intra_begin, local_begin
+    if split_idx == 2:
+        block_begin, block_end = Int32(0), intra_begin
+    return block_begin, block_end
+
+
+@cute.jit
 def get_split_block_ranges(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx: Int32,
@@ -641,12 +654,20 @@ def get_split_block_ranges(
         local_mask_count, local_full_count = get_curr_local_block_counts(
             batch_idx, head_idx, m_block, blocksparse_tensors
         )
-        mask_begin, mask_end = local_remote_block_range(
-            mask_count, local_mask_count, split_idx
-        )
-        full_begin, full_end = local_remote_block_range(
-            full_count, local_full_count, split_idx
-        )
+        if const_expr(blocksparse_tensors.intra_mask_block_cnt is not None):
+            intra_mask_count = blocksparse_tensors.intra_mask_block_cnt[batch_idx, head_idx, m_block]
+            intra_full_count = Int32(0)
+            if const_expr(blocksparse_tensors.intra_full_block_cnt is not None):
+                intra_full_count = blocksparse_tensors.intra_full_block_cnt[batch_idx, head_idx, m_block]
+            mask_begin, mask_end = local_intra_inter_block_range(
+                mask_count, local_mask_count, intra_mask_count, split_idx)
+            full_begin, full_end = local_intra_inter_block_range(
+                full_count, local_full_count, intra_full_count, split_idx)
+        else:
+            mask_begin, mask_end = local_remote_block_range(
+                mask_count, local_mask_count, split_idx)
+            full_begin, full_end = local_remote_block_range(
+                full_count, local_full_count, split_idx)
     else:
         mask_begin, mask_end = split_block_range(mask_count, split_idx, num_splits)
         full_begin, full_end = split_block_range(full_count, split_idx, num_splits)

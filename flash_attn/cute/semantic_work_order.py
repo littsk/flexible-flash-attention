@@ -16,7 +16,8 @@ def lower_semantic_work_order(mask, *, batch_size, num_head, seqlen_q,
         raise ValueError('Native Q tile must divide the logical sparse Q block')
     logical_rows = (seqlen_q * packed_heads + logical_block_m - 1) // logical_block_m
     native_rows = (seqlen_q * packed_heads + native_block_m - 1) // native_block_m
-    groups = 2 * batch_size * (num_head // packed_heads)
+    phases = 3 if mask.intra_mask_block_cnt is not None else 2
+    groups = phases * batch_size * (num_head // packed_heads)
     # Direct FA callers may already supply an explicitly native work grid.
     if order.numel() == groups * native_rows:
         return mask
