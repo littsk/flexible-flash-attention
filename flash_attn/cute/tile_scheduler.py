@@ -394,6 +394,10 @@ class ThreePhaseBwdSingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         work_idx = self._blk_coord[0]
         block_idx = self.params.bwd_work_map[work_idx, 0]
+        if const_expr(self.params.use_cluster_idx):
+            # The prepared work map contains one even physical K base per
+            # cluster. Its second CTA handles the adjacent physical K row.
+            block_idx += cute.arch.block_in_cluster_idx()[0]
         head_idx = self.params.bwd_work_map[work_idx, 1]
         batch_idx = self.params.bwd_work_map[work_idx, 2]
         return WorkTileInfo(
@@ -542,14 +546,17 @@ def semantic_split_work_coordinates(
     num_block: int,
     num_head: int,
     num_batch: int,
+    num_splits: int = 2,
 ) -> tuple[int, int, int, int]:
     """Host mirror of the semantic split-major work-id decoder."""
     if min(num_block, num_head, num_batch) <= 0:
         raise ValueError("num_block, num_head, and num_batch must be positive")
+    if num_splits not in (2, 3):
+        raise ValueError("Semantic SplitKV supports two or three phases")
     region_size = num_block * num_head * num_batch
-    if not 0 <= work_id < 2 * region_size:
+    if not 0 <= work_id < num_splits * region_size:
         raise ValueError(
-            f"work_id must be in [0, {2 * region_size}), got {work_id}"
+            f"work_id must be in [0, {num_splits * region_size}), got {work_id}"
         )
     split_idx, region_idx = divmod(work_id, region_size)
     batch_head_idx, block_idx = divmod(region_idx, num_block)
@@ -561,10 +568,9 @@ class SemanticSplitSingleTileScheduler:
     """Non-persistent one-CTA-per-work grid for semantic local/remote SplitKV.
 
     The one-dimensional physical grid is laid out as
-    ``[all local work ids][all remote work ids]``. This is an empirical
+    ``[local][remote]`` or ``[local][intra remote][inter remote]``. This is an empirical
     local-first optimization: CUDA does not guarantee increasing blockIdx
     execution order, while remote-work signal gating preserves correctness.
-    An optional permutation remaps physical CTAs without changing logical output IDs.
     """
 
     @dataclass
@@ -573,7 +579,7 @@ class SemanticSplitSingleTileScheduler:
         num_head_divmod: FastDivmodDivisor
         region_size_divmod: FastDivmodDivisor
         total_tiles: Int32
-        work_order: Optional[cute.Tensor] = None
+        fwd_work_order: Optional[cute.Tensor]
 
         @staticmethod
         def create(
@@ -586,11 +592,12 @@ class SemanticSplitSingleTileScheduler:
                 "SemanticSplitSingleTileScheduler requires cluster_shape == 1"
             )
             region_size = args.num_block * args.num_head * args.num_batch
+            # Work-order length is checked against concrete shapes in the host interface.
             return SemanticSplitSingleTileScheduler.Params(
                 FastDivmodDivisor(args.num_block),
                 FastDivmodDivisor(args.num_head),
                 FastDivmodDivisor(region_size),
-                region_size * 2,
+                region_size * args.num_splits,
                 args.fwd_work_order,
             )
 
@@ -652,11 +659,11 @@ class SemanticSplitSingleTileScheduler:
         return (params.total_tiles, Int32(1), Int32(1))
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        work_id = self._tile_idx
-        if const_expr(self.params.work_order is not None):
-            work_id = self.params.work_order[work_id]
+        work_idx = self._tile_idx
+        if const_expr(self.params.fwd_work_order is not None):
+            work_idx = self.params.fwd_work_order[work_idx]
         split_idx, region_idx = divmod(
-            work_id,
+            work_idx,
             self.params.region_size_divmod,
         )
         batch_head_idx, block_idx = divmod(

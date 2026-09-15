@@ -84,6 +84,20 @@ _PROF_PHASE_END = 2
 
 
 @cute.jit
+def _cta_lifetime_mark(trace, signal, num_warps, phase):
+    if cute.arch.lane_idx() == 0:
+        offset = cute.size(signal.shape) * 3
+        idx = offset + (cute.arch.block_idx()[0] * num_warps + cute.arch.warp_idx()) * 3
+        trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+        if const_expr(phase == 0):
+            trace[idx + 2] = Int64(_llvm.inline_asm(
+                _mlir_T.i64(), [],
+                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
+                has_side_effects=True, asm_dialect=0,
+            ))
+
+
+@cute.jit
 def _prof_mark(prof_buf, num_warps, max_events, event_no, phase):
     """Record one warp-granular profiler event for the calling (block, warp)."""
     if cute.arch.lane_idx() == 0:
@@ -783,6 +797,12 @@ class FlashAttentionForwardSm100:
 
         TileScheduler = self.TileScheduler
         _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
+        fwd_work_order = (
+            blocksparse_tensors.fwd_work_order
+            if const_expr(blocksparse_tensors is not None) else None
+        )
+        if const_expr(fwd_work_order is not None):
+            assert self.is_semantic_split
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
             cute.size(mQ.shape[2]),
@@ -809,10 +829,7 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
-            fwd_work_order=(
-                blocksparse_tensors.fwd_work_order
-                if const_expr(blocksparse_tensors is not None) else None
-            ),
+            fwd_work_order=fwd_work_order,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -1007,6 +1024,9 @@ class FlashAttentionForwardSm100:
             else None
         )
         prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
+
+        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
+            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 0)
 
         # Prefetch tma descriptor
         if warp_idx == 0:
@@ -1490,6 +1510,8 @@ class FlashAttentionForwardSm100:
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
+        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
+            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 1)
         return
 
     @cute.jit
@@ -1670,6 +1692,7 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
                 kv_signal=kv_block_signal,
+                signal_head_idx=head_idx_kv,
                 kv_trace=kv_block_trace,
                 prof_buf=prof_buf,
                 prof_nw=prof_nw,
@@ -3247,14 +3270,18 @@ class FlashAttentionForwardSm100:
         prof_buf: Optional[cute.Tensor] = None,
         prof_nw: int = 0,
         head_idx: Int32 = Int32(0),
+        signal_head_idx: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
+        # Sparse traversal's head_idx addresses Q-head masks when PackGQA is
+        # disabled. Readiness always addresses the KV head of the actual K/V.
+        ready_head = signal_head_idx if const_expr(signal_head_idx is not None) else head_idx
         # Observability trace row: per-block (legacy) or per-(kv-head, block) when the
         # signal is 2D [H_kv, n_block] -- so each kv-head's wait/ready/consume is recorded
         # separately (H_kv*n_block rows) instead of all heads colliding on one block slot.
         if const_expr(kv_trace is not None):
             if const_expr(kv_signal is not None and cute.rank(kv_signal) == 2):
-                trace_row = head_idx * cute.size(kv_signal, mode=[1]) + block
+                trace_row = ready_head * cute.size(kv_signal, mode=[1]) + block
             else:
                 trace_row = block
         # Gated KV load: spin on the per-block readiness signal in GMEM before
@@ -3273,7 +3300,7 @@ class FlashAttentionForwardSm100:
                 # q-tile only waits for head h's slice -- not the whole block's all-heads
                 # transfer. 1D [n_block] keeps the legacy per-block gate (e.g. backward).
                 if const_expr(cute.rank(kv_signal) == 2):
-                    sig_base = kv_signal[head_idx, None]
+                    sig_base = kv_signal[ready_head, None]
                     sig_view = cute.make_tensor(
                         sig_base.iterator + block, cute.make_layout((1,), stride=(1,))
                     )
