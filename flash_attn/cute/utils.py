@@ -319,16 +319,13 @@ def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    return Float32(
-        nvvm.fmax(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    # CUTLASS DSL 4.6 exposes only the binary ``cute.arch.fmax`` form.
+    # Preserve the previous optional three-input helper semantics by folding
+    # the third value through a second binary max.
+    result = cute.arch.fmax(a, b, loc=loc, ip=ip)
+    if c is not None:
+        result = cute.arch.fmax(result, c, loc=loc, ip=ip)
+    return result
 
 
 @cute.jit
