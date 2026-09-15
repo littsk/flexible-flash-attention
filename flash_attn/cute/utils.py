@@ -25,16 +25,12 @@ from .tile_size import (
 )
 
 
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
-)
+# CUTLASS DSL 4.6 accepts string literals for rounding modes and no longer
+# exports RoundingModeKind from cutlass._mlir.dialects.nvvm.
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
+sub_packed_f32x2 = partial(cute.arch.sub_packed_f32x2, rnd="rn")
 
 
 def hash_callable(func: Callable) -> str:
@@ -778,7 +774,7 @@ def ex2_emulation_2(
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
     xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
     )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
