@@ -28,7 +28,7 @@ from flash_attn_cute.named_barrier import NamedBarrierFwd, NamedBarrierBwd
 
 
 def mma_partition_fragment_AB(
-    thr_mma: cute.core.ThrMma, sA: Optional[cute.Tensor], sB: Optional[cute.Tensor], swap_AB: bool
+    thr_mma: cute.ThrMma, sA: Optional[cute.Tensor], sB: Optional[cute.Tensor], swap_AB: bool
 ):
     if const_expr(not swap_AB):
         return (

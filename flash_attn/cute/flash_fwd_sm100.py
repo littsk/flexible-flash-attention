@@ -1150,8 +1150,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def load(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1341,8 +1341,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def mma(
         self,
-        tiled_mma_qk: cute.core.ThrMma,
-        tiled_mma_pv: cute.core.ThrMma,
+        tiled_mma_qk: cute.ThrMma,
+        tiled_mma_pv: cute.ThrMma,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
@@ -1575,7 +1575,7 @@ class FlashAttentionForwardSm100:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
@@ -1943,7 +1943,7 @@ class FlashAttentionForwardSm100:
         softmax: SoftmaxSm100,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
-        thr_mma_qk: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: cute.CopyAtom,
         thr_tmem_store_scale: cute.CopyAtom,
@@ -2073,8 +2073,8 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_loop(
         self,
-        thr_mma_qk: cute.core.ThrMma,
-        thr_mma_pv: cute.core.ThrMma,
+        thr_mma_qk: cute.ThrMma,
+        thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtOs: tuple[cute.Tensor],
         sScale: cute.Tensor,
@@ -2357,7 +2357,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_rescale(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         scale: Float32,
@@ -2410,7 +2410,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def correction_epilogue(
         self,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tOtO: cute.Tensor,
         tidx: Int32,
         stage: Int32,
@@ -2436,7 +2436,7 @@ class FlashAttentionForwardSm100:
         5. Preparation for efficient TMA store operations
 
         :param thr_mma: Thread MMA operation for the computation
-        :type thr_mma: cute.core.ThrMma
+        :type thr_mma: cute.ThrMma
         :param tOtO: Tensor containing accumulated attention output
         :type tOtO: cute.Tensor
         :param scale: Final scaling factor to apply to the output
