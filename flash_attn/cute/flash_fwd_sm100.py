@@ -179,6 +179,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
+from flash_attn.cute.barrier import ld_acquire
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
@@ -3307,15 +3308,18 @@ class FlashAttentionForwardSm100:
                     sig_view = cute.make_tensor(
                         kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
                     )
-                ready = cute_dist.ld_bypass(sig_view)[0]
+                # Compact transport may publish from a different GPU.
+                ready = ld_acquire(sig_view.iterator, scope="sys")
                 while ready == 0:
-                    ready = cute_dist.ld_bypass(sig_view)[0]
+                    ready = ld_acquire(sig_view.iterator, scope="sys")
                 # [.,1] signal-ready: producer's push for this block is now visible.
                 if const_expr(kv_trace is not None):
                     _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)
                 if const_expr(prof_buf is not None):
                     _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_END)
             cute.arch.sync_warp()
+            # The ready acquire orders generic memory; K/V loads use the async proxy.
+            cute.arch.fence_proxy("async.global")
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
         extra_tx_count = (
