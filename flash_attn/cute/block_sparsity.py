@@ -23,6 +23,36 @@ class BlockSparseTensors(NamedTuple):
     cu_block_idx_offsets: cute.Tensor | None = None
     dq_write_order: cute.Tensor | None = None
     dq_write_order_full: cute.Tensor | None = None
+    # Per-kv-block readiness signal (int32, shape [num_n_blocks]). When provided,
+    # the forward load warp polls signal[n_block] in GMEM and only issues the TMA
+    # load of that K/V block once the value is non-zero. This enables overlapping
+    # remote KV delivery (e.g. context-parallel all-gather) with attention compute.
+    kv_block_signal: cute.Tensor | None = None
+    # Observability trace (int64, shape [num_n_blocks, 3]). When provided, the load
+    # warp records the GPU globaltimer (ns) at three points per kv-block:
+    # [.,0]=wait-start, [.,1]=signal-ready, [.,2]=load-issued. No-op when absent.
+    kv_block_trace: cute.Tensor | None = None
+    # Warp-granular profiler buffer (int64, flat) for mega_attention.profiler. When
+    # provided, forward warps record (block, warp)-private start/end/instant events
+    # into this buffer; layout is [num_blocks, PROF_NUM_WARPS, 1+max_events*2]. No-op
+    # when absent. See mega_attention/profiler/README.md.
+    prof_buf: cute.Tensor | None = None
+    # SM100 semantic local/remote SplitKV metadata. The two count tensors mirror
+    # mask_block_cnt/full_block_cnt and identify the owned suffix of each sparse row.
+    # The presence of local_mask_block_cnt enables semantic SplitKV.
+    local_mask_block_cnt: cute.Tensor | None = None
+    local_full_block_cnt: cute.Tensor | None = None
+    # Backward physical work-id -> compact KV-slot permutation.
+    bwd_kv_order: cute.Tensor | None = None
+    bwd_work_map: cute.Tensor | None = None
+    # Original per-Q-head active flag, before paired CSR union.
+    bwd_original_active: cute.Tensor | None = None
+    # Physical semantic-split FWD work id -> original work id.
+    # Reorders CTA issuance without reordering Q/K/V or backward work.
+    fwd_work_order: cute.Tensor | None = None
+    # Intra-remote counts, excluding local, in [inter, intra, local] CSR rows.
+    intra_mask_block_cnt: cute.Tensor | None = None
+    intra_full_block_cnt: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -47,6 +77,25 @@ class BlockSparseTensorsTorch(NamedTuple):
     dq_write_order: torch.Tensor | None = None
     dq_write_order_full: torch.Tensor | None = None
     spt: bool | None = None
+    # Per-kv-block readiness signal (int32, shape [num_n_blocks]); see BlockSparseTensors.
+    kv_block_signal: torch.Tensor | None = None
+    # Observability trace (int64, shape [num_n_blocks, 3]); see BlockSparseTensors.
+    kv_block_trace: torch.Tensor | None = None
+    # Warp-granular profiler buffer (int64, flat); see BlockSparseTensors.prof_buf.
+    prof_buf: torch.Tensor | None = None
+    # Optional SM100 semantic local/remote SplitKV metadata; see BlockSparseTensors.
+    local_mask_block_cnt: torch.Tensor | None = None
+    local_full_block_cnt: torch.Tensor | None = None
+    bwd_kv_order: torch.Tensor | None = None
+    bwd_work_map: torch.Tensor | None = None
+    # Original per-Q-head active flag, before paired CSR union.
+    bwd_original_active: torch.Tensor | None = None
+    # Physical semantic-split FWD work id -> original work id.
+    # Reorders CTA issuance without reordering Q/K/V or backward work.
+    fwd_work_order: torch.Tensor | None = None
+    # Intra-remote counts, excluding local, in [inter, intra, local] CSR rows.
+    intra_mask_block_cnt: torch.Tensor | None = None
+    intra_full_block_cnt: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -488,6 +537,84 @@ def normalize_block_sparse_tensors(
         hint,
         mask_cnt.device,
     )
+    local_mask_block_cnt = _check_and_expand_metadata_tensor(
+        "local_mask_block_cnt",
+        tensors.local_mask_block_cnt,
+        tuple(mask_cnt.shape),
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    local_full_block_cnt = _check_and_expand_metadata_tensor(
+        "local_full_block_cnt",
+        tensors.local_full_block_cnt,
+        tuple(full_cnt.shape) if full_cnt is not None else expected_count_shape,
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    if local_mask_block_cnt is not None and full_cnt is not None and local_full_block_cnt is None:
+        raise ValueError(
+            "semantic local/remote SplitKV requires local_full_block_cnt when full blocks exist"
+        )
+    intra_mask_block_cnt = _check_and_expand_metadata_tensor(
+        "intra_mask_block_cnt",
+        tensors.intra_mask_block_cnt,
+        tuple(mask_cnt.shape),
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    intra_full_block_cnt = _check_and_expand_metadata_tensor(
+        "intra_full_block_cnt",
+        tensors.intra_full_block_cnt,
+        tuple(full_cnt.shape) if full_cnt is not None else expected_count_shape,
+        context,
+        hint,
+        mask_cnt.device,
+    )
+    if intra_mask_block_cnt is not None:
+        if local_mask_block_cnt is None:
+            raise ValueError("Three-phase SplitKV requires local counts")
+        if full_cnt is not None and intra_full_block_cnt is None:
+            raise ValueError("Three-phase SplitKV requires intra full counts")
+    elif intra_full_block_cnt is not None:
+        raise ValueError("Intra full counts require intra partial counts")
+    bwd_kv_order = tensors.bwd_kv_order
+    if bwd_kv_order is not None:
+        if bwd_kv_order.device != mask_cnt.device:
+            raise ValueError("bwd_kv_order must be on the block-mask device")
+        if bwd_kv_order.dtype != torch.int32:
+            raise TypeError(f"bwd_kv_order must use torch.int32, got {bwd_kv_order.dtype}")
+        if bwd_kv_order.dim() != 1 or not bwd_kv_order.is_contiguous():
+            raise ValueError("bwd_kv_order must be a contiguous 1D tensor")
+        if bwd_kv_order.numel() != expected_count_shape[-1]:
+            raise ValueError(
+                f"bwd_kv_order has {bwd_kv_order.numel()} entries, "
+                f"expected {expected_count_shape[-1]}"
+            )
+    bwd_work_map = tensors.bwd_work_map
+    if bwd_work_map is not None:
+        if bwd_kv_order is None:
+            raise ValueError("bwd_work_map requires bwd_kv_order")
+        if bwd_work_map.device != mask_cnt.device or bwd_work_map.dtype != torch.int32:
+            raise TypeError("bwd_work_map must be int32 on the block-mask device")
+        if (
+            bwd_work_map.dim() != 2
+            or bwd_work_map.shape[1] != 3
+            or not bwd_work_map.is_contiguous()
+        ):
+            raise ValueError("bwd_work_map must be a contiguous [work, 3] tensor")
+    fwd_work_order = tensors.fwd_work_order
+    if fwd_work_order is not None:
+        if local_mask_block_cnt is None:
+            raise ValueError("fwd_work_order requires semantic local/remote SplitKV")
+        if fwd_work_order.device != mask_cnt.device or fwd_work_order.dtype != torch.int32:
+            raise TypeError("fwd_work_order must be int32 on the block-mask device")
+        if fwd_work_order.dim() != 1 or not fwd_work_order.is_contiguous():
+            raise ValueError("fwd_work_order must be a contiguous 1D tensor")
+        # The planner checks permutation contents outside capture/timing. Actual
+        # grid length is checked when constructing the semantic scheduler.
     spt = tensors.spt
     if spt is not None and not isinstance(spt, bool):
         raise ValueError("spt must be a bool when provided")
@@ -505,11 +632,45 @@ def normalize_block_sparse_tensors(
         dq_write_order=dq_write_order,
         dq_write_order_full=dq_write_order_full,
         spt=spt,
+        kv_block_signal=tensors.kv_block_signal,
+        kv_block_trace=tensors.kv_block_trace,
+        prof_buf=tensors.prof_buf,
+        local_mask_block_cnt=local_mask_block_cnt,
+        local_full_block_cnt=local_full_block_cnt,
+        bwd_kv_order=bwd_kv_order,
+        bwd_work_map=bwd_work_map,
+        fwd_work_order=fwd_work_order,
+        intra_mask_block_cnt=intra_mask_block_cnt,
+        intra_full_block_cnt=intra_full_block_cnt,
+        bwd_original_active=_check_and_expand_metadata_tensor(
+            "bwd_original_active",
+            tensors.bwd_original_active,
+            tuple(mask_cnt.shape),
+            context,
+            hint,
+            mask_cnt.device,
+        ),
     )
 
 
 def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
+
+
+def validate_fwd_work_order_size(
+    tensors, *, batch_size, num_head, seqlen_q, m_block_size, qhead_per_kvhead_packgqa=1
+):
+    """Host-only length check before converting shapes to dynamic CuTe values."""
+    order = tensors.fwd_work_order
+    if order is None:
+        return
+    group = qhead_per_kvhead_packgqa
+    if min(batch_size, num_head, seqlen_q, m_block_size, group) <= 0 or num_head % group:
+        raise ValueError("Invalid semantic forward work-grid dimensions")
+    phases = 3 if tensors.intra_mask_block_cnt is not None else 2
+    expected = phases * batch_size * (num_head // group) * ceildiv(seqlen_q * group, m_block_size)
+    if order.numel() != expected:
+        raise ValueError(f"fwd_work_order has {order.numel()} elements; expected {expected}")
 
 
 def get_block_sparse_broadcast_pattern(
@@ -538,6 +699,13 @@ def get_block_sparse_broadcast_pattern(
         tensors.full_block_idx,
         tensors.dq_write_order,
         tensors.dq_write_order_full,
+        tensors.local_mask_block_cnt,
+        tensors.local_full_block_cnt,
+        tensors.bwd_kv_order,
+        tensors.bwd_work_map,
+        tensors.bwd_original_active,
+        tensors.intra_mask_block_cnt,
+        tensors.intra_full_block_cnt,
     ):
         if tensor is not None:
             patterns.append(get_broadcast_dims(tensor))
@@ -707,7 +875,81 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.dq_write_order, tensors.dq_write_order_full)
     ]
-
+    kv_block_signal_tensor = (
+        to_cute_tensor(
+            tensors.kv_block_signal,
+            assumed_align=4,
+            # 1D [n_block] (legacy per-block) is unit-stride on dim 0; 2D [H_kv, n_block]
+            # (per-kv-head) is row-major -> the contiguous (unit-stride) dim is the last.
+            leading_dim=tensors.kv_block_signal.dim() - 1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.kv_block_signal is not None
+        else None
+    )
+    kv_block_trace_tensor = (
+        to_cute_tensor(
+            tensors.kv_block_trace, assumed_align=8, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+        )
+        if tensors.kv_block_trace is not None
+        else None
+    )
+    prof_buf_tensor = (
+        to_cute_tensor(
+            tensors.prof_buf, assumed_align=8, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+        )
+        if tensors.prof_buf is not None
+        else None
+    )
+    local_mask_block_cnt_tensor, local_full_block_cnt_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.local_mask_block_cnt, tensors.local_full_block_cnt)
+    ]
+    intra_mask_block_cnt_tensor, intra_full_block_cnt_tensor = [
+        to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
+        if t is not None
+        else None
+        for t in (tensors.intra_mask_block_cnt, tensors.intra_full_block_cnt)
+    ]
+    bwd_kv_order_tensor = (
+        to_cute_tensor(
+            tensors.bwd_kv_order,
+            assumed_align=4,
+            leading_dim=0,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.bwd_kv_order is not None
+        else None
+    )
+    bwd_work_map_tensor = (
+        to_cute_tensor(
+            tensors.bwd_work_map,
+            assumed_align=4,
+            leading_dim=1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.bwd_work_map is not None
+        else None
+    )
+    bwd_original_active_tensor = (
+        to_cute_tensor(
+            tensors.bwd_original_active,
+            assumed_align=4,
+            leading_dim=-1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if tensors.bwd_original_active is not None
+        else None
+    )
+    fwd_work_order_tensor = (
+        to_cute_tensor(
+            tensors.fwd_work_order, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
+        )
+        if tensors.fwd_work_order is not None
+        else None
+    )
     return BlockSparseTensors(
         mask_block_cnt_tensor,
         mask_block_idx_tensor,
@@ -717,6 +959,17 @@ def to_cute_block_sparse_tensors(
         cu_block_idx_offsets_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+        kv_block_signal_tensor,
+        kv_block_trace_tensor,
+        prof_buf_tensor,
+        local_mask_block_cnt_tensor,
+        local_full_block_cnt_tensor,
+        bwd_kv_order_tensor,
+        bwd_work_map_tensor,
+        bwd_original_active_tensor,
+        fwd_work_order_tensor,
+        intra_mask_block_cnt_tensor,
+        intra_full_block_cnt_tensor,
     )
 
 
