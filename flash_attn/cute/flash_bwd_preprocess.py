@@ -309,7 +309,7 @@ class FlashAttentionBackwardPreprocess:
             threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
             assert cute.arch.WARP_SIZE % threads_per_row == 0
             dpsum = utils.warp_reduce(dpsum, operator.add, width=threads_per_row)
-            dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), Float32)
+            dP_sum = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
             dP_sum.store(dpsum)
 
             # Write dPsum from rmem -> gmem

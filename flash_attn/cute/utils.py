@@ -25,16 +25,12 @@ from .tile_size import (
 )
 
 
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
-)
+# CUTLASS DSL 4.6 accepts string literals for rounding modes and no longer
+# exports RoundingModeKind from cutlass._mlir.dialects.nvvm.
+fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd="rn")
+mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
+add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd="rn")
+sub_packed_f32x2 = partial(cute.arch.sub_packed_f32x2, rnd="rn")
 
 
 def hash_callable(func: Callable) -> str:
@@ -114,7 +110,7 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_B(smem, thr_mma)
@@ -123,7 +119,7 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_A(smem, thr_mma)
@@ -154,7 +150,7 @@ def warp_reduce(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -290,7 +286,7 @@ def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
     :rtype: cute.TensorSSA or Float32
     """
     if const_expr(isinstance(x, cute.TensorSSA)):
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         for i in cutlass.range_constexpr(cute.size(x.shape)):
             res[i] = cute.arch.exp2(res[i])
@@ -323,16 +319,13 @@ def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    return Float32(
-        nvvm.fmax(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-            loc=loc,
-            ip=ip,
-        )
-    )
+    # CUTLASS DSL 4.6 exposes only the binary ``cute.arch.fmax`` form.
+    # Preserve the previous optional three-input helper semantics by folding
+    # the third value through a second binary max.
+    result = cute.arch.fmax(a, b, loc=loc, ip=ip)
+    if c is not None:
+        result = cute.arch.fmax(result, c, loc=loc, ip=ip)
+    return result
 
 
 @cute.jit
@@ -343,7 +336,7 @@ def fmax_reduce(
         # if const_expr(init_val is None):
         #     init_val = -cutlass.Float32.if
         # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         # local_max = [res[0], res[1]]
         # for i in cutlass.range_constexpr(2, cute.size(x.shape), 2):
@@ -364,7 +357,7 @@ def fmax_reduce(
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
         # We instead force the 3-input max.
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_max_0 = (
             fmax(init_val, res[0], res[1])
@@ -394,7 +387,7 @@ def fadd_reduce(
         if const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-        # res = cute.make_fragment(x.shape, Float32)
+        # res = cute.make_rmem_tensor(x.shape, Float32)
         # res.store(x)
         # local_sum = [res[0], res[1], res[2], res[3]]
         # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -407,7 +400,7 @@ def fadd_reduce(
         # local_sum[0] += local_sum[2]
         # return local_sum[0] if const_expr(init_val is None) else local_sum[0] + init_val
     else:
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_sum_0 = (
             add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
@@ -469,7 +462,7 @@ def atomic_max_f32(value: float | Float32, gmem_ptr_i32: cute.Pointer) -> None:
     we reinterpret the fp32 bits via a 1-elem fragment recast rather than a
     value-converting cast.
     """
-    bits_frg = cute.make_fragment(1, Float32)
+    bits_frg = cute.make_rmem_tensor(1, Float32)
     bits_frg[0] = Float32(value)
     bits = cute.recast_tensor(bits_frg, cutlass.Int32)[0]
     if bits >= cutlass.Int32(0):
@@ -514,7 +507,7 @@ def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) ->
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -565,7 +558,7 @@ def shuffle_sync(
     mask = cute.arch.WARP_SIZE - width
     clamp = cute.arch.WARP_SIZE - 1
     mask_and_clamp = mask << 8 | clamp
-    val = cute.make_fragment(1, type(value))
+    val = cute.make_rmem_tensor(1, type(value))
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
@@ -646,7 +639,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
     if const_expr(isinstance(dst_or_dtype, type)):
         # dtype variant: create new tensor and call the tensor variant
         dtype = dst_or_dtype
-        dst = cute.make_fragment(src.shape, dtype)
+        dst = cute.make_rmem_tensor(src.shape, dtype)
         cvt_f16(src, dst)
         return dst
     else:
@@ -778,7 +771,7 @@ def ex2_emulation_2(
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
     xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
     )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
@@ -896,7 +889,7 @@ def coord_offset_i64(
 @cute.jit
 def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
     """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
-    vec = cute.make_fragment(1, dtype)
+    vec = cute.make_rmem_tensor(1, dtype)
     vec[0] = a
     return vec.load()
 

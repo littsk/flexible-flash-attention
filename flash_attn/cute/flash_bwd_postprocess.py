@@ -392,7 +392,7 @@ class FlashAttentionBackwardPostprocess:
                 acc_shape = tiled_mma.partition_shape_C(
                     tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
                 )
-                acc = cute.make_fragment(acc_shape, cutlass.Float32)
+                acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
                 assert cute.size(acc) == cute.size(tdQsdQaccum)
             else:
                 thr_mma = tiled_mma.get_slice(0)  # 1-CTA
@@ -407,7 +407,7 @@ class FlashAttentionBackwardPostprocess:
                 tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                 tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
-                acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                acc = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
             tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
             cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
             # Convert tdQrdQaccum from fp32 to fp16/bf16
@@ -650,7 +650,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
         smem_thr_copy_g2s = G2S_tiled_copy_dQaccum.get_slice(tidx)
 
         # S->R
-        tdQrdQ_t2r = cute.make_fragment(tdQrdQ.shape, cutlass.Float32)
+        tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ.shape, cutlass.Float32)
         tiled_smem_store_s2r = cute.make_tiled_copy(
             atom_universal_copy, layout_tv=layout_tv, tiler_mn=tiler_mn
         )
@@ -669,7 +669,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
             tiler_mn=tiled_tmem_ld.tiler_mn,
         )
         tdQsdQ_r2s = thr_tmem_ld.partition_D(thr_mma_dsk.partition_C(sdQ))
-        tdQrdQ_r2s = cute.make_fragment(tdQsdQ_r2s.shape, self.dtype)
+        tdQrdQ_r2s = cute.make_rmem_tensor(tdQsdQ_r2s.shape, self.dtype)
 
         num_stages = cute.size(tdQrdQ_t2r, mode=[1])
         for stage in cutlass.range_constexpr(num_stages):
@@ -690,9 +690,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
 
             cute.copy(smem_thr_copy_g2s, tdQgdQ[None, None, 0], tdQsdQ[None, None, 0])
 
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier(barrier_id=6, number_of_threads=num_reduce_threads)
 
             # S -> R
@@ -704,9 +702,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
 
             cute.copy(s2r_thr_copy_dQaccum, tdQsdQ_s2r_p, tdQrdQ_r2s_cpy)
 
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_proxy("async.shared", space="cta")
             cute.arch.barrier(barrier_id=7, number_of_threads=num_reduce_threads)
 
             # R->S
@@ -722,9 +718,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
             tdQrdQ_r2s[None, None, None, None, 0],
             tdQsdQ_r2s[None, None, None, None, 0],
         )
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-        )
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier(barrier_id=8, number_of_threads=num_reduce_threads)
 
         # S-> G
