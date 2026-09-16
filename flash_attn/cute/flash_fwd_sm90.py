@@ -42,11 +42,13 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    SemanticSplitSingleTileScheduler,
 )
 from cutlass.cute import FastDivmodDivisorV2
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.cp_sync_sm90 import gated_k_load
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -56,9 +58,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        num_splits: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.num_splits = num_splits
+        self.is_split_kv = num_splits > 1
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
@@ -81,7 +86,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ),
             self.dtype,
         )
-        sO_layout_atom = sV_layout_atom
+        sO_layout_atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(
+                LayoutEnum.ROW_MAJOR, self.output_dtype, self.tile_hdimv
+            ),
+            self.output_dtype,
+        )
         if not self.mma_pv_is_rs:
             sP_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils_basic.get_smem_layout_atom(
@@ -124,7 +134,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ]
             for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
         ]
-        cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
+        output_elems = cute.cosize(self.sO_layout) * self.output_dtype.width // self.dtype.width
+        sQ_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, max(cute.cosize(self.sQ_layout), output_elems)],
+            self.buffer_align_bytes,
+        ]
+        cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout), output_elems)
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
@@ -191,14 +206,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         )
 
+        self.output_dtype = mO.element_type
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
+        mQ = layout_utils.select(mQ, QO_layout_transpose)
+        O_layout_transpose = (
+            [2, 4, 3, 1, 0] if const_expr(self.is_split_kv) else QO_layout_transpose
+        )
+        mO = layout_utils.select(mO, O_layout_transpose)
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        if const_expr(self.is_split_kv):
+            LSE_layout_transpose = [3, 2, 1, 0]
         mLSE = (
             layout_utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
@@ -227,7 +249,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
-        self.use_tma_O = self.use_tma_Q
+        self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
@@ -314,7 +336,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.sO_layout,
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+        if const_expr(
+            self.is_split_kv
+            and blocksparse_tensors is not None
+            and blocksparse_tensors.local_mask_block_cnt is not None
+        ):
+            TileScheduler = SemanticSplitSingleTileScheduler
+        elif const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             # TODO: dispatch to DynamicPersistentVarlenScheduler when appropriate
             TileScheduler = SingleTileVarlenScheduler
         else:
@@ -329,7 +357,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
-            1,  # num_splits
+            self.num_splits,
             cute.size(mK.shape[0])
             if const_expr(mPageTable is None)
             else mK.shape[0] * mPageTable.shape[1],
@@ -344,6 +372,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
+            is_split_kv=self.is_split_kv,
+            fwd_work_order=blocksparse_tensors.fwd_work_order
+            if const_expr(blocksparse_tensors is not None)
+            else None,
             lpt=self.is_causal or self.is_local,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
@@ -537,7 +569,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
         # reuse sQ's data iterator
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        sO = storage.sQ.get_tensor(
+            sO_layout.outer, swizzle=sO_layout.inner, dtype=self.output_dtype
+        )
 
         block_info = BlockInfo(
             self.tile_m,
@@ -680,7 +714,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # if work_tile.is_valid_tile:
-                m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+                m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 head_idx_kv = (
@@ -720,6 +754,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         tma_atom_K, 0, cute.make_layout(1), gK, sK
                     )
                     tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
+                    if const_expr(
+                        blocksparse_tensors is not None
+                        and blocksparse_tensors.kv_block_signal is not None
+                    ):
+                        tma_load_K_fn = partial(
+                            gated_k_load,
+                            tma_load_K_fn,
+                            blocksparse_tensors.kv_block_signal,
+                            head_idx_kv,
+                        )
                     tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_V, 0, cute.make_layout(1), gV, sV
                     )
@@ -905,6 +949,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             self.intra_wg_overlap,
                             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                             self.q_subtile_factor,
+                            1,  # SM90 does not support KV subtiles.
+                            split_idx,
+                            self.num_splits,
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -1052,7 +1099,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if work_tile.is_valid_tile:
 
             # shape: (atom_v_m * rest_m)
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
 
             # Recompute fastdiv_mods if necessary for varlen with aux_tensors
@@ -1220,6 +1267,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
+                    split_idx,
+                    self.num_splits,
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q
@@ -1255,8 +1304,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.epilogue(
                 acc_O,
                 softmax.row_sum,
-                mO,
-                mLSE,
+                mO[None, None, None, None, split_idx] if const_expr(self.is_split_kv) else mO,
+                mLSE[None, None, None, split_idx] if const_expr(self.is_split_kv) else mLSE,
                 sO,
                 seqlen,
                 gmem_tiled_copy_O,

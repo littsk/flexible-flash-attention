@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -28,52 +29,179 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+import cutlass.utils.distributed as cute_dist
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import T as _mlir_T
+from cutlass._mlir.dialects import llvm as _llvm, nvvm as _nvvm
 
 from quack import copy_utils, layout_utils
+from quack.cute_dsl_utils import ParamsBase
 
-from flash_attn.cute.paged_kv import PagedKVManager
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import utils
-import flash_attn.cute.pipeline as pipeline_custom
-import cutlass.pipeline as cutlass_pipeline
-from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import (
-    SoftmaxSm100,
-    apply_score_mod_inner,
-    apply_learnable_sink,
-    load_learnable_sink,
-)
-from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
+    handle_block_sparse_empty_tile_correction_sm100,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
-    handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
-from flash_attn.cute import mma_sm100_desc as sm100_desc
-from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.fa_logging import fa_log, fa_printf
+from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
-from cutlass.cute import FastDivmodDivisorV2
-from quack.cute_dsl_utils import ParamsBase
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.softmax import (
+    SoftmaxSm100,
+    apply_learnable_sink,
+    apply_score_mod_inner,
+    load_learnable_sink,
+)
 from flash_attn.cute.tile_scheduler import (
+    DynamicPersistentVarlenScheduler,
+    GroupedPersistentTileScheduler,
+    MBlockGroupBatchTileScheduler,
     SchedulerState,
     SchedulingMode,
+    SemanticSplitSingleTileScheduler,
+    SingleTileLPTScheduler,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
+    StaticPersistentTileScheduler,
     TileSchedulerArguments,
     TileSchedulerProtocol,
-    SingleTileScheduler,
-    StaticPersistentTileScheduler,
-    SingleTileLPTScheduler,
-    SingleTileVarlenScheduler,
-    DynamicPersistentVarlenScheduler,
 )
-from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, smid
+import flash_attn.cute.pipeline as pipeline_custom
+import cutlass.pipeline as cutlass_pipeline
+from cutlass.cute import FastDivmodDivisorV2
+
+
+@cute.jit
+def _trace_store_globaltimer(trace, idx):
+    """Observability (--obs): record the GPU %globaltimer (ns) into trace[idx], once.
+
+    `trace` is a 1D int64 GMEM tensor of length num_n_blocks*3; idx = block*3 + slot
+    where slot is 0=wait-start, 1=signal-ready, 2=load-issued. Single-thread store via
+    inline PTX so it adds one global write and never touches the SM compute pipeline.
+
+    First-touch semantics: the persistent scheduler re-loads each kv-block once per
+    q-tile, but only the *first* visit can observe a real wait (later visits find the
+    signal already set). We therefore write only when the slot is still 0, so the trace
+    captures the genuine first-touch wait/ready/consume of each block rather than the
+    last (already-ready) re-load.
+    """
+    view = cute.make_tensor(trace.iterator + idx, cute.make_layout((1,), stride=(1,)))
+    cur = cute_dist.ld_bypass(view)[0]
+    if cur == 0:
+        ts = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+        ptr = trace.iterator + idx
+        _llvm.inline_asm(
+            None,
+            [ptr.toint().ir_value(), ts.ir_value()],
+            "st.global.u64 [$0], $1;",
+            "l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Warp-granular profiler (mega_attention.profiler) device-side recorder.       #
+#                                                                              #
+# Buffer layout (must match mega_attention/profiler): a flat int64 tensor of   #
+# logical shape [num_blocks, num_warps, 1 + max_events * 2] --                 #
+#   [b, w, 0]            : event count for this (block, warp) (lane-0 only)     #
+#   [b, w, 1 + e*2 + 0]  : event e timestamp (%globaltimer ns)                 #
+#   [b, w, 1 + e*2 + 1]  : event e meta = (smid << 32) | (event_no << 2) | ph  #
+# Only lane 0 of each warp writes into its own region, so there are no atomics  #
+# and no cross-warp barriers. num_warps/max_events/event_no/phase are          #
+# compile-time constants; callers gate the whole call with const_expr.         #
+# --------------------------------------------------------------------------- #
+_PROF_EVENT_WORDS = 2
+_PROF_PHASE_INSTANT = 0
+_PROF_PHASE_START = 1
+_PROF_PHASE_END = 2
+
+
+@cute.jit
+def _cta_lifetime_mark(trace, signal, num_warps, phase):
+    if cute.arch.lane_idx() == 0:
+        offset = cute.size(signal.shape) * 3
+        idx = offset + (cute.arch.block_idx()[0] * num_warps + cute.arch.warp_idx()) * 3
+        trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+        if const_expr(phase == 0):
+            trace[idx + 2] = Int64(_llvm.inline_asm(
+                _mlir_T.i64(), [],
+                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
+                has_side_effects=True, asm_dialect=0,
+            ))
+
+
+@cute.jit
+def _prof_mark(prof_buf, num_warps, max_events, event_no, phase):
+    """Record one warp-granular profiler event for the calling (block, warp)."""
+    if cute.arch.lane_idx() == 0:
+        block_x, block_y, block_z = cute.arch.block_idx()
+        grid_x, grid_y, _ = cute.arch.grid_dim()
+        bidx = block_x + grid_x * (block_y + grid_y * block_z)
+        warp = cute.arch.warp_idx()
+        region = (Int64(bidx) * Int64(num_warps) + Int64(warp)) * Int64(
+            1 + max_events * _PROF_EVENT_WORDS
+        )
+        cnt_ptr = prof_buf.iterator + region
+        cnt_view = cute.make_tensor(cnt_ptr, cute.make_layout((1,), stride=(1,)))
+        count = cute_dist.ld_bypass(cnt_view)[0]
+        if count < Int64(max_events):
+            ts = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+            # Read %smid (u32) and zero-extend to u64 in PTX so the Python-side
+            # Int64 wrap is unambiguous.
+            smid = Int64(_llvm.inline_asm(
+                _mlir_T.i64(), [],
+                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
+                has_side_effects=True, asm_dialect=0,
+            ))
+            # meta = (smid << 32) | (event_no << 2) | phase, built with plain
+            # arithmetic since event_no/phase are compile-time constants.
+            meta = smid * Int64(1 << 32) + Int64(event_no * 4 + phase)
+            evt = region + Int64(1) + count * Int64(_PROF_EVENT_WORDS)
+            ts_ptr = prof_buf.iterator + evt
+            meta_ptr = prof_buf.iterator + evt + Int64(1)
+            _llvm.inline_asm(
+                None, [ts_ptr.toint().ir_value(), ts.ir_value()],
+                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
+            )
+            _llvm.inline_asm(
+                None, [meta_ptr.toint().ir_value(), meta.ir_value()],
+                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
+            )
+            new_count = count + Int64(1)
+            _llvm.inline_asm(
+                None, [cnt_ptr.toint().ir_value(), new_count.ir_value()],
+                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
+            )
+
+
+# Profiler event ids (registered names live in the host harness / Profiler).
+_PROF_EVT_LOAD = 0
+_PROF_EVT_MMA = 1
+_PROF_EVT_SOFTMAX = 2
+_PROF_EVT_CORRECTION = 3
+_PROF_EVT_EPILOGUE = 4
+_PROF_EVT_KV_LOAD = 5
+_PROF_EVT_KV_WAIT = 6
+_PROF_EVT_LOCAL_WORK = 7
+_PROF_EVT_REMOTE_WORK = 8
+#: Per-(CTA, warp) event capacity; the host Profiler must use the same value.
+#: Buffer size scales with the full physical grid. Non-persistent semantic
+#: SplitKV records one work per CTA, so 1024 covers its load/wait events while
+#: keeping the 4096-CTA trace allocation bounded.
+_PROF_MAX_EVENTS = 1024
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -149,6 +277,7 @@ class FlashAttentionForwardSm100:
         is_causal: bool = False,
         is_local: bool = False,
         is_split_kv: bool = False,
+        is_semantic_split: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int = 1,
         kv_subtile_factor: int = 1,
@@ -213,6 +342,8 @@ class FlashAttentionForwardSm100:
         self.is_varlen_q = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        self.is_semantic_split = is_semantic_split
+        assert not self.is_semantic_split or self.is_split_kv
         self.pack_gqa = pack_gqa
         self.use_tma_O = (
             not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
@@ -252,7 +383,10 @@ class FlashAttentionForwardSm100:
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+            (
+                self.head_dim_v_padded >= 128
+                and self.is_split_kv
+            )
         )
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -284,7 +418,16 @@ class FlashAttentionForwardSm100:
         )
 
         self.use_varlen_scheduler = False
-        if is_varlen_q:
+        # Optional distributed-CP walks. Both only permute static-persistent
+        # coarse axes and are disabled by default.
+        self.group_inner_sched = (
+            os.environ.get("FA_TILE_GROUP_INNER", "0") == "1" and not self.pack_gqa
+        )
+        self.mblock_outer_sched = os.environ.get("FA_TILE_MBLOCK_OUTER", "0") == "1"
+        if self.is_semantic_split:
+            assert not self.is_persistent
+            self.TileScheduler = SemanticSplitSingleTileScheduler
+        elif is_varlen_q:
             if self.dynamic_persistent and not self.use_clc_scheduler:
                 self.use_varlen_scheduler = True
                 self.TileScheduler = DynamicPersistentVarlenScheduler
@@ -295,6 +438,10 @@ class FlashAttentionForwardSm100:
                 self.TileScheduler = SingleTileVarlenScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
+        elif self.is_static_persistent and self.group_inner_sched:
+            self.TileScheduler = GroupedPersistentTileScheduler
+        elif self.is_static_persistent and self.mblock_outer_sched:
+            self.TileScheduler = MBlockGroupBatchTileScheduler
         elif self.is_static_persistent:
             self.TileScheduler = StaticPersistentTileScheduler
         else:
@@ -396,7 +543,11 @@ class FlashAttentionForwardSm100:
 
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
         smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+        smem_size_q_o = (
+            smem_size_q + smem_size_o
+            if not self.overlap_sO_sQ
+            else max(smem_size_q, smem_size_o)
+        )
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
@@ -709,6 +860,12 @@ class FlashAttentionForwardSm100:
             eff_seqlen_q = max_seqlen_q if const_expr(not self.pack_gqa) else max_seqlen_q * self.qhead_per_kvhead
         TileScheduler = self.TileScheduler
         _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
+        fwd_work_order = (
+            blocksparse_tensors.fwd_work_order
+            if const_expr(blocksparse_tensors is not None) else None
+        )
+        if const_expr(fwd_work_order is not None):
+            assert self.is_semantic_split
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(eff_seqlen_q, _num_block_divisor),
             cute.size(mQ.shape[2]),
@@ -728,6 +885,7 @@ class FlashAttentionForwardSm100:
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead=self.qhead_per_kvhead,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
@@ -741,6 +899,7 @@ class FlashAttentionForwardSm100:
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
+            fwd_work_order=fwd_work_order,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -938,6 +1097,18 @@ class FlashAttentionForwardSm100:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+
+        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
+        # recording at compile time (const_expr-gated call sites emit nothing).
+        prof_buf = (
+            blocksparse_tensors.prof_buf
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
+
+        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
+            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 0)
 
         # Prefetch tma descriptor
         if warp_idx == 0:
@@ -1322,6 +1493,8 @@ class FlashAttentionForwardSm100:
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_MMA, _PROF_PHASE_START)
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -1343,6 +1516,8 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_MMA, _PROF_PHASE_END)
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
@@ -1354,6 +1529,8 @@ class FlashAttentionForwardSm100:
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_EPILOGUE, _PROF_PHASE_START)
                 self.epilogue_s2g(
                     mO,
                     sO,
@@ -1368,6 +1545,8 @@ class FlashAttentionForwardSm100:
                     blocksparse_tensors=blocksparse_tensors,
                     tile_scheduler=tile_scheduler,
                 )
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_EPILOGUE, _PROF_PHASE_END)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
@@ -1406,6 +1585,8 @@ class FlashAttentionForwardSm100:
                 tile_scheduler=tile_scheduler,
             )
 
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_SOFTMAX, _PROF_PHASE_START)
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if const_expr(self.q_stage == 1) or warp_idx < self.softmax1_warp_ids[0] else 1)
                 softmax_loop(stage=stage, tStS=tStS)
@@ -1415,6 +1596,8 @@ class FlashAttentionForwardSm100:
                     softmax_loop(stage=0, tStS=tStS)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     softmax_loop(stage=1, tStS=tStS)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_SOFTMAX, _PROF_PHASE_END)
 
             tmem_alloc_barrier.arrive()
 
@@ -1426,6 +1609,8 @@ class FlashAttentionForwardSm100:
             # sync with mma warp before retrieving tmem ptr
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_START)
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
@@ -1452,8 +1637,12 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
+        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
+            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 1)
         return
 
     @cute.jit
@@ -1589,6 +1778,45 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
+            # Per-kv-block readiness signal (context-parallel overlap). When present,
+            # the K load of block n polls kv_block_signal[n] in GMEM until it is set
+            # before issuing the TMA load. We gate on K only since K and V of the same
+            # block are loaded back-to-back and the producer marks the signal once both
+            # K and V of that block have arrived.
+            kv_block_signal = (
+                blocksparse_tensors.kv_block_signal
+                if const_expr(blocksparse_tensors is not None)
+                else None
+            )
+            kv_block_trace = (
+                blocksparse_tensors.kv_block_trace
+                if const_expr(blocksparse_tensors is not None)
+                else None
+            )
+            prof_buf = (
+                blocksparse_tensors.prof_buf
+                if const_expr(blocksparse_tensors is not None)
+                else None
+            )
+            prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
+            if const_expr(prof_buf is not None and self.is_semantic_split):
+                if issue_kv_for_this_warp:
+                    if split_idx == 0:
+                        _prof_mark(
+                            prof_buf,
+                            prof_nw,
+                            _PROF_MAX_EVENTS,
+                            _PROF_EVT_LOCAL_WORK,
+                            _PROF_PHASE_INSTANT,
+                        )
+                    else:
+                        _prof_mark(
+                            prof_buf,
+                            prof_nw,
+                            _PROF_MAX_EVENTS,
+                            _PROF_EVT_REMOTE_WORK,
+                            _PROF_PHASE_INSTANT,
+                        )
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1598,6 +1826,11 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                kv_signal=kv_block_signal,
+                signal_head_idx=head_idx_kv,
+                kv_trace=kv_block_trace,
+                prof_buf=prof_buf,
+                prof_nw=prof_nw,
             )
             load_V = partial(
                 self.load_KV,
@@ -1608,6 +1841,8 @@ class FlashAttentionForwardSm100:
                 sV,
                 pipeline_kv=pipeline_kv,
                 K_or_V="V",
+                prof_buf=prof_buf,
+                prof_nw=prof_nw,
             )
 
             if const_expr(not self.use_block_sparsity):
@@ -3251,8 +3486,58 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        kv_signal: Optional[cute.Tensor] = None,
+        kv_trace: Optional[cute.Tensor] = None,
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_nw: int = 0,
+        head_idx: Int32 = Int32(0),
+        signal_head_idx: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
+        # Sparse traversal's head_idx addresses Q-head masks when PackGQA is
+        # disabled. Readiness always addresses the KV head of the actual K/V.
+        ready_head = signal_head_idx if const_expr(signal_head_idx is not None) else head_idx
+        # Observability trace row: per-block (legacy) or per-(kv-head, block) when the
+        # signal is 2D [H_kv, n_block] -- so each kv-head's wait/ready/consume is recorded
+        # separately (H_kv*n_block rows) instead of all heads colliding on one block slot.
+        if const_expr(kv_trace is not None):
+            if const_expr(kv_signal is not None and cute.rank(kv_signal) == 2):
+                trace_row = ready_head * cute.size(kv_signal, mode=[1]) + block
+            else:
+                trace_row = block
+        # Gated KV load: spin on the per-block readiness signal in GMEM before
+        # touching this block's K/V. Mirrors the gate_a_flags pattern used in the
+        # all-gather GEMM example: a peer copy stream fills the block then sets the
+        # signal, and the load warp polls here so compute overlaps the transfer.
+        if const_expr(kv_signal is not None):
+            if cute.arch.lane_idx() == 0:
+                # [.,0] wait-start: kernel reaches this block and begins polling.
+                if const_expr(kv_trace is not None):
+                    _trace_store_globaltimer(kv_trace, trace_row * 3 + 0)
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_START)
+                # Per-(kv-head, block) gate when kv_signal is 2D [H_kv, n_block]: the comm
+                # delivers (and signals) head h's slice of a block independently, so head h's
+                # q-tile only waits for head h's slice -- not the whole block's all-heads
+                # transfer. 1D [n_block] keeps the legacy per-block gate (e.g. backward).
+                if const_expr(cute.rank(kv_signal) == 2):
+                    sig_base = kv_signal[ready_head, None]
+                    sig_view = cute.make_tensor(
+                        sig_base.iterator + block, cute.make_layout((1,), stride=(1,))
+                    )
+                else:
+                    sig_view = cute.make_tensor(
+                        kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
+                    )
+                ready = cute_dist.ld_bypass(sig_view)[0]
+                while ready == 0:
+                    ready = cute_dist.ld_bypass(sig_view)[0]
+                # [.,1] signal-ready: producer's push for this block is now visible.
+                if const_expr(kv_trace is not None):
+                    _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)
+                if const_expr(prof_buf is not None):
+                    _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_END)
+            cute.arch.sync_warp()
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
         extra_tx_count = (
@@ -3261,6 +3546,15 @@ class FlashAttentionForwardSm100:
         )
         extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
         pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
+        # [.,2] load-issued: smem stage is free and this block's TMA load is about to
+        # fire. (consume - wait-start) is the per-block stall bubble; (consume - ready)
+        # is post-delivery pipeline backpressure.
+        if const_expr(kv_trace is not None):
+            if cute.arch.lane_idx() == 0:
+                _trace_store_globaltimer(kv_trace, trace_row * 3 + 2)
+        # Warp-granular profiler: per-(K/V) block load issued by the load warp.
+        if const_expr(prof_buf is not None):
+            _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_LOAD, _PROF_PHASE_INSTANT)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
             # Before this round, the smem location was occupied by V, which is smaller than
             # K. So we need to wait for the stage after that (stage 1) to be empty as well.
