@@ -28,6 +28,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,
+    ThreePhaseBwdSingleTileScheduler,
     SingleTileVarlenScheduler,
 )
 from flash_attn.cute import barrier
@@ -35,6 +36,7 @@ from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.cp_sync_sm90 import wait_kv_ready, fence_proxy_async_global
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
@@ -363,11 +365,16 @@ class FlashAttentionBackwardSm90:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        mdKV_done: Optional[cute.Tensor] = None,
+        mdGQA_local_done: Optional[cute.Tensor] = None,
+        mdGQA_local_expected: Optional[cute.Tensor] = None,
+        mdGQA_finalize_state: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        assert getattr(self, "dkv_done_mc_ptr", None) is None, "SM90 CP uses local release counters"
         # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
         # so we need the float32 accum path + postprocess.
         # For varlen_k with qhead_per_kvhead == 1, we use ragged TMA tensors.
@@ -516,13 +523,27 @@ class FlashAttentionBackwardSm90:
         else:
             tma_atom_dK = tma_atom_dV = tma_tensor_dK = tma_tensor_dV = None
 
-        if const_expr(mCuSeqlensK is not None or mSeqUsedK is not None):
+        bwd_kv_order = (
+            blocksparse_tensors.bwd_kv_order
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        bwd_work_map = (
+            blocksparse_tensors.bwd_work_map
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        if const_expr(bwd_kv_order is not None):
+            TileScheduler = ThreePhaseBwdSingleTileScheduler
+        elif const_expr(mCuSeqlensK is not None or mSeqUsedK is not None):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = (self.is_causal or self.is_local) and self.deterministic
+        self.spt = (
+            getattr(self, "spt_override", (self.is_causal or self.is_local)) and self.deterministic
+        )
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mQ.shape[2]),
@@ -545,6 +566,8 @@ class FlashAttentionBackwardSm90:
             lpt=self.spt,
             head_swizzle=self.deterministic,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            bwd_kv_order=bwd_kv_order,
+            bwd_work_map=bwd_work_map,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -618,6 +641,10 @@ class FlashAttentionBackwardSm90:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
+            mdKV_done,
+            mdGQA_local_done,
+            mdGQA_local_expected,
+            mdGQA_finalize_state,
             window_size_left,
             window_size_right,
         ).launch(
@@ -673,6 +700,10 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        mdKV_done: Optional[cute.Tensor] = None,
+        mdGQA_local_done: Optional[cute.Tensor] = None,
+        mdGQA_local_expected: Optional[cute.Tensor] = None,
+        mdGQA_finalize_state: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ):
@@ -811,6 +842,10 @@ class FlashAttentionBackwardSm90:
                 mdV,
                 mdK_semaphore,
                 mdV_semaphore,
+                mdKV_done,
+                mdGQA_local_done,
+                mdGQA_local_expected,
+                mdGQA_finalize_state,
                 mdQaccum,
                 sQ,
                 sK,
@@ -898,6 +933,17 @@ class FlashAttentionBackwardSm90:
                     if const_expr(self.qhead_per_kvhead == 1)
                     else head_idx // qhead_per_kvhead_divmod
                 )
+                if const_expr(blocksparse_tensors is not None):
+                    active_q = get_total_q_block_count_bwd(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        n_block,
+                        q_subtile_factor=self.q_subtile_factor,
+                        m_block_max=block_info.get_m_block_min_max(seqlen, n_block)[1],
+                    )
+                    if active_q > 0:
+                        wait_kv_ready(blocksparse_tensors.kv_block_signal, head_idx_kv, n_block)
                 mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
@@ -1120,6 +1166,10 @@ class FlashAttentionBackwardSm90:
         mdV: cute.Tensor,
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        mdKV_done: Optional[cute.Tensor],
+        mdGQA_local_done: Optional[cute.Tensor],
+        mdGQA_local_expected: Optional[cute.Tensor],
+        mdGQA_finalize_state: Optional[cute.Tensor],
         mdQaccum: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
@@ -1463,6 +1513,54 @@ class FlashAttentionBackwardSm90:
                         mdK_semaphore,
                         mdV_semaphore,
                     )
+
+            if const_expr(mdKV_done is not None or mdGQA_local_done is not None):
+                if process_tile:
+                    if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 4:
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    cutlass.pipeline.NamedBarrier(
+                        barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads
+                    ).arrive_and_wait()
+                    if tidx == 0:
+                        fence_proxy_async_global()
+                        # Full async completion is ordered before a system release.
+                        if const_expr(mdGQA_local_done is not None):
+                            flat = (head_idx // qhead_per_kvhead_divmod) * self.gqa_nblk + n_block
+                            if const_expr(
+                                mdGQA_local_expected is not None
+                                and mdGQA_finalize_state is not None
+                            ):
+                                previous = cute.arch.atomic_add(
+                                    mdGQA_local_done.iterator + flat,
+                                    Int32(1),
+                                    sem="acq_rel",
+                                    scope="sys",
+                                )
+                                if previous + Int32(1) == mdGQA_local_expected[flat]:
+                                    cute.arch.atomic_add(
+                                        mdGQA_finalize_state.iterator + Int32(4) + flat,
+                                        Int32(1),
+                                        sem="release",
+                                        scope="sys",
+                                    )
+                                    cute.arch.atomic_add(
+                                        mdGQA_finalize_state.iterator,
+                                        Int32(1),
+                                        sem="release",
+                                        scope="sys",
+                                    )
+                            else:
+                                cute.arch.atomic_add(
+                                    mdGQA_local_done.iterator + flat,
+                                    Int32(1),
+                                    sem="release",
+                                    scope="sys",
+                                )
+                        else:
+                            flat = head_idx * self.dkv_done_nblk + n_block
+                            cute.arch.atomic_add(
+                                mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                            )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1917,9 +2015,6 @@ class FlashAttentionBackwardSm90:
                                 1,
                             )
                 else:
-                    assert not self.deterministic, (
-                        "Deterministic not implemented for block-sparse backward"
-                    )
                     dQaccum_store_block_sparse_bwd_sm90(
                         blocksparse_tensors,
                         batch_idx,
@@ -1932,12 +2027,16 @@ class FlashAttentionBackwardSm90:
                         num_dQ_warp_groups=self.num_wg_dQ,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
+                        semaphore=mdQ_semaphore_cur if const_expr(self.deterministic) else None,
                     )
 
             # For local masking + deterministic (non-spt): signal remaining m_blocks
             # that this n_block won't visit, so they don't deadlock waiting.
             if const_expr(
-                self.deterministic and not self.spt and block_info.window_size_left is not None
+                self.deterministic
+                and not self.spt
+                and not self.use_block_sparsity
+                and block_info.window_size_left is not None
             ):
                 m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                 for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):

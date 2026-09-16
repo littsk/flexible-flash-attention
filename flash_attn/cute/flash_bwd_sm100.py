@@ -7,10 +7,13 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.distributed as cute_dist
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
@@ -29,6 +32,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
+    ThreePhaseBwdSingleTileScheduler,
 )
 
 from flash_attn.cute import barrier
@@ -36,6 +40,12 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.flash_fwd_sm100 import (
+    _prof_mark,
+    _PROF_MAX_EVENTS,
+    _PROF_PHASE_START,
+    _PROF_PHASE_END,
+)
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
@@ -43,6 +53,14 @@ from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192,
     produce_block_sparse_q_loads_bwd_sm100_default,
 )
+
+# Backward warp-role profiler event ids (own namespace; the host Profiler for the
+# backward kernel registers these names). See mega_attention/profiler.
+_PROF_BWD_RELAY = 0
+_PROF_BWD_LOAD = 1
+_PROF_BWD_MMA = 2
+_PROF_BWD_COMPUTE = 3
+_PROF_BWD_REDUCE = 4
 
 
 # NOTE [hdim64 dedicated P/dS TMEM slots]
@@ -62,6 +80,21 @@ from flash_attn.cute.block_sparse_utils import (
 # The S handshake keeps its own phase/state (producer_phase_S, consumer_state_S) so its
 # parity never depends on where the other pipelines flip. Perf evidence in PR #2804; the
 # aliased layout is what every other shape runs.
+
+
+@dsl_user_op
+def fence_proxy_async_global(*, loc=None, ip=None) -> Int32:
+    """Make completed cp.async.bulk global writes visible to generic loads."""
+    value = llvm.inline_asm(
+        T.i32(),
+        [],
+        "fence.proxy.async.global; mov.u32 $0, 0;",
+        "=r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(value)
 
 
 class FlashAttentionBackwardSm100:
@@ -266,6 +299,32 @@ class FlashAttentionBackwardSm100:
                 self.num_regs_compute = 128 + 8
                 self.num_regs_load = 128 - 24
                 self.num_regs_mma = self.num_regs_load
+
+        # E345: the 1CTA D128 deterministic compute path spills six scalars
+        # at 136 registers. Keep the same CTA register budget, but give the
+        # two compute warpgroups eight more registers each.
+        if (
+            self.deterministic
+            and not self.use_2cta_instrs
+            and self.tile_hdim == 128
+            and self.tile_hdimv == 128
+        ):
+            self.num_regs_reduce = 144
+            self.num_regs_compute = 144
+            self.num_regs_load = 80
+            self.num_regs_mma = 80
+
+        # Paired deterministic D128: validated equal-budget role allocation.
+        if (
+            self.deterministic
+            and self.use_2cta_instrs
+            and self.tile_hdim == 128
+            and self.tile_hdimv == 128
+        ):
+            self.num_regs_reduce = 144
+            self.num_regs_compute = 152
+            self.num_regs_load = 64
+            self.num_regs_mma = 64
 
         assert (
             self.num_regs_reduce
@@ -510,6 +569,10 @@ class FlashAttentionBackwardSm100:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        mdKV_done: Optional[cute.Tensor] = None,
+        mdGQA_local_done: Optional[cute.Tensor] = None,
+        mdGQA_local_expected: Optional[cute.Tensor] = None,
+        mdGQA_finalize_state: Optional[cute.Tensor] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
@@ -750,7 +813,19 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
         # TileScheduler = SingleTileScheduler
-        if const_expr(self.is_varlen_k):
+        bwd_kv_order = (
+            blocksparse_tensors.bwd_kv_order
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        bwd_work_map = (
+            blocksparse_tensors.bwd_work_map
+            if const_expr(blocksparse_tensors is not None)
+            else None
+        )
+        if const_expr(bwd_kv_order is not None):
+            TileScheduler = ThreePhaseBwdSingleTileScheduler
+        elif const_expr(self.is_varlen_k):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
@@ -784,6 +859,9 @@ class FlashAttentionBackwardSm100:
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            use_cluster_idx=self.cta_group_size > 1,
+            bwd_kv_order=bwd_kv_order,
+            bwd_work_map=bwd_work_map,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -978,10 +1056,14 @@ class FlashAttentionBackwardSm100:
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if const_expr(self.use_block_sparsity and self.use_2cta_instrs):
-            # Both CTAs of a cluster must map to the same sparse KV column or they deadlock.
-            assert self.kv_subtile_factor % self.cta_group_size == 0, (
+            # Generic sparse 2CTA uses one coarse CSR column per cluster. The
+            # paired CP path instead supplies mirrored CSR rows plus a cluster work map.
+            paired_sparse = blocksparse_tensors.bwd_original_active is not None
+            assert self.kv_subtile_factor % self.cta_group_size == 0 or paired_sparse, (
                 "2-CTA block-sparse backward requires kv_subtile_factor % cta_group_size == 0"
             )
+        # Experimental sparse 2CTA is admitted only by the private interface
+        # keyword after preparation of mirrored pair CSR and pair tickets.
 
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
@@ -1008,6 +1090,10 @@ class FlashAttentionBackwardSm100:
             mdQ_semaphore,
             mdK_semaphore,
             mdV_semaphore,
+            mdKV_done,
+            mdGQA_local_done,
+            mdGQA_local_expected,
+            mdGQA_finalize_state,
             mCuSeqlensQ,
             mCuSeqlensK,
             mSeqUsedQ,
@@ -1091,6 +1177,10 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        mdKV_done: Optional[cute.Tensor],
+        mdGQA_local_done: Optional[cute.Tensor],
+        mdGQA_local_expected: Optional[cute.Tensor],
+        mdGQA_finalize_state: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
@@ -1141,6 +1231,13 @@ class FlashAttentionBackwardSm100:
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+
+        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
+        # recording at compile time. 16 warps per CTA (reduce/compute/mma/load/relay/empty).
+        prof_buf = (
+            blocksparse_tensors.prof_buf if const_expr(blocksparse_tensors is not None) else None
+        )
+        prof_nw = 16
 
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
@@ -1498,6 +1595,10 @@ class FlashAttentionBackwardSm100:
                 self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
             )
             if const_expr(self.use_2cta_instrs):
+                if const_expr(prof_buf is not None):
+                    _prof_mark(
+                        prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_RELAY, _PROF_PHASE_START
+                    )
                 self.relay(
                     dS_cluster_full_mbar_ptr,
                     dS_cluster_empty_mbar_ptr,
@@ -1508,11 +1609,17 @@ class FlashAttentionBackwardSm100:
                     TileSchedulerCls,
                     blocksparse_tensors,
                 )
+                if const_expr(prof_buf is not None):
+                    _prof_mark(
+                        prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_RELAY, _PROF_PHASE_END
+                    )
 
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_LOAD, _PROF_PHASE_START)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1558,6 +1665,8 @@ class FlashAttentionBackwardSm100:
                 should_load_Q=True,
                 should_load_dO=True,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_LOAD, _PROF_PHASE_END)
 
         #  MMA
         # (12)
@@ -1569,6 +1678,8 @@ class FlashAttentionBackwardSm100:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
 
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_MMA, _PROF_PHASE_START)
             self.mma(
                 tiled_mma_S,
                 tiled_mma_dP,
@@ -1610,6 +1721,8 @@ class FlashAttentionBackwardSm100:
                 is_leader_cta,
                 blocksparse_tensors,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_MMA, _PROF_PHASE_END)
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
@@ -1621,6 +1734,10 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
+            if const_expr(prof_buf is not None):
+                _prof_mark(
+                    prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_START
+                )
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1664,7 +1781,13 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mdKV_done,
+                mdGQA_local_done,
+                mdGQA_local_expected,
+                mdGQA_finalize_state,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
         # Reduce
@@ -1673,6 +1796,8 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_REDUCE, _PROF_PHASE_START)
             self.dQacc_reduce(
                 mdQaccum,
                 sdQaccum,
@@ -1686,6 +1811,8 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore,
                 blocksparse_tensors,
             )
+            if const_expr(prof_buf is not None):
+                _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_REDUCE, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
         return
@@ -2235,6 +2362,36 @@ class FlashAttentionBackwardSm100:
 
             else:
                 assert blocksparse_tensors is not None
+                sparse_work_count = get_total_q_block_count_bwd(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    n_block_sparse,
+                    q_subtile_factor=self.q_subtile_factor,
+                    m_block_max=m_block_max,
+                )
+                if const_expr(blocksparse_tensors.kv_block_signal is not None):
+                    if sparse_work_count > Int32(0):
+                        # A clustered MMA consumes both physical K blocks. Wait for
+                        # the complete cluster before either CTA issues a TMA load.
+                        signal = blocksparse_tensors.kv_block_signal
+                        if cute.arch.lane_idx() == 0:
+                            signal_group = self.cta_group_size
+                            group_base = (n_block // signal_group) * signal_group
+                            for mate in cutlass.range_constexpr(signal_group):
+                                slot = group_base + mate
+                                if slot * self.tile_n < seqlen.seqlen_k:
+                                    offset = slot
+                                    if const_expr(len(signal.shape) == 2):
+                                        offset = head_idx_kv * signal.stride[0] + slot
+                                    sig_view = cute.make_tensor(
+                                        signal.iterator + offset,
+                                        cute.make_layout((1,), stride=(1,)),
+                                    )
+                                    ready = cute_dist.ld_bypass(sig_view)[0]
+                                    while ready == 0:
+                                        ready = cute_dist.ld_bypass(sig_view)[0]
+                        cute.arch.sync_warp()
                 if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                     assert should_load_Q and should_load_dO
                     assert load_dOt is not None and load_Qt is not None
@@ -3027,6 +3184,10 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mdKV_done: Optional[cute.Tensor] = None,
+        mdGQA_local_done: Optional[cute.Tensor] = None,
+        mdGQA_local_expected: Optional[cute.Tensor] = None,
+        mdGQA_finalize_state: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3184,11 +3345,24 @@ class FlashAttentionBackwardSm100:
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                mask_mod=self.mask_mod,
+                mask_mod=(
+                    self.mask_mod._paired_sparse_source_mask
+                    if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                    else self.mask_mod
+                ),
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_data=aux_data,
+                aux_data=(
+                    AuxData(aux_data.tensors[:-1], aux_data.scalars)
+                    if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                    else aux_data
+                ),
                 fastdiv_mods=fastdiv_mods,
+                paired_original_bits=(
+                    aux_data.tensors[-1]
+                    if const_expr(getattr(self.mask_mod, "_paired_sparse_visibility", False))
+                    else None
+                ),
             )
 
             # prefetch_LSE = not self.is_causal
@@ -3525,6 +3699,13 @@ class FlashAttentionBackwardSm100:
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
 
+            local_head_active = True
+            if const_expr(self.use_block_sparsity):
+                if const_expr(blocksparse_tensors.bwd_original_active is not None):
+                    local_head_active = (
+                        blocksparse_tensors.bwd_original_active[batch_idx, head_idx, n_block] != 0
+                    )
+
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
             if process_tile:
@@ -3587,7 +3768,30 @@ class FlashAttentionBackwardSm100:
                         int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
                         mdK_semaphore,
                         "K",
+                        mdKV_done,
+                        mdGQA_local_done,
+                        mdGQA_local_expected,
+                        mdGQA_finalize_state,
+                        local_head_active,
                     )
+            if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+                if not process_tile:
+                    # Empty sparse Q heads perform no add, but later heads must
+                    # not wait forever for their deterministic epilogue ticket.
+                    assert mdV_semaphore is not None and mdK_semaphore is not None
+                    wg_idx_empty = cute.arch.make_warp_uniform(tidx // 128)
+                    head_kv_empty = head_idx // self.qhead_per_kvhead
+                    v_sem = mdV_semaphore[n_block, None, head_kv_empty, batch_idx]
+                    k_sem = mdK_semaphore[n_block, None, head_kv_empty, batch_idx]
+                    barrier.wait_eq(
+                        v_sem.iterator, dp_idx, wg_idx_empty, head_idx % self.qhead_per_kvhead
+                    )
+                    barrier.arrive_inc(v_sem.iterator, dp_idx, wg_idx_empty, 1)
+                    barrier.wait_eq(
+                        k_sem.iterator, dp_idx, wg_idx_empty, head_idx % self.qhead_per_kvhead
+                    )
+                    barrier.arrive_inc(k_sem.iterator, dp_idx, wg_idx_empty, 1)
+
             # Zero dK/dV for empty tiles (local attention or block sparsity)
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
             if const_expr(not self.dKV_postprocess):
@@ -4173,6 +4377,11 @@ class FlashAttentionBackwardSm100:
         barrier_id: Int32,
         mdKV_semaphore: Optional[cute.Tensor],
         K_or_V: cutlass.Constexpr[str],
+        mdKV_done: Optional[cute.Tensor] = None,
+        mdGQA_local_done: Optional[cute.Tensor] = None,
+        mdGQA_local_expected: Optional[cute.Tensor] = None,
+        mdGQA_finalize_state: Optional[cute.Tensor] = None,
+        local_head_active=True,
     ) -> cutlass.pipeline.PipelineState:
         assert K_or_V in ("K", "V")
         tile_hdim = self.tile_hdim if const_expr(K_or_V == "K") else self.tile_hdimv
@@ -4311,11 +4520,19 @@ class FlashAttentionBackwardSm100:
                     cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
                 else:
                     with cute.arch.elect_one():
-                        copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV.iterator,
-                            gdKV_epi[None, epi_stage].iterator,
-                            self.tma_copy_bytes["dKacc"],
-                        )
+                        if const_expr(self.use_2cta_instrs and self.use_block_sparsity):
+                            if n_block * self.tile_n < seqlen.seqlen_k:
+                                copy_utils.cpasync_reduce_bulk_add_f32(
+                                    sdKV.iterator,
+                                    gdKV_epi[None, epi_stage].iterator,
+                                    self.tma_copy_bytes["dKacc"],
+                                )
+                        else:
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sdKV.iterator,
+                                gdKV_epi[None, epi_stage].iterator,
+                                self.tma_copy_bytes["dKacc"],
+                            )
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -4335,8 +4552,94 @@ class FlashAttentionBackwardSm100:
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
+
+        # GQA producer-local completion: every Q-head CTA contributes once after both
+        # dV and dK fp32 async accumulation have completed.  A separate SM-capped
+        # reduce_dkv kernel waits for the real arrival count, converts the pair to
+        # bf16, and only then emits the owner-visible rank-ready signal.
+        if const_expr(mdGQA_local_done is not None and K_or_V == "K"):
+            if leader_warp:
+                cute.arch.cp_async_bulk_commit_group()
+                # The signal permits another CTA to read the global accumulator.
+                # A read-only wait only permits reuse of the source shared memory.
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+            # Both compute warpgroups own part of dK/dV. The single publisher
+            # must observe completion of every issuing warpgroup first.
+            self.compute_sync_barrier.arrive_and_wait()
+            _do_local_done = leader_warp and wg_idx == 0 and local_head_active
+            if _do_local_done:
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+                    local_flat = head_idx_kv * self.gqa_nblk + n_block
+                    previous = cute.arch.atomic_add(
+                        mdGQA_local_done.iterator + local_flat,
+                        Int32(1),
+                        sem="acq_rel",
+                        scope="sys",
+                    )
+                    if const_expr(
+                        mdGQA_local_expected is not None and mdGQA_finalize_state is not None
+                    ):
+                        expected = mdGQA_local_expected[local_flat]
+                        if previous + Int32(1) == expected:
+                            cute.arch.atomic_add(
+                                mdGQA_finalize_state.iterator + Int32(4) + local_flat,
+                                Int32(1),
+                                sem="release",
+                                scope="sys",
+                            )
+                            cute.arch.atomic_add(
+                                mdGQA_finalize_state.iterator,
+                                Int32(1),
+                                sem="release",
+                                scope="sys",
+                            )
+
+        # Per-block "done" signal for distributed CP backward reduce-scatter: after this
+        # rank finishes dK for (n_block, head_kv, batch), bump a per-block counter (with
+        # a system-scope release so the dK/dV writes are visible before the count). The
+        # owner of this kv block gates its multimem.ld_reduce on this counter reaching the
+        # number of contributing ranks. Guarded -> default path is byte-for-byte unchanged.
+        if const_expr(mdKV_done is not None and mdGQA_local_done is None and K_or_V == "K"):
+            # One signal per (n_block, head_kv, batch) per rank. Dedupe across:
+            #  - warpgroups: only wg 0 (the dK epilogue runs on both),
+            #  - q-heads of a GQA group: only the last (head % R == R-1), so a kv-head
+            #    is signalled once after all R query heads' dK contributions are in.
+            last_qhead_in_group = (head_idx % self.qhead_per_kvhead) == (self.qhead_per_kvhead - 1)
+            _do_signal = leader_warp and wg_idx == 0 and last_qhead_in_group
+            if _do_signal:
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+                    # Flat 1D counter, explicit index -> avoids the multi-dim cute index
+                    # convention. release-ordered system-scope add: .release orders this
+                    # rank's dK/dV writes before the count is visible to the owner's
+                    # gating load (data-before-signal across GPUs).
+                    num_head_kv = cute.size(mdKV.shape[2])
+                    num_n_block = (
+                        self.dkv_done_nblk
+                        if const_expr(getattr(self, "dkv_done_nblk", None) is not None)
+                        else cute.ceil_div(cute.size(mdKV.shape[0]), self.tile_n)
+                    )
+                    flat = (batch_idx * num_head_kv + head_idx_kv) * num_n_block + n_block
+                    mc_base = getattr(self, "dkv_done_mc_ptr", None)
+                    if const_expr(mc_base is not None):
+                        # PUSH: multimem.red broadcasts +1 to every rank's counter copy
+                        # in-switch, so the owner polls its LOCAL counter (no per-poll
+                        # cross-rank multimem.ld_reduce -> frees NVLink BW for the reduce).
+                        mc = cute.make_ptr(
+                            Int32, Int64(mc_base), cute.AddressSpace.gmem, assumed_align=4
+                        )
+                        barrier.multimem_red_add_release_sys(mc + flat, 1)
+                    else:
+                        cute.arch.atomic_add(
+                            mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                        )
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
