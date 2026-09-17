@@ -49,6 +49,7 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.cp_sync_sm90 import load_kv_ready
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.mask import AttentionMask
@@ -3529,9 +3530,9 @@ class FlashAttentionForwardSm100:
                     sig_view = cute.make_tensor(
                         kv_signal.iterator + block, cute.make_layout((1,), stride=(1,))
                     )
-                ready = cute_dist.ld_bypass(sig_view)[0]
+                ready = load_kv_ready(sig_view.iterator)
                 while ready == 0:
-                    ready = cute_dist.ld_bypass(sig_view)[0]
+                    ready = load_kv_ready(sig_view.iterator)
                 # [.,1] signal-ready: producer's push for this block is now visible.
                 if const_expr(kv_trace is not None):
                     _trace_store_globaltimer(kv_trace, trace_row * 3 + 1)

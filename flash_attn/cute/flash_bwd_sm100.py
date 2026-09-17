@@ -7,7 +7,6 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils.distributed as cute_dist
 from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
@@ -39,6 +38,7 @@ from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.cp_sync_sm90 import load_kv_ready
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.flash_fwd_sm100 import (
     _prof_mark,
@@ -2388,9 +2388,9 @@ class FlashAttentionBackwardSm100:
                                         signal.iterator + offset,
                                         cute.make_layout((1,), stride=(1,)),
                                     )
-                                    ready = cute_dist.ld_bypass(sig_view)[0]
+                                    ready = load_kv_ready(sig_view.iterator)
                                     while ready == 0:
-                                        ready = cute_dist.ld_bypass(sig_view)[0]
+                                        ready = load_kv_ready(sig_view.iterator)
                         cute.arch.sync_warp()
                 if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                     assert should_load_Q and should_load_dO
