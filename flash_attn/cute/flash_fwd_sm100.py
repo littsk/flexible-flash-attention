@@ -49,7 +49,7 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.cp_sync_sm90 import load_kv_ready
+from flash_attn.cute.cp_sync_sm90 import fence_proxy_async_global, load_kv_ready
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.mask import AttentionMask
@@ -3539,6 +3539,8 @@ class FlashAttentionForwardSm100:
                 if const_expr(prof_buf is not None):
                     _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_KV_WAIT, _PROF_PHASE_END)
             cute.arch.sync_warp()
+            # Order acquired K/V visibility before asynchronous TMA loads.
+            fence_proxy_async_global()
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
         extra_tx_count = (
