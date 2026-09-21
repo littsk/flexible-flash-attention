@@ -579,6 +579,7 @@ class FlashAttentionBackwardSm100:
         mdGQA_finalize_state: Optional[cute.Tensor] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        prof_ptr: Int64 = Int64(0),
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -1151,6 +1152,7 @@ class FlashAttentionBackwardSm100:
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
+            prof_ptr,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1238,6 +1240,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        prof_ptr: Int64 = Int64(0),
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1245,11 +1248,8 @@ class FlashAttentionBackwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
-        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
-        # recording at compile time. 16 warps per CTA (reduce/compute/mma/load/relay/empty).
-        prof_buf = (
-            blocksparse_tensors.prof_buf if const_expr(blocksparse_tensors is not None) else None
-        )
+        # Warp-granular profiler base pointer. Zero disables recording.
+        prof_buf = prof_ptr
         prof_nw = 16
 
         # Prefetch tma descriptor
