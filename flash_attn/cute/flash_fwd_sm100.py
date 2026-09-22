@@ -131,20 +131,6 @@ _PROF_PHASE_END = 2
 
 
 @cute.jit
-def _cta_lifetime_mark(trace, signal, num_warps, phase):
-    if cute.arch.lane_idx() == 0:
-        offset = cute.size(signal.shape) * 3
-        idx = offset + (cute.arch.block_idx()[0] * num_warps + cute.arch.warp_idx()) * 3
-        trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
-        if const_expr(phase == 0):
-            trace[idx + 2] = Int64(_llvm.inline_asm(
-                _mlir_T.i64(), [],
-                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
-                has_side_effects=True, asm_dialect=0,
-            ))
-
-
-@cute.jit
 def _prof_mark(prof_ptr, num_warps, max_events, event_no, phase):
     """Record one warp-granular profiler event for the calling (block, warp)."""
     base = Int64(prof_ptr)
@@ -1096,9 +1082,6 @@ class FlashAttentionForwardSm100:
         prof_buf = prof_ptr
         prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
 
-        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
-            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 0)
-
         # Prefetch tma descriptor
         if warp_idx == 0:
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
@@ -1631,8 +1614,6 @@ class FlashAttentionForwardSm100:
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
-        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
-            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 1)
         return
 
     @cute.jit
