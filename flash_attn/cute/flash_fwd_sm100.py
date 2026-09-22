@@ -93,9 +93,9 @@ def _trace_store_globaltimer(trace, idx):
 
     First-touch semantics: the persistent scheduler re-loads each kv-block once per
     q-tile, but only the *first* visit can observe a real wait (later visits find the
-    signal already set). We therefore write only when the slot is still 0, so the trace
-    captures the genuine first-touch wait/ready/consume of each block rather than the
-    last (already-ready) re-load.
+    signal already set). The bypass load keeps the common nonzero path cheap; the CAS
+    resolves concurrent first visits so later warps cannot overwrite the winning
+    wait/ready/consume timestamp.
     """
     view = cute.make_tensor(trace.iterator + idx, cute.make_layout((1,), stride=(1,)))
     cur = cute_dist.ld_bypass(view)[0]
@@ -105,7 +105,7 @@ def _trace_store_globaltimer(trace, idx):
         _llvm.inline_asm(
             None,
             [ptr.toint().ir_value(), ts.ir_value()],
-            "st.global.u64 [$0], $1;",
+            "{ .reg .u64 old; atom.global.cas.b64 old, [$0], 0, $1; }",
             "l,l",
             has_side_effects=True,
             asm_dialect=0,
