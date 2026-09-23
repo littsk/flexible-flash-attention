@@ -12,6 +12,23 @@ from quack import layout_utils
 import flash_attn.cute.utils as utils
 
 
+def pack_gqa_head_major(tensor: cute.Tensor, group_size: int, head_axis: int) -> cute.Tensor:
+    """Fold adjacent heads into mode 0 with p = head_in_group * seqlen + q.
+
+    This is a view: Q/dO retain a nested, strided sequence mode, while the
+    contiguous per-head statistics and gradient buffers coalesce naturally.
+    """
+    shape = list(tensor.shape)
+    stride = list(tensor.stride)
+    shape[0] = (shape[0], group_size)
+    stride[0] = (stride[0], stride[head_axis])
+    shape[head_axis] = shape[head_axis] // group_size
+    stride[head_axis] = stride[head_axis] * group_size
+    layout = cute.make_layout(tuple(shape), stride=tuple(stride))
+    layout = cute.coalesce(layout, target_profile=tuple(1 for _ in shape))
+    return cute.make_tensor(tensor.iterator, layout)
+
+
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
     """Reshape a tensor to fold qhead_per_kvhead into the seqlen dimension (mode 0).
 

@@ -15,6 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
+from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
 
@@ -2018,6 +2019,13 @@ def _flash_attn_bwd(
     skip_dkv_postprocess: bool = False,
     paired_sparse_bwd: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
+    """Run attention backward, preserving the public Q/K/V gradient layouts.
+
+    Explicit pack_gqa=True enables head-major SM100 deterministic sparse GQA:
+    a KV CTA processes every head in the group and stores BF16 dK/dV directly.
+    This 1CTA path requires shared-head metadata and tile-aligned fixed Q length;
+    see README.md for the supported combinations. None/False keeps unpacked GQA.
+    """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2290,11 +2298,67 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
-    # pack_gqa backward not yet supported in bwd
-    pack_gqa = False
-    
+    # Backward packing is opt-in; preserve the historical default.
+    pack_gqa = bool(pack_gqa) and qhead_per_kvhead > 1
+    if pack_gqa:
+        if not (arch // 10 in (10, 11) and deterministic and use_block_sparsity):
+            raise ValueError("backward pack_gqa requires SM100/SM110 deterministic block sparsity")
+        if is_varlen or head_dim > 128 or head_dim_v > 128 or q.dtype != torch.bfloat16:
+            raise ValueError(
+                "backward pack_gqa requires fixed-length BF16 with head dimensions <= 128"
+            )
+        if use_2cta_instrs or paired_sparse_bwd:
+            raise ValueError("backward pack_gqa currently requires 1CTA (FA_DISABLE_2CTA=1)")
+        if causal or local or score_mod is not None or softcap != 0 or learnable_sink is not None:
+            raise ValueError(
+                "backward pack_gqa supports mask_mod; native causal/local, score_mod and sink are unsupported"
+            )
+        sparse_q_size = (
+            block_sparse_tensors.block_size[0]
+            if block_sparse_tensors.block_size
+            else m_block_size * q_subtile_factor
+        )
+        if seqlen_q % sparse_q_size != 0 or seqlen_q % m_block_size != 0:
+            raise ValueError(
+                "backward pack_gqa requires Q length divisible by its sparse Q block size and tile_m"
+            )
+        for name in (
+            "mask_block_cnt",
+            "mask_block_idx",
+            "full_block_cnt",
+            "full_block_idx",
+            "dq_write_order",
+            "dq_write_order_full",
+        ):
+            tensor = block_sparse_tensors._asdict()[name]
+            if tensor is not None and tensor.shape[1] != 1:
+                raise ValueError(
+                    f"backward pack_gqa requires shared-head metadata: {name}.shape[1] == 1"
+                )
+        if (
+            any(
+                t is not None
+                for t in (
+                    dk_accum_external,
+                    dv_accum_external,
+                    dkv_done_counter,
+                    dkv_done_mc_ptr,
+                    gqa_local_done_counter,
+                    gqa_local_expected,
+                    gqa_finalize_work_state,
+                    block_sparse_tensors.bwd_kv_order,
+                    block_sparse_tensors.bwd_work_map,
+                    block_sparse_tensors.bwd_original_active,
+                    block_sparse_tensors.prof_buf,
+                )
+            )
+            or skip_dkv_postprocess
+            or os.environ.get("FA_BWD_DKV_DONE", "0") == "1"
+        ):
+            raise ValueError(
+                "backward pack_gqa does not support external ring accumulators, work maps or completion counters"
+            )
+
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
             "softcap and score_mod/score_mod_bwd cannot be used together"
@@ -2364,7 +2428,7 @@ def _flash_attn_bwd(
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel and not pack_gqa
     if skip_dkv_postprocess and (
         not dKV_postprocess
         or dk_accum_external is None
@@ -2449,7 +2513,7 @@ def _flash_attn_bwd(
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1:
+    if deterministic and dKV_postprocess:
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
@@ -2744,6 +2808,11 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
 
+    if pack_gqa:
+        # Head-major TMA tiles require the inner sequence extent to be static.
+        # Specialize all view layouts and include their shape/stride in the key.
+        compile_key += (tuple((tuple(t.shape), t.stride()) for t in (q, k, v, dout, dq, dk, dv)),)
+
     if compile_key not in _flash_attn_bwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cute_aux_tensors = (
@@ -2769,6 +2838,16 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
+        if pack_gqa:
+            q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
+                from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True)
+                for t in (q, k, v, dout, dq, dk, dv)
+            ]
+            lse_log2_tensor, dpsum_tensor, dq_accum_tensor = [
+                from_dlpack(t.detach(), assumed_align=16, enable_tvm_ffi=True)
+                for t in (lse_log2, dpsum, dq_accum)
+            ]
+            dQ_semaphore_tensor = from_dlpack(dQ_semaphore, assumed_align=4, enable_tvm_ffi=True)
         dKV_done_tensor = to_cute_tensor(dKV_done.detach(), assumed_align=4) if dKV_done is not None else None
         gqa_local_done_tensor = (
             to_cute_tensor(gqa_local_done_counter.detach(), assumed_align=4)
@@ -2890,6 +2969,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    pack_gqa=pack_gqa,
                 )
 
         # Distributed CP push-signal: when a multicast pointer for the done-counter is given,
@@ -3605,6 +3685,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.pack_gqa_bwd = bool(pack_gqa) and deterministic and block_sparse_tensors_bwd is not None
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
@@ -3656,6 +3737,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size_left=ctx.window_size[0],
                 window_size_right=ctx.window_size[1],
                 deterministic=ctx.deterministic,
+                pack_gqa=ctx.pack_gqa_bwd,
                 score_mod=ctx.score_mod,
                 score_mod_bwd=ctx.score_mod_bwd,
                 mask_mod=ctx.mask_mod,

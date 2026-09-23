@@ -31,3 +31,44 @@ pip install -e "flash_attn/cute[dev]"       # CUDA 12.x
 pip install -e "flash_attn/cute[dev,cu13]"  # CUDA 13.x (e.g. B200)
 pytest tests/cute/
 ```
+
+## Deterministic block-sparse PackGQA backward
+
+The SM100/SM110 backward supports an opt-in head-major PackGQA path. One CTA
+owns a KV head and KV tile and processes every query head in its group without
+draining the Q pipeline. Q/dO use zero-copy views; dK/dV accumulate in FP32
+inside the CTA and are stored directly as BF16. The public tensor layouts
+remain unchanged. No global dKV accumulator or dKV postprocess is needed.
+
+Set `FA_DISABLE_2CTA=1` before importing the library. Call `_flash_attn_bwd`
+with `pack_gqa=True`, `deterministic=True`, `mask_mod`, and backward
+`block_sparse_tensors` containing `dq_write_order`, `dq_write_order_full`
+(when full blocks exist), and `spt`. Through `flash_attn_func`, explicitly set
+`pack_gqa=True`, `deterministic=True`, and supply both forward and backward
+sparse metadata. `pack_gqa=None` preserves the original unpacked backward.
+
+The initial path requires BF16, fixed-length Q/KV, head dimensions <=128,
+broadcast sparse head dimension (size 1), and Q length divisible by both the
+sparse Q block size and 128. Express causal/local masks through `mask_mod`.
+Native causal/local pruning, score modifications, learnable sinks, 2CTA,
+paired work maps, and external ring accumulators/completion counters are
+explicitly unsupported. K/V readiness signals retain their existing semantics.
+The Q sequence extent is static in the packed TMA layout, so shape/stride
+changes select a separate compiled variant.
+
+Deterministic means bitwise repeatability within a fixed kernel configuration;
+packed and unpacked dK/dV can differ numerically due to summation order.
+See the [design](../../design/deterministic_sparse_pack_gqa.md).
+
+```sh
+FA_DISABLE_2CTA=1 PYTHONPATH=. pytest -q tests/cute/test_pack_gqa_bwd.py
+FA_DISABLE_2CTA=1 PYTHONPATH=. python benchmarks/benchmark_sparse_pack_gqa_bwd.py \
+  --q 512 1024 --kv 8192 32768 65536 --output /tmp/pack-gqa-results.json
+```
+
+The benchmark fixes B=1, Hq=64, Hkv=8, D=128. It checks FP32-reference
+gradients and bitwise repeatability before timing. Total backward time uses
+CUDA events around an uninstrumented CUDA graph. Main-kernel time uses a
+separate graph with external CUDA event nodes immediately around the compiled
+backward kernel; preprocess/reset and postprocess still run for each invocation.
+It reports individual samples, median/min/max, source identity, and versions.
