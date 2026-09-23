@@ -1382,6 +1382,7 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     load_Kt=None,
     load_dOt=None,
     tma_copy_bytes_dO=0,
+    merge_q256_asc: cutlass.Constexpr = False,
 ):
     """Produce SM100 backward block-sparse Q/dO loads for 1CTA and non-hdim192 2CTA."""
     (
@@ -1395,15 +1396,27 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     )
     # 2 cta peels the first loop for Qt path; so we guard the whole block if loopcount == 0
     if loop_count > Int32(0):
-        first_m_block, _ = get_m_block_from_iter_bwd(
-            Int32(0),
-            curr_q_cnt,
-            curr_q_idx,
-            curr_full_cnt,
-            curr_full_idx,
-            q_subtile_factor=q_subtile_factor,
-            m_block_max=m_block_max,
-        )
+        q_cursor = Int32(0)
+        full_cursor = Int32(0)
+        if const_expr(merge_q256_asc):
+            assert curr_full_idx is not None
+            first_m_block, _, _, q_cursor, full_cursor = (
+                get_m_block_from_merge_q256_asc_bwd(
+                    Int32(0), curr_q_cnt, curr_q_idx, curr_full_cnt,
+                    curr_full_idx, q_cursor, full_cursor,
+                    q_subtile_factor=q_subtile_factor,
+                )
+            )
+        else:
+            first_m_block, _ = get_m_block_from_iter_bwd(
+                Int32(0),
+                curr_q_cnt,
+                curr_q_idx,
+                curr_full_cnt,
+                curr_full_idx,
+                q_subtile_factor=q_subtile_factor,
+                m_block_max=m_block_max,
+            )
         # with q_subtile > 1 we need to guard against fully OOB regions
         if m_block_max > 0:
             first_m_block = cutlass.min(first_m_block, m_block_max - 1)
@@ -1455,15 +1468,25 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
 
         prev_m_block = first_m_block
         for iter_idx in cutlass.range(Int32(1), loop_count, unroll=1):
-            m_block, _ = get_m_block_from_iter_bwd(
-                iter_idx,
-                curr_q_cnt,
-                curr_q_idx,
-                curr_full_cnt,
-                curr_full_idx,
-                q_subtile_factor=q_subtile_factor,
-                m_block_max=m_block_max,
-            )
+            if const_expr(merge_q256_asc):
+                assert curr_full_idx is not None
+                m_block, _, _, q_cursor, full_cursor = (
+                    get_m_block_from_merge_q256_asc_bwd(
+                        iter_idx, curr_q_cnt, curr_q_idx, curr_full_cnt,
+                        curr_full_idx, q_cursor, full_cursor,
+                        q_subtile_factor=q_subtile_factor,
+                    )
+                )
+            else:
+                m_block, _ = get_m_block_from_iter_bwd(
+                    iter_idx,
+                    curr_q_cnt,
+                    curr_q_idx,
+                    curr_full_cnt,
+                    curr_full_idx,
+                    q_subtile_factor=q_subtile_factor,
+                    m_block_max=m_block_max,
+                )
             if m_block_max > 0:
                 m_block = cutlass.min(m_block, m_block_max - 1)
             if const_expr(should_load_Q):
@@ -1775,6 +1798,57 @@ def get_m_block_from_iter_bwd(
         sparse_m_block = curr_q_idx[sparse_iter_idx]
 
     return sparse_m_block * q_subtile_factor + subtile_offset, is_full_block
+
+
+@cute.jit
+def get_m_block_from_merge_q256_asc_bwd(
+    iter_idx,
+    curr_q_cnt,
+    curr_q_idx: cute.Tensor,
+    curr_full_cnt,
+    curr_full_idx: cute.Tensor,
+    q_cursor: Int32,
+    full_cursor: Int32,
+    q_subtile_factor: cutlass.Constexpr = 2,
+):
+    """Select the next physical Q128 tile in ascending Q256 order.
+
+    Partial and full CSR rows are separately sorted and disjoint. The two
+    Q128 subtiles of one Q256 share a CSR entry, so advance the selected
+    cursor only after subtile 1. All kernel roles must call this once per
+    physical iteration, including the producer's peeled first iteration.
+    Returns (m_block, is_full, selected_csr_index, next_q_cursor,
+    next_full_cursor). The selected CSR index also addresses the original
+    partial/full dQ ticket array; it is not iter_idx // q_subtile_factor.
+    """
+    assert q_subtile_factor == 2
+    subtile_offset = iter_idx % q_subtile_factor
+    is_full = False
+    if q_cursor >= curr_q_cnt:
+        is_full = True
+    elif full_cursor < curr_full_cnt:
+        is_full = curr_full_idx[full_cursor] < curr_q_idx[q_cursor]
+
+    # CUTE needs branch-carried values declared before the dynamic branch.
+    csr_index = Int32(0)
+    sparse_m_block = Int32(0)
+    if is_full:
+        csr_index = full_cursor
+        sparse_m_block = curr_full_idx[full_cursor]
+        if subtile_offset == q_subtile_factor - 1:
+            full_cursor += 1
+    else:
+        csr_index = q_cursor
+        sparse_m_block = curr_q_idx[q_cursor]
+        if subtile_offset == q_subtile_factor - 1:
+            q_cursor += 1
+    return (
+        sparse_m_block * q_subtile_factor + subtile_offset,
+        is_full,
+        csr_index,
+        q_cursor,
+        full_cursor,
+    )
 
 
 @cute.jit

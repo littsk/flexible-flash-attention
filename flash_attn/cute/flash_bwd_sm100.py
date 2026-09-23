@@ -50,6 +50,7 @@ from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,
+    get_m_block_from_merge_q256_asc_bwd,
     produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192,
     produce_block_sparse_q_loads_bwd_sm100_default,
 )
@@ -1055,6 +1056,38 @@ class FlashAttentionBackwardSm100:
             seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        # Enable Q256-ascending partial/full traversal only for the measured
+        # deterministic 1CTA D128 Q256/KV128 sparse path. Every other
+        # specialization keeps the original partial-then-full traversal.
+        paired_csr_and_tickets = False
+        if const_expr(self.use_block_sparsity):
+            assert blocksparse_tensors is not None
+            paired_csr_and_tickets = (
+                blocksparse_tensors.full_block_cnt is not None
+                and blocksparse_tensors.full_block_idx is not None
+                and blocksparse_tensors.dq_write_order is not None
+                and blocksparse_tensors.dq_write_order_full is not None
+            )
+        target_shape = (
+            (self.head_dim == 128)
+            & (self.head_dim_v == 128)
+            & (self.tile_m == 128)
+            & (self.tile_n == 128)
+            & (self.q_subtile_factor == 2)
+            & (self.kv_subtile_factor == 1)
+        )
+        target_mode = (
+            self.deterministic
+            & (not self.use_2cta_instrs)
+            & (not self.spt)
+            & (not self.is_varlen_q)
+            & (not self.is_varlen_k)
+            & (not self.is_local)
+            & (not self.is_causal)
+        )
+        self.merge_q256_asc = cutlass.const_expr(
+            self.use_block_sparsity & paired_csr_and_tickets & target_shape & target_mode
+        )
         if const_expr(self.use_block_sparsity and self.use_2cta_instrs):
             # Generic sparse 2CTA uses one coarse CSR column per cluster. The
             # paired CP path instead supplies mirrored CSR rows plus a cluster work map.
@@ -2473,6 +2506,7 @@ class FlashAttentionBackwardSm100:
                         load_Kt=load_Kt,
                         load_dOt=load_dOt,
                         tma_copy_bytes_dO=self.tma_copy_bytes["dO"],
+                        merge_q256_asc=self.merge_q256_asc,
                     )
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -3397,20 +3431,32 @@ class FlashAttentionBackwardSm100:
             # Mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
             # from Q_IDX/FULL_Q_IDX tensors. Dense: iterate m_block_min..m_block_max directly.
+            q_cursor = Int32(0)
+            full_cursor = Int32(0)
             for iter_idx in cutlass.range(loop_count, unroll=1):
                 m_block = m_block_min + iter_idx
                 m_block_oob = False
                 is_full_block = False
                 if const_expr(self.use_block_sparsity):
-                    m_block, is_full_block = get_m_block_from_iter_bwd(
-                        iter_idx,
-                        curr_q_cnt,
-                        curr_q_idx,
-                        curr_full_cnt,
-                        curr_full_idx,
-                        q_subtile_factor=self.q_subtile_factor,
-                        m_block_max=m_block_max,
-                    )
+                    if const_expr(self.merge_q256_asc):
+                        assert curr_full_idx is not None
+                        m_block, is_full_block, _, q_cursor, full_cursor = (
+                            get_m_block_from_merge_q256_asc_bwd(
+                                iter_idx, curr_q_cnt, curr_q_idx, curr_full_cnt,
+                                curr_full_idx, q_cursor, full_cursor,
+                                q_subtile_factor=self.q_subtile_factor,
+                            )
+                        )
+                    else:
+                        m_block, is_full_block = get_m_block_from_iter_bwd(
+                            iter_idx,
+                            curr_q_cnt,
+                            curr_q_idx,
+                            curr_full_cnt,
+                            curr_full_idx,
+                            q_subtile_factor=self.q_subtile_factor,
+                            m_block_max=m_block_max,
+                        )
                     m_block_oob = m_block >= m_block_max
                 # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
@@ -3984,6 +4030,23 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             delay_semaphore_release = not self.tile_hdim == 192 and not self.use_block_sparsity
+            defer_sparse_release = (
+                self.deterministic
+                & self.use_block_sparsity
+                & (self.head_dim == 128)
+                & (self.head_dim_v == 128)
+                & (self.tile_m == 128)
+                & (self.tile_n == 128)
+                & (self.q_subtile_factor == 2)
+                & (self.kv_subtile_factor == 1)
+                & (not self.use_2cta_instrs)
+                & (not self.spt)
+                & (not self.is_varlen_q)
+                & (not self.is_varlen_k)
+                & (not self.is_local)
+                & (not self.is_causal)
+            )
+            pending_q = Int32(-1)
 
             dq_sem_release_inc = Int32(1)
             if const_expr(
@@ -4048,19 +4111,34 @@ class FlashAttentionBackwardSm100:
             # dQacc_reduce mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
             # from Q_IDX/FULL_Q_IDX tensors. Dense: iterate m_block_min..m_block_max directly.
+            q_cursor = Int32(0)
+            full_cursor = Int32(0)
             for iter_idx in cutlass.range(loop_count, unroll=1):
                 m_block = m_block_min + iter_idx
                 m_block_oob_upper = False
+                is_full_block = False
+                selected_csr_index = Int32(0)
                 if const_expr(self.use_block_sparsity):
-                    m_block, _ = get_m_block_from_iter_bwd(
-                        iter_idx,
-                        curr_q_cnt,
-                        curr_q_idx,
-                        curr_full_cnt,
-                        curr_full_idx,
-                        q_subtile_factor=self.q_subtile_factor,
-                        m_block_max=m_block_max,
-                    )
+                    if const_expr(self.merge_q256_asc):
+                        assert curr_full_idx is not None
+                        (
+                            m_block, is_full_block, selected_csr_index,
+                            q_cursor, full_cursor,
+                        ) = get_m_block_from_merge_q256_asc_bwd(
+                            iter_idx, curr_q_cnt, curr_q_idx, curr_full_cnt,
+                            curr_full_idx, q_cursor, full_cursor,
+                            q_subtile_factor=self.q_subtile_factor,
+                        )
+                    else:
+                        m_block, _ = get_m_block_from_iter_bwd(
+                            iter_idx,
+                            curr_q_cnt,
+                            curr_q_idx,
+                            curr_full_cnt,
+                            curr_full_idx,
+                            q_subtile_factor=self.q_subtile_factor,
+                            m_block_max=m_block_max,
+                        )
                     m_block_oob_upper = m_block >= m_block_max
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
                 # TMEM -> RMEM
@@ -4071,6 +4149,21 @@ class FlashAttentionBackwardSm100:
                 with cute.arch.elect_one():
                     pipeline_dQ.consumer_release(dQ_consumer_state)
                 dQ_consumer_state.advance()
+
+                if const_expr(defer_sparse_release):
+                    if pending_q >= 0:
+                        # Hide the previous write behind this TMEM load, but
+                        # publish it before waiting for this Q's predecessor.
+                        if is_tma_warp:
+                            cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        self.reduce_sync_barrier.arrive_and_wait()
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[pending_q, None].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            dq_sem_release_inc,
+                        )
+                        pending_q = Int32(-1)
 
                 if m_block_max > 0:
                     m_block = cutlass.min(m_block, m_block_max - 1)
@@ -4092,17 +4185,29 @@ class FlashAttentionBackwardSm100:
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if not m_block_oob_upper:
-                            lock_value = self._dq_semaphore_lock_value(
-                                iter_idx,
-                                curr_q_cnt,
-                                curr_dq_write_order,
-                                curr_dq_write_order_full,
-                                blocksparse_tensors,
-                                block_info,
-                                seqlen,
-                                m_block,
-                                n_block_cta_group,
-                            )
+                            lock_value = Int32(0)
+                            if const_expr(self.merge_q256_asc):
+                                # The original ticket arrays remain indexed by
+                                # their own CSR domains. Merged position is not
+                                # a partial/full CSR index.
+                                assert curr_dq_write_order is not None
+                                assert curr_dq_write_order_full is not None
+                                if is_full_block:
+                                    lock_value = curr_dq_write_order_full[selected_csr_index]
+                                else:
+                                    lock_value = curr_dq_write_order[selected_csr_index]
+                            else:
+                                lock_value = self._dq_semaphore_lock_value(
+                                    iter_idx,
+                                    curr_q_cnt,
+                                    curr_dq_write_order,
+                                    curr_dq_write_order_full,
+                                    blocksparse_tensors,
+                                    block_info,
+                                    seqlen,
+                                    m_block,
+                                    n_block_cta_group,
+                                )
                             barrier.wait_eq(
                                 mdQ_semaphore_cur[(m_block, None)].iterator,
                                 tidx,
@@ -4145,7 +4250,9 @@ class FlashAttentionBackwardSm100:
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(self.deterministic and not delay_semaphore_release):
+                if const_expr(
+                    self.deterministic and not delay_semaphore_release and not defer_sparse_release
+                ):
                     if const_expr(self.sdQaccum_stage > 1 and not self.tile_hdim == 192):
                         if is_tma_warp and not m_block_oob_upper:
                             cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -4158,11 +4265,23 @@ class FlashAttentionBackwardSm100:
                             dq_sem_release_inc,
                         )
 
+                if const_expr(defer_sparse_release):
+                    if not m_block_oob_upper:
+                        pending_q = m_block
+
             if process_tile:
                 if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
+                if const_expr(defer_sparse_release):
+                    if pending_q >= 0:
+                        barrier.arrive_inc(
+                            mdQ_semaphore_cur[pending_q, None].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            dq_sem_release_inc,
+                        )
                 if const_expr(self.deterministic and delay_semaphore_release):
                     barrier.arrive_inc(
                         mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
