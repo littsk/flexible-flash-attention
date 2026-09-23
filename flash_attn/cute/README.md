@@ -50,15 +50,24 @@ sparse metadata. `pack_gqa=None` preserves the original unpacked backward.
 The initial path requires BF16, fixed-length Q/KV, head dimensions <=128,
 broadcast sparse head dimension (size 1), and Q length divisible by both the
 sparse Q block size and 128. Express causal/local masks through `mask_mod`.
-Native causal/local pruning, score modifications, learnable sinks, 2CTA,
-paired work maps, and external ring accumulators/completion counters are
-explicitly unsupported. K/V readiness signals retain their existing semantics.
+Native causal/local pruning, score modifications, learnable sinks, generic 2CTA,
+and external accumulators/completion counters are explicitly unsupported. K/V readiness signals retain their existing semantics.
 The Q sequence extent is static in the packed TMA layout, so shape/stride
 changes select a separate compiled variant.
 
+For paired 2CTA, set `FA_DISABLE_2CTA=0` and call `_flash_attn_bwd` with both
+`paired_sparse_bwd=True` and `pack_gqa=True`. The pair planner must contract
+its CSR/ticket heads to Hkv and keep one work-map row per KV-head/pair, retaining
+the original Hq-indexed visibility bits for `mask_mod`. MegaAttention provides
+`prepare_paired_bwd_mask(..., pack_gqa=True)` for this preparation. This path
+requires D128 and sparse blocks `(256,128)`. Its two CTAs jointly traverse all
+G query heads and directly store BF16 dK/dV; no external FP32 buffer is needed.
+Odd-K mates are metadata-only and must never issue output stores.
+
 Deterministic means bitwise repeatability within a fixed kernel configuration;
 packed and unpacked dK/dV can differ numerically due to summation order.
-See the [design](../../design/deterministic_sparse_pack_gqa.md).
+See the [design](../../design/deterministic_sparse_pack_gqa.md) and
+[paired 2CTA validation and CP-dispatch results](../../reports/paired_sparse_pack_gqa_gb200.md).
 
 ```sh
 FA_DISABLE_2CTA=1 PYTHONPATH=. pytest -q tests/cute/test_pack_gqa_bwd.py

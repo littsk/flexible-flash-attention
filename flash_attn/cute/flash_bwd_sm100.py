@@ -866,7 +866,7 @@ class FlashAttentionBackwardSm100:
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
-            qhead_per_kvhead_packgqa=1,  # pack_gqa disabled for bwd
+            qhead_per_kvhead_packgqa=1,  # mQ already exposes the packed head count
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
@@ -4556,7 +4556,11 @@ class FlashAttentionBackwardSm100:
             # SMEM -> GMEM
             if leader_warp:
                 if const_expr(not self.dKV_postprocess):
-                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                    if const_expr(self.use_2cta_instrs and self.use_block_sparsity):
+                        if n_block * self.tile_n < seqlen.seqlen_k:
+                            cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                    else:
+                        cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
                 else:
                     with cute.arch.elect_one():
                         if const_expr(self.use_2cta_instrs and self.use_block_sparsity):

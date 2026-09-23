@@ -97,3 +97,27 @@ Implemented and validated on GB200 (SM100). The head-major TMA view specializes
 sequence extents and input/output strides in the compilation cache. See the
 [validation and performance report](../reports/deterministic_sparse_pack_gqa_gb200.md)
 for the measured 12-case matrix, correctness coverage, and remaining limits.
+
+## Paired 2CTA extension
+
+The paired path retains the production mirrored union CSR, original visibility
+bitset and pair-ordered dQ tickets. Contract each KV-head group's work map to
+one cluster: keep rows whose Q head is divisible by G and divide that head by G.
+Do not take every G-th row: local-phase scheduling need not place group heads
+next to one another. CSR and ticket heads contract from Hq to Hkv only after
+checking equality within each group. Original visibility bits remain Hq-indexed
+because mask callbacks receive the original Q head.
+
+Both CTAs traverse the identical G-times-longer head-major Q loop. Each owns
+its original 128-token KV half; their existing cross-CTA dS exchange and split
+dQ reduction remain unchanged. Paired dQ tickets advance once per cluster,
+with independent state for each original Q head. The contracted work ordering
+must preserve every original head's KV-pair order.
+
+Output is direct BF16 dK/dV, with no external FP32 accumulator, dKV
+postprocess, or completion-counter extension. This stage covers the compute
+kernel and CP-dispatch replay only; communication integration is outside scope.
+
+Validation covers shared-head partial/full masks, disjoint pair neighbors,
+odd-K padding, inactive halves, deterministic replay, and the same CP128/256
+production-dispatch benchmark with paired pack disabled/enabled.

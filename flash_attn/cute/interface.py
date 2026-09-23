@@ -2022,8 +2022,9 @@ def _flash_attn_bwd(
     """Run attention backward, preserving the public Q/K/V gradient layouts.
 
     Explicit pack_gqa=True enables head-major SM100 deterministic sparse GQA:
-    a KV CTA processes every head in the group and stores BF16 dK/dV directly.
-    This 1CTA path requires shared-head metadata and tile-aligned fixed Q length;
+    a KV CTA or paired 2CTA cluster processes all heads and stores BF16 dK/dV.
+    Paired mode requires KV-head-contracted work/CSR/tickets; both modes require
+    shared masks and tile-aligned fixed Q length;
     see README.md for the supported combinations. None/False keeps unpacked GQA.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
@@ -2307,8 +2308,12 @@ def _flash_attn_bwd(
             raise ValueError(
                 "backward pack_gqa requires fixed-length BF16 with head dimensions <= 128"
             )
-        if use_2cta_instrs or paired_sparse_bwd:
-            raise ValueError("backward pack_gqa currently requires 1CTA (FA_DISABLE_2CTA=1)")
+        if use_2cta_instrs and not paired_sparse_bwd:
+            raise ValueError("2CTA backward pack_gqa requires prepared paired sparse metadata")
+        if paired_sparse_bwd and block_sparse_tensors.bwd_work_map.shape != (
+            batch_size * num_head_kv * ((num_n_blocks + 1) // 2), 3
+        ):
+            raise ValueError("paired backward pack_gqa requires one work-map row per KV-head/pair")
         if causal or local or score_mod is not None or softcap != 0 or learnable_sink is not None:
             raise ValueError(
                 "backward pack_gqa supports mask_mod; native causal/local, score_mod and sink are unsupported"
@@ -2331,9 +2336,9 @@ def _flash_attn_bwd(
             "dq_write_order_full",
         ):
             tensor = block_sparse_tensors._asdict()[name]
-            if tensor is not None and tensor.shape[1] != 1:
+            if tensor is not None and tensor.shape[1] not in ((1, num_head_kv) if paired_sparse_bwd else (1,)):
                 raise ValueError(
-                    f"backward pack_gqa requires shared-head metadata: {name}.shape[1] == 1"
+                    f"backward pack_gqa requires shared-head metadata or KV-head contracted metadata: {name}"
                 )
         if (
             any(
@@ -2346,9 +2351,9 @@ def _flash_attn_bwd(
                     gqa_local_done_counter,
                     gqa_local_expected,
                     gqa_finalize_work_state,
-                    block_sparse_tensors.bwd_kv_order,
-                    block_sparse_tensors.bwd_work_map,
-                    block_sparse_tensors.bwd_original_active,
+                    block_sparse_tensors.bwd_kv_order if not paired_sparse_bwd else None,
+                    block_sparse_tensors.bwd_work_map if not paired_sparse_bwd else None,
+                    block_sparse_tensors.bwd_original_active if not paired_sparse_bwd else None,
                     block_sparse_tensors.prof_buf,
                 )
             )
@@ -2356,7 +2361,7 @@ def _flash_attn_bwd(
             or os.environ.get("FA_BWD_DKV_DONE", "0") == "1"
         ):
             raise ValueError(
-                "backward pack_gqa does not support external ring accumulators, work maps or completion counters"
+                "backward pack_gqa does not support external ring accumulators, completion counters or unpaired work maps"
             )
 
     if softcap != 0.0:
@@ -2632,7 +2637,7 @@ def _flash_attn_bwd(
         ) = normalize_block_sparse_config_bwd(
             block_sparse_tensors,
             batch_size=batch_size,
-            num_head=num_head,
+            num_head=num_head_kv if pack_gqa else num_head,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k_rounded if paired_sparse_bwd else seqlen_k,
             block_size=(m_block_size, n_block_size),
