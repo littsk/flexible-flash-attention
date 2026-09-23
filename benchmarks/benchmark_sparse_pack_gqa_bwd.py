@@ -1,6 +1,6 @@
 """Compare deterministic native PackGQA and unpacked sparse backward on GB200.
 
-FA_DISABLE_2CTA=1 PYTHONPATH=. python benchmarks/benchmark_sparse_pack_gqa_bwd.py \
+PYTHONPATH=. python benchmarks/benchmark_sparse_pack_gqa_bwd.py \
     --output /tmp/pack-gqa-benchmark.json
 """
 
@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -17,10 +18,6 @@ from unittest.mock import patch
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests" / "cute"))
-from pack_gqa_utils import check_gradients, make_case, reference_gradients
-
-from flash_attn.cute import utils
-from flash_attn.cute.interface import _flash_attn_bwd
 
 
 def capture(case, pack: bool, calls: int) -> torch.cuda.CUDAGraph:
@@ -46,14 +43,20 @@ def time_graph(graph: torch.cuda.CUDAGraph, calls: int) -> float:
     return start.elapsed_time(end) * 1000 / calls
 
 
-def main_kernel_times(case, pack: bool, calls: int) -> list[float]:
+def main_kernel_times(
+    case, pack: bool, calls: int, outputs: tuple[torch.Tensor, ...]
+) -> list[float]:
     """External CUDA event nodes bracket only the compiled main kernel.
 
     The normal graph used for total timing contains no instrumentation. Keep
     preprocess/reset and postprocess in this separate graph so replay resets
-    all deterministic semaphores before each measured invocation.
+    all deterministic semaphores before each measured invocation. Reuse the
+    total-timing graph's output buffers to match its memory access pattern.
     """
+    from flash_attn.cute.interface import _flash_attn_bwd
+
     events = []
+    kwargs = {"dq": outputs[0], "dk": outputs[1], "dv": outputs[2]}
 
     def instrument(kernel):
         def measured(*args):
@@ -75,7 +78,7 @@ def main_kernel_times(case, pack: bool, calls: int) -> list[float]:
         torch.cuda.graph(graph),
     ):
         for _ in range(calls):
-            case.backward(pack)
+            case.backward(pack, **kwargs)
     if len(events) != calls:
         raise RuntimeError(
             f"Expected {calls} main backward launches, got {len(events)}"
@@ -107,15 +110,31 @@ def main() -> None:
         choices=["dense", "sparse", "mixed"],
         default=["dense", "mixed"],
     )
+    parser.add_argument(
+        "--cta-group-size",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="CTA group size for both variants (default: paired 2CTA)",
+    )
     parser.add_argument("--samples", type=int, default=9)
     parser.add_argument("--calls", type=int, default=10)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.samples < 3 or args.calls < 1:
         parser.error("at least 3 samples and 1 call are required")
+    if any(q <= 0 or q % 256 for q in args.q) or any(k <= 0 for k in args.kv):
+        parser.error(
+            "Q lengths must be positive multiples of 256 and KV lengths positive"
+        )
+    if args.cta_group_size == 2 and any(k % 128 for k in args.kv):
+        parser.error("paired 2CTA requires KV lengths divisible by 128")
+    # FA4 caches this setting at import; select it before loading the helpers.
+    os.environ["FA_DISABLE_2CTA"] = "1" if args.cta_group_size == 1 else "0"
+    from pack_gqa_utils import check_gradients, make_case, reference_gradients
+
     if torch.cuda.get_device_capability()[0] not in (10, 11):
         raise RuntimeError("SM100/SM110 is required")
-    utils._fa_disable_2cta_enabled = True
     repo = Path(__file__).resolve().parents[1]
     diff = subprocess.check_output(["git", "diff", "HEAD"], cwd=repo)
     props = torch.cuda.get_device_properties(0)
@@ -139,7 +158,8 @@ def main() -> None:
         "dim": 128,
         "dtype": "bfloat16",
         "deterministic": True,
-        "cta_mode": "1CTA",
+        "cta_mode": "paired 2CTA" if args.cta_group_size == 2 else "1CTA",
+        "cta_group_size": args.cta_group_size,
         "calls_per_graph": args.calls,
         "samples": args.samples,
         "main_kernel_method": "external CUDA event nodes bracketing the compiled main kernel in a separate graph",
@@ -151,7 +171,9 @@ def main() -> None:
         for sk in args.kv:
             for pattern in args.patterns:
                 print(f"Q={sq} KV={sk} {pattern}: validating", flush=True)
-                case = make_case(sq, sk, pattern=pattern)
+                case = make_case(
+                    sq, sk, pattern=pattern, cta_group_size=args.cta_group_size
+                )
                 ref = reference_gradients(case)
                 errors = {}
                 for pack in (False, True):
@@ -175,15 +197,22 @@ def main() -> None:
                     for pack in order:
                         totals[pack].append(time_graph(graphs[pack], args.calls))
                 for pack in (False, True):
-                    kernels[pack] = main_kernel_times(case, pack, args.calls)
+                    kernels[pack] = main_kernel_times(
+                        case, pack, args.calls, graphs[pack].outputs
+                    )
                 counts = case.bwd_sparse.mask_block_cnt + case.bwd_sparse.full_block_cnt
+                original_counts = (
+                    case.fwd_sparse.mask_block_cnt + case.fwd_sparse.full_block_cnt
+                )
                 row = {
                     "q": sq,
                     "kv": sk,
                     "pattern": pattern,
                     "correctness_max_abs": errors,
                     "repeat_bitwise": True,
-                    "block_density": counts.sum().item()
+                    "block_density": original_counts.sum().item()
+                    / (original_counts.numel() * ((sk + 127) // 128)),
+                    "executed_block_density": counts.sum().item()
                     / (counts.numel() * (sq // 256)),
                     "unpacked_q_loop_min": int(counts.min()) * 2,
                     "unpacked_q_loop_max": int(counts.max()) * 2,

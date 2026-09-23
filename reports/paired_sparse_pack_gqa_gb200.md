@@ -9,8 +9,8 @@ The caller supplies contracted paired CSR/tickets/work maps as described in
 [the design](../design/deterministic_sparse_pack_gqa.md). Original visibility
 bits retain Hq indexing. MegaAttention's integration prepares this metadata
 outside the timed region; its planner and dispatch benchmark live in that
-separate repository. The optional paired integration tests require that
-checkout's `prepare_paired_bwd_mask(..., pack_gqa=True)` implementation.
+separate repository. The standalone benchmark and paired tests now build their own equivalent
+synthetic pair fixtures and do not require a MegaAttention checkout.
 
 ## Measurement
 
@@ -66,3 +66,24 @@ The tested kernel sources were copied byte-for-byte into this checkout:
 The odd-K fix prevents the metadata-only mate from issuing BF16 output stores
 while preserving cluster synchronization. Cold/repeated numerical probes,
 a neutral perturbation control and generated SASS inspection verified the fix.
+
+
+## Standalone benchmark extension
+
+`benchmarks/benchmark_sparse_pack_gqa_bwd.py` now defaults to paired 2CTA;
+`--cta-group-size 1` explicitly selects the original 1CTA comparison. The CLI
+sets the upstream environment option before importing FA4. Synthetic fixtures
+use ascending pair/head order, not MegaAttention's CP-dispatch work ordering.
+
+Validated on GB200 after the extension:
+
+- All 12 default shapes/patterns passed independent FP32 gradient and bitwise
+  eager repeat checks, and produced main/total CUDA graph timings. The two
+  Q512/KV8192 smoke cases used 3 samples and 2 calls/graph; the remaining 10
+  cases used the defaults of 9 samples and 10 calls/graph.
+- Explicit 1CTA Q512/KV8192 mixed-mask smoke passed with 3 samples, 2 calls.
+- Four standalone paired tests passed for both unpacked and packed execution,
+  covering Sk128/384/1152, mixed/empty masks, odd-K and bitwise graph replay.
+- Ruff lint/format and git diff whitespace checks passed for the changed code.
+
+Original sparse density and executed pair-union density are reported separately.

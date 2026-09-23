@@ -127,61 +127,22 @@ def test_pack_gqa_mask_coordinates_and_optional_full_list(pattern):
     "sk,pattern", [(128, "mixed"), (384, "mixed"), (1152, "mixed"), (384, "empty")]
 )
 def test_paired_pack_gqa_outputs(monkeypatch, sk, pattern):
-    planner = pytest.importorskip("mega_attention.parallel.planner.paired_sparse_plan")
-    from flash_attn.cute.interface import _flash_attn_bwd
-
     monkeypatch.setattr(utils, "_fa_disable_2cta_enabled", False)
-    case = make_case(sq=512, sk=sk, hq=16, hkv=2, pattern=pattern)
-    nk = sk // 128
-    source = case.bwd_sparse._replace(
-        bwd_kv_order=torch.arange(nk, device="cuda", dtype=torch.int32),
-        # Head-major phase deliberately has nonadjacent GQA heads.
-        bwd_work_map=torch.tensor(
-            [(n, h, 0) for h in range(16) for n in range(nk)],
-            device="cuda",
-            dtype=torch.int32,
-        ),
-    )
-    mask, bits = planner.prepare_paired_bwd_mask(
-        source,
-        num_q_blocks=2,
-        num_q_heads=16,
-        num_kv_heads=2,
-        pack_gqa=True,
-    )
-    callback = planner.make_paired_mask_mod(case.cute_mask)
+    case = make_case(sq=512, sk=sk, hq=16, hkv=2, pattern=pattern, cta_group_size=2)
+    reference = reference_gradients(case)
     outputs = (
         torch.empty_like(case.q),
         torch.empty_like(case.k),
         torch.empty_like(case.v),
     )
-
-    def run():
-        return _flash_attn_bwd(
-            case.q,
-            case.k,
-            case.v,
-            case.out,
-            case.dout,
-            case.lse,
-            deterministic=True,
-            pack_gqa=True,
-            paired_sparse_bwd=True,
-            mask_mod=callback,
-            aux_tensors=[bits],
-            block_sparse_tensors=mask,
-            dq=outputs[0],
-            dk=outputs[1],
-            dv=outputs[2],
-        )
-
-    run()
-    reference = reference_gradients(case)
-    check_gradients(outputs, reference)
-    saved = tuple(x.clone() for x in outputs)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for _ in range(3):
-        graph.replay()
-        assert all(torch.equal(x, y) for x, y in zip(saved, outputs))
+    kwargs = {"dq": outputs[0], "dk": outputs[1], "dv": outputs[2]}
+    for pack in (False, True):
+        case.backward(pack, **kwargs)
+        check_gradients(outputs, reference)
+        saved = tuple(x.clone() for x in outputs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            case.backward(pack, **kwargs)
+        for _ in range(3):
+            graph.replay()
+            assert all(torch.equal(x, y) for x, y in zip(saved, outputs))

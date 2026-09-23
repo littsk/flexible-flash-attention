@@ -121,3 +121,19 @@ kernel and CP-dispatch replay only; communication integration is outside scope.
 Validation covers shared-head partial/full masks, disjoint pair neighbors,
 odd-K padding, inactive halves, deterministic replay, and the same CP128/256
 production-dispatch benchmark with paired pack disabled/enabled.
+
+
+## Standalone benchmark CTA selection
+
+`benchmark_sparse_pack_gqa_bwd.py` defaults to paired 2CTA; `--cta-group-size 1`
+retains the original comparison. Set the upstream environment flag before FA4
+imports rather than mutating the cached private setting after import.
+
+The shared synthetic fixture builds a coarse (Q256,KV256) mask with the original
+element predicate. Its transposed CSR and pair-level dQ tickets are mirrored to
+the two physical KV128 rows. CSR/tickets remain head-broadcast; work maps and
+original-active flags use Hq or Hkv for unpacked/packed execution. Pair-major,
+ascending-head order preserves dQ and dKV deterministic order. The predicate
+masks holes introduced by the pair union, so this fixture needs neither the
+MegaAttention planner nor its original-visibility callback wrapper. Report both
+original and executed tile density; pair padding must not inflate original density.

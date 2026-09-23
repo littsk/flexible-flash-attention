@@ -64,6 +64,7 @@ class BackwardCase:
     bwd_sparse: BlockSparseTensorsTorch
     torch_mask: Callable
     cute_mask: Callable
+    packed_bwd_sparse: BlockSparseTensorsTorch | None = None
 
     def backward(self, pack: bool, **kwargs) -> tuple[torch.Tensor, ...]:
         return _flash_attn_bwd(
@@ -76,7 +77,12 @@ class BackwardCase:
             deterministic=True,
             pack_gqa=pack,
             mask_mod=self.cute_mask,
-            block_sparse_tensors=self.bwd_sparse,
+            block_sparse_tensors=(
+                self.packed_bwd_sparse
+                if pack and self.packed_bwd_sparse is not None
+                else self.bwd_sparse
+            ),
+            paired_sparse_bwd=self.packed_bwd_sparse is not None,
             **kwargs,
         )
 
@@ -91,7 +97,16 @@ def make_case(
     batch: int = 1,
     spt: bool = False,
     kv_block: int = 128,
+    cta_group_size: int = 1,
 ) -> BackwardCase:
+    if cta_group_size not in (1, 2):
+        raise ValueError("cta_group_size must be 1 or 2")
+    if cta_group_size == 2 and (
+        sq % 256 or sk % 128 or dim != 128 or kv_block != 128 or spt
+    ):
+        raise ValueError(
+            "paired 2CTA requires aligned Q256/KV128, D128, KV block128 and spt=False"
+        )
     torch.manual_seed(2026)
     mask, mask_cute = make_masks(pattern, sq, sk)
     bm = create_block_mask(
@@ -115,6 +130,50 @@ def make_case(
         dq_write_order_full=full_order,
         spt=spt,
     )
+    packed_bwd = None
+    if cta_group_size == 2:
+        # A 256-token KV mask gives the exact pair union/full intersection.
+        # The original element predicate also masks newly introduced pair tiles.
+        paired_bm = create_block_mask(
+            mask, batch, 1, sq, sk, device="cuda", BLOCK_SIZE=(256, 256)
+        )
+        pair_order, pair_full_order = compute_dq_write_order_from_block_mask(
+            paired_bm, spt=False
+        )
+        pair_counts = paired_bm.q_num_blocks.repeat_interleave(2, dim=2)
+        physical_k = pair_counts.shape[2]
+        active = (bm.q_num_blocks + bm.full_q_num_blocks > 0).to(torch.int32)
+        active = torch.nn.functional.pad(active, (0, physical_k - sk // 128))
+        work = torch.tensor(
+            [
+                (n, h, b)
+                for b in range(batch)
+                for n in range(0, physical_k, 2)
+                for h in range(hq)
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        bwd = BlockSparseTensorsTorch(
+            pair_counts,
+            paired_bm.q_indices.repeat_interleave(2, dim=2),
+            paired_bm.full_q_num_blocks.repeat_interleave(2, dim=2),
+            paired_bm.full_q_indices.repeat_interleave(2, dim=2),
+            block_size=(256, 128),
+            dq_write_order=pair_order.repeat_interleave(2, dim=2),
+            dq_write_order_full=pair_full_order.repeat_interleave(2, dim=2),
+            spt=False,
+            bwd_kv_order=torch.arange(physical_k, dtype=torch.int32, device="cuda"),
+            bwd_work_map=work,
+            bwd_original_active=active.expand(batch, hq, physical_k).contiguous(),
+        )
+        group = hq // hkv
+        packed_work = work[work[:, 1] % group == 0].clone()
+        packed_work[:, 1] //= group
+        packed_bwd = bwd._replace(
+            bwd_work_map=packed_work,
+            bwd_original_active=active.expand(batch, hkv, physical_k).contiguous(),
+        )
     q = torch.randn(batch, sq, hq, dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, sk, hkv, dim, device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
@@ -128,7 +187,7 @@ def make_case(
         return_lse=True,
     )
     return BackwardCase(
-        q, k, v, out, lse, torch.randn_like(out), fwd, bwd, mask, mask_cute
+        q, k, v, out, lse, torch.randn_like(out), fwd, bwd, mask, mask_cute, packed_bwd
     )
 
 
