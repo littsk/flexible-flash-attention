@@ -1571,7 +1571,7 @@ def _flash_attn_fwd(
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-                compile_args.append(Int64(prof_ptr))
+                compile_args.append(Int64(prof_ptr) if prof_ptr else None)
             if use_dedicated_hd256_kernel:
                 compile_args.append(
                     Int32(host_max_seqlen_q)
@@ -1679,7 +1679,7 @@ def _flash_attn_fwd(
                 AuxData(aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-                call_args.append(Int64(prof_ptr))
+                call_args.append(Int64(prof_ptr) if prof_ptr else None)
             if use_dedicated_hd256_kernel:
                 call_args.append(
                     host_max_seqlen_q
@@ -3049,7 +3049,7 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
         ]
         if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-            compile_args.append(Int64(prof_ptr))
+            compile_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
         else:
@@ -3126,7 +3126,7 @@ def _flash_attn_bwd(
             else None,
         ]
         if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-            call_args.append(Int64(prof_ptr))
+            call_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
         else:

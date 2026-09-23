@@ -575,7 +575,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
-        prof_ptr: Int64 = Int64(0),
+        prof_ptr: Optional[Int64] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -1042,7 +1042,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor],
         descale_tensors: Optional[DescaleTensors],
         blocksparse_tensors: Optional[BlockSparseTensors],
-        prof_ptr: Int64,
+        prof_ptr: Optional[Int64],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1078,7 +1078,7 @@ class FlashAttentionForwardSm100:
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # Warp-granular profiler base pointer. Zero disables recording.
+        # None removes profiler calls from the compiled kernel.
         prof_buf = prof_ptr
         prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
 
@@ -1639,7 +1639,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
-        prof_ptr: Int64,
+        prof_ptr: Optional[Int64],
         tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE

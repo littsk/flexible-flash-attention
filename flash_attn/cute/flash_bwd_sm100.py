@@ -579,7 +579,7 @@ class FlashAttentionBackwardSm100:
         mdGQA_finalize_state: Optional[cute.Tensor] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        prof_ptr: Int64 = Int64(0),
+        prof_ptr: Optional[Int64] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -1240,7 +1240,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        prof_ptr: Int64 = Int64(0),
+        prof_ptr: Optional[Int64] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1248,7 +1248,7 @@ class FlashAttentionBackwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
-        # Warp-granular profiler base pointer. Zero disables recording.
+        # None removes profiler calls from the compiled kernel.
         prof_buf = prof_ptr
         prof_nw = 16
 
