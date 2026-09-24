@@ -4644,12 +4644,31 @@ class FlashAttentionBackwardSm100:
                                 scope="sys",
                             )
 
+        # Packed GQA owns the complete BF16 partial. Drain every issuing
+        # warpgroup's dV/dK stores before publishing one physical-tile arrival.
+        if const_expr(self.pack_gqa and mdKV_done is not None and K_or_V == "K"):
+            if leader_warp:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+            self.compute_sync_barrier.arrive_and_wait()
+            if leader_warp and wg_idx == 0 and local_head_active:
+                if n_block * self.tile_n < seqlen.seqlen_k:
+                    with cute.arch.elect_one():
+                        fence_proxy_async_global()
+                        num_head_kv = cute.size(mdKV.shape[2])
+                        flat = (batch_idx * num_head_kv + head_idx_kv) * self.dkv_done_nblk + n_block
+                        cute.arch.atomic_add(
+                            mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                        )
+
         # Per-block "done" signal for distributed CP backward reduce-scatter: after this
         # rank finishes dK for (n_block, head_kv, batch), bump a per-block counter (with
         # a system-scope release so the dK/dV writes are visible before the count). The
         # owner of this kv block gates its multimem.ld_reduce on this counter reaching the
         # number of contributing ranks. Guarded -> default path is byte-for-byte unchanged.
-        if const_expr(mdKV_done is not None and mdGQA_local_done is None and K_or_V == "K"):
+        if const_expr(not self.pack_gqa and mdKV_done is not None and mdGQA_local_done is None and K_or_V == "K"):
             # One signal per (n_block, head_kv, batch) per rank. Dedupe across:
             #  - warpgroups: only wg 0 (the dK epilogue runs on both),
             #  - q-heads of a GQA group: only the last (head % R == R-1), so a kv-head

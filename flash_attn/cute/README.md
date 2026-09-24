@@ -51,7 +51,8 @@ The initial path requires BF16, fixed-length Q/KV, head dimensions <=128,
 broadcast sparse head dimension (size 1), and Q length divisible by both the
 sparse Q block size and 128. Express causal/local masks through `mask_mod`.
 Native causal/local pruning, score modifications, learnable sinks, generic 2CTA,
-and external accumulators/completion counters are explicitly unsupported. K/V readiness signals retain their existing semantics.
+and external accumulators/Q-head finalizer counters are explicitly unsupported.
+The optional packed BF16 ready counter is described below. K/V readiness signals retain their existing semantics.
 The Q sequence extent is static in the packed TMA layout, so shape/stride
 changes select a separate compiled variant.
 
@@ -101,3 +102,12 @@ It reports individual samples, median/min/max, source identity, and versions.
 
 The [Q512/Q1024/Q2048 comparison](../../reports/paired_pack_gqa_q_sweep_gb200.md)
 reports paired pack/no-pack main-kernel and full-backward timings.
+
+
+Packed sparse backward optionally accepts `dkv_done_counter`: a caller-reset
+int32 `[B*Hkv*N]` or (B=1) `[Hkv,capacity]` buffer, N=ceil(Sk/128). An active
+physical tile increments its slot once after complete BF16 dK/dV stores;
+inactive and padded tiles leave it zero. Consumers wait with acquire semantics
+using original tile activity as expected (0/1). This signal is local readiness,
+not remote delivery; packed dK is already scaled. See
+[the producer-ready contract](../../design/deterministic_sparse_pack_gqa.md#packed-bf16-producer-ready-signal).

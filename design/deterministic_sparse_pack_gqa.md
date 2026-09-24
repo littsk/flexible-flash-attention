@@ -114,9 +114,9 @@ dQ reduction remain unchanged. Paired dQ tickets advance once per cluster,
 with independent state for each original Q head. The contracted work ordering
 must preserve every original head's KV-pair order.
 
-Output is direct BF16 dK/dV, with no external FP32 accumulator, dKV
-postprocess, or completion-counter extension. This stage covers the compute
-kernel and CP-dispatch replay only; communication integration is outside scope.
+The initial paired stage outputs direct BF16 dK/dV, without an external FP32
+accumulator or dKV postprocess. The producer-ready extension below adds the
+optional local completion signal; transport integration remains outside FA4.
 
 Validation covers shared-head partial/full masks, disjoint pair neighbors,
 odd-K padding, inactive halves, deterministic replay, and the same CP128/256
@@ -137,3 +137,36 @@ ascending-head order preserves dQ and dKV deterministic order. The predicate
 masks holes introduced by the pair union, so this fixture needs neither the
 MegaAttention planner nor its original-visibility callback wrapper. Report both
 original and executed tile density; pair padding must not inflate original density.
+
+
+## Packed BF16 producer-ready signal
+
+The packed 1CTA and paired 2CTA paths optionally accept `dkv_done_counter`.
+It is caller-owned contiguous CUDA int32: either `[B*Hkv*N]`, or `[Hkv,capacity]`
+for B=1 with capacity >= N, where N=ceil(Sk/128). The second layout preserves
+its physical head stride. Reset it to zero before every invocation/replay.
+
+One active physical KV tile publishes one system-release increment after its
+complete BF16 dV and scaled dK outputs are visible. All issuing compute
+warpgroups drain their bulk store groups with a full wait (not `.read`), then
+synchronize before the single publisher. No last-Q-head test is used: packed
+head indices already name KV heads. A paired CTA publishes only its own valid
+physical half; original-active metadata suppresses inactive halves. Empty CSR
+rows and the padded odd-K mate publish nothing. The consumer's expected array
+is the original per-tile activity (0/1), not the union CSR activity or G.
+An expected-zero consumer must synthesize zero or skip the contribution;
+it must not read the output before compute completion merely because no signal
+is expected. Counters describe local partial readiness, not remote delivery.
+
+Consumers acquire the counter and apply their required proxy fence before
+reading the caller's BF16 buffers. Communication can use a head-major strided
+BSHD output view directly. External FP32 accumulators, multicast completion,
+Q-head finalizer queues and `skip_dkv_postprocess` remain unsupported in packed
+mode. Omitting the counter preserves the compute-only specialization.
+
+Validate by running an independent, bounded polling consumer on another CUDA
+stream. Snapshot dK and dV immediately after acquire and compare bitwise against
+the final BF16 output, plus an independent FP32 reference. Cover both CTA modes,
+all KV heads, inactive/empty tiles, odd pairs, nontrivial counter head stride,
+head-major output views, resets, and CUDA Graph replay. A pre-published signal
+with poisoned output must be detected by the same consumer harness.

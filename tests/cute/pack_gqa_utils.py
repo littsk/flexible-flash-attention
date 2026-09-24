@@ -193,8 +193,9 @@ def make_case(
 
 def reference_gradients(
     case: BackwardCase,
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Independent FP32 PyTorch autograd, one KV group at a time to bound memory."""
+    """Independent native PyTorch autograd, one KV group at a time."""
     _b, sq, hq, d = case.q.shape
     sk, hkv = case.k.shape[1:3]
     group = hq // hkv
@@ -202,13 +203,18 @@ def reference_gradients(
     k_idx = torch.arange(sk, device=case.q.device)[None, :]
     valid = case.torch_mask(0, 0, q_idx, k_idx).expand(sq, sk)
     row_valid = valid.any(-1)
-    dq = torch.empty_like(case.q, dtype=torch.float32)
-    dk = torch.empty_like(case.k, dtype=torch.float32)
-    dv = torch.empty_like(case.v, dtype=torch.float32)
+    dq = torch.empty_like(case.q, dtype=dtype)
+    dk = torch.empty_like(case.k, dtype=dtype)
+    dv = torch.empty_like(case.v, dtype=dtype)
     for h in range(hkv):
-        q = case.q[:, :, h * group : (h + 1) * group].float().detach().requires_grad_()
-        k = case.k[:, :, h].float().detach().requires_grad_()
-        v = case.v[:, :, h].float().detach().requires_grad_()
+        q = (
+            case.q[:, :, h * group : (h + 1) * group]
+            .to(dtype)
+            .detach()
+            .requires_grad_()
+        )
+        k = case.k[:, :, h].to(dtype).detach().requires_grad_()
+        v = case.v[:, :, h].to(dtype).detach().requires_grad_()
         scores = torch.einsum("bqhd,bkd->bhqk", q, k) * d**-0.5
         scores = scores.masked_fill(~valid, -torch.inf)
         # Avoid undefined softmax gradients for all-masked rows.
@@ -216,7 +222,7 @@ def reference_gradients(
         p = scores.softmax(-1).masked_fill(~valid, 0.0)
         out = torch.einsum("bhqk,bkd->bqhd", p, v)
         grads = torch.autograd.grad(
-            out, (q, k, v), case.dout[:, :, h * group : (h + 1) * group].float()
+            out, (q, k, v), case.dout[:, :, h * group : (h + 1) * group].to(dtype)
         )
         dq[:, :, h * group : (h + 1) * group], dk[:, :, h], dv[:, :, h] = grads
     return dq, dk, dv

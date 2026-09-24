@@ -2180,7 +2180,8 @@ def _flash_attn_bwd(
         assert block_sparse_tensors.block_size == (256, 128)
         assert block_sparse_tensors.bwd_work_map is not None
         # Original active flags preserve arrivals for paired and odd-K work.
-        assert dkv_done_counter is None and dkv_done_mc_ptr is None
+        assert dkv_done_counter is None or pack_gqa
+        assert dkv_done_mc_ptr is None
         if gqa_local_done_counter is not None:
             assert block_sparse_tensors.bwd_original_active is not None
             assert q.shape[0] == 1 and q.shape[2] > k.shape[2]
@@ -2365,7 +2366,6 @@ def _flash_attn_bwd(
                 for t in (
                     dk_accum_external,
                     dv_accum_external,
-                    dkv_done_counter,
                     dkv_done_mc_ptr,
                     gqa_local_done_counter,
                     gqa_local_expected,
@@ -2382,6 +2382,25 @@ def _flash_attn_bwd(
             raise ValueError(
                 "backward pack_gqa does not support external ring accumulators, completion counters or unpaired work maps"
             )
+
+        if dkv_done_counter is not None:
+            if dkv_done_counter.ndim == 1:
+                _validate_tensor(
+                    dkv_done_counter, "dkv_done_counter",
+                    (batch_size * num_head_kv * num_n_blocks,), torch.int32, q.device,
+                )
+            elif (
+                dkv_done_counter.ndim != 2 or batch_size != 1
+                or dkv_done_counter.shape[0] != num_head_kv
+                or dkv_done_counter.shape[1] < num_n_blocks
+                or dkv_done_counter.dtype != torch.int32
+                or dkv_done_counter.device != q.device
+                or not dkv_done_counter.is_contiguous()
+            ):
+                raise ValueError(
+                    "packed dkv_done_counter must be contiguous int32 [B*Hkv*N] "
+                    "or [Hkv, capacity] with B=1 and capacity>=N"
+                )
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
