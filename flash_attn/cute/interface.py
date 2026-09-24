@@ -13,7 +13,7 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Int64, Float32
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
@@ -585,6 +585,7 @@ def _flash_attn_fwd(
     disable_scheduler_metadata: bool = False,
     out_partial_workspace: Optional[torch.Tensor] = None,
     lse_partial_workspace: Optional[torch.Tensor] = None,
+    prof_ptr: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -605,6 +606,13 @@ def _flash_attn_fwd(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
+    if block_sparse_tensors is not None and block_sparse_tensors.prof_buf is not None:
+        if fake_mode:
+            raise ValueError("prof_buf is not supported with fake tensors")
+        if prof_ptr:
+            raise ValueError("pass the profiler buffer either via prof_ptr or prof_buf, not both")
+        prof_ptr = block_sparse_tensors.prof_buf.data_ptr()
+        block_sparse_tensors = block_sparse_tensors._replace(prof_buf=None)
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -1561,6 +1569,8 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
+            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+                compile_args.append(Int64(prof_ptr) if prof_ptr else None)
             if use_dedicated_hd256_kernel:
                 compile_args.append(
                     Int32(host_max_seqlen_q)
@@ -1654,7 +1664,6 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.dq_write_order_full,
                     normalized_block_sparse_tensors.kv_block_signal,
                     normalized_block_sparse_tensors.kv_block_trace,
-                    normalized_block_sparse_tensors.prof_buf,
                     normalized_block_sparse_tensors.local_mask_block_cnt,
                     normalized_block_sparse_tensors.local_full_block_cnt,
                     normalized_block_sparse_tensors.bwd_kv_order,
@@ -1668,6 +1677,8 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
+            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+                call_args.append(Int64(prof_ptr) if prof_ptr else None)
             if use_dedicated_hd256_kernel:
                 call_args.append(
                     host_max_seqlen_q
@@ -2017,9 +2028,17 @@ def _flash_attn_bwd(
     gqa_finalize_work_state: Optional[torch.Tensor] = None,
     skip_dkv_postprocess: bool = False,
     paired_sparse_bwd: bool = False,
+    prof_ptr: int = 0,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
+    if block_sparse_tensors is not None and block_sparse_tensors.prof_buf is not None:
+        if fake_mode:
+            raise ValueError("prof_buf is not supported with fake tensors")
+        if prof_ptr:
+            raise ValueError("pass the profiler buffer either via prof_ptr or prof_buf, not both")
+        prof_ptr = block_sparse_tensors.prof_buf.data_ptr()
+        block_sparse_tensors = block_sparse_tensors._replace(prof_buf=None)
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     if block_sparse_tensors is not None:
@@ -2944,6 +2963,8 @@ def _flash_attn_bwd(
             ),
             sparse_tensors_compile,
         ]
+        if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            compile_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
         else:
@@ -3007,7 +3028,6 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.dq_write_order_full,
                 normalized_block_sparse_tensors.kv_block_signal,
                 normalized_block_sparse_tensors.kv_block_trace,
-                normalized_block_sparse_tensors.prof_buf,
                 normalized_block_sparse_tensors.local_mask_block_cnt,
                 normalized_block_sparse_tensors.local_full_block_cnt,
                 normalized_block_sparse_tensors.bwd_kv_order,
@@ -3020,6 +3040,8 @@ def _flash_attn_bwd(
             if normalized_block_sparse_tensors is not None
             else None,
         ]
+        if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            call_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
         else:
