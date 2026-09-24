@@ -135,13 +135,21 @@ def _cta_lifetime_mark(trace, signal, num_warps, phase):
     if cute.arch.lane_idx() == 0:
         offset = cute.size(signal.shape) * 3
         idx = offset + (cute.arch.block_idx()[0] * num_warps + cute.arch.warp_idx()) * 3
-        trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
-        if const_expr(phase == 0):
-            trace[idx + 2] = Int64(_llvm.inline_asm(
-                _mlir_T.i64(), [],
-                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
-                has_side_effects=True, asm_dialect=0,
-            ))
+        # KVBlockProfiler provides only the KV rows. CTA lifetime records are
+        # optional and require an explicitly allocated three-word suffix slot.
+        if idx + 2 < cute.size(trace.shape):
+            trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+            if const_expr(phase == 0):
+                trace[idx + 2] = Int64(
+                    _llvm.inline_asm(
+                        _mlir_T.i64(),
+                        [],
+                        "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }",
+                        "=l",
+                        has_side_effects=True,
+                        asm_dialect=0,
+                    )
+                )
 
 
 @cute.jit
