@@ -32,11 +32,6 @@ class BlockSparseTensors(NamedTuple):
     # warp records the GPU globaltimer (ns) at three points per kv-block:
     # [.,0]=wait-start, [.,1]=signal-ready, [.,2]=load-issued. No-op when absent.
     kv_block_trace: cute.Tensor | None = None
-    # Warp-granular profiler buffer (int64, flat) for mega_attention.profiler. When
-    # provided, forward warps record (block, warp)-private start/end/instant events
-    # into this buffer; layout is [num_blocks, PROF_NUM_WARPS, 1+max_events*2]. No-op
-    # when absent. See mega_attention/profiler/README.md.
-    prof_buf: cute.Tensor | None = None
     # SM100 semantic local/remote SplitKV metadata. The two count tensors mirror
     # mask_block_cnt/full_block_cnt and identify the owned suffix of each sparse row.
     # The presence of local_mask_block_cnt enables semantic SplitKV.
@@ -81,7 +76,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     kv_block_signal: torch.Tensor | None = None
     # Observability trace (int64, shape [num_n_blocks, 3]); see BlockSparseTensors.
     kv_block_trace: torch.Tensor | None = None
-    # Warp-granular profiler buffer (int64, flat); see BlockSparseTensors.prof_buf.
+    # Host-side lifetime carrier for the warp profiler buffer. The interface
+    # extracts data_ptr() and passes it through the dedicated Int64 kernel ABI.
     prof_buf: torch.Tensor | None = None
     # Optional SM100 semantic local/remote SplitKV metadata; see BlockSparseTensors.
     local_mask_block_cnt: torch.Tensor | None = None
@@ -894,13 +890,6 @@ def to_cute_block_sparse_tensors(
         if tensors.kv_block_trace is not None
         else None
     )
-    prof_buf_tensor = (
-        to_cute_tensor(
-            tensors.prof_buf, assumed_align=8, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi
-        )
-        if tensors.prof_buf is not None
-        else None
-    )
     local_mask_block_cnt_tensor, local_full_block_cnt_tensor = [
         to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
         if t is not None
@@ -961,7 +950,6 @@ def to_cute_block_sparse_tensors(
         dq_write_order_full_tensor,
         kv_block_signal_tensor,
         kv_block_trace_tensor,
-        prof_buf_tensor,
         local_mask_block_cnt_tensor,
         local_full_block_cnt_tensor,
         bwd_kv_order_tensor,

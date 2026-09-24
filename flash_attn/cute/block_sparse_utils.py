@@ -1329,13 +1329,14 @@ def get_total_q_block_count_bwd(
     n_block,
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    pack_gqa_factor: cutlass.Constexpr = 1,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
     q_block_cnt, _, full_block_cnt, _, *_ = blocksparse_tensors
     total = q_block_cnt[batch_idx, head_idx, n_block]
     if const_expr(full_block_cnt is not None):
         total = total + full_block_cnt[batch_idx, head_idx, n_block]
-    return total * q_subtile_factor
+    return total * q_subtile_factor * pack_gqa_factor
 
 
 @cute.jit
@@ -1372,6 +1373,7 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     # Subtiling factor and bounds
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    pack_gqa_factor: cutlass.Constexpr = 1,
     # Optional 2CTA state for hdim <= 128
     use_2cta_instrs: cutlass.Constexpr = False,
     producer_state_Qt=None,
@@ -1391,7 +1393,13 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
         curr_full_idx,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        pack_gqa_factor,
     )
     # 2 cta peels the first loop for Qt path; so we guard the whole block if loopcount == 0
     if loop_count > Int32(0):
@@ -1403,6 +1411,7 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
             curr_full_idx,
             q_subtile_factor=q_subtile_factor,
             m_block_max=m_block_max,
+            pack_gqa_factor=pack_gqa_factor,
         )
         # with q_subtile > 1 we need to guard against fully OOB regions
         if m_block_max > 0:
@@ -1463,6 +1472,7 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
                 curr_full_idx,
                 q_subtile_factor=q_subtile_factor,
                 m_block_max=m_block_max,
+                pack_gqa_factor=pack_gqa_factor,
             )
             if m_block_max > 0:
                 m_block = cutlass.min(m_block, m_block_max - 1)
@@ -1720,6 +1730,7 @@ def get_block_sparse_iteration_info_bwd(
     n_block,
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    pack_gqa_factor: cutlass.Constexpr = 1,
 ):
     """Extract block-sparse iteration info for backward pass.
 
@@ -1739,7 +1750,7 @@ def get_block_sparse_iteration_info_bwd(
     sparse_block_count = curr_q_cnt
     if const_expr(full_cnt is not None):
         sparse_block_count = sparse_block_count + curr_full_cnt
-    total_count = sparse_block_count * q_subtile_factor
+    total_count = sparse_block_count * q_subtile_factor * pack_gqa_factor
 
     return curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count
 
@@ -1753,6 +1764,7 @@ def get_m_block_from_iter_bwd(
     curr_full_idx: Optional[cute.Tensor],
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    pack_gqa_factor: cutlass.Constexpr = 1,
 ):
     """Derive m_block index and is_full_block flag from iteration index.
 
@@ -1760,6 +1772,12 @@ def get_m_block_from_iter_bwd(
         - m_block: The actual Q-tile block index
         - is_full_block: True if this is a full block (no mask_mod needed)
     """
+    head_tile_offset = Int32(0)
+    if const_expr(pack_gqa_factor > 1):
+        iters_per_head = (curr_q_cnt + curr_full_cnt) * q_subtile_factor
+        head_offset = iter_idx // iters_per_head
+        iter_idx = iter_idx % iters_per_head
+        head_tile_offset = head_offset * (m_block_max // pack_gqa_factor)
     sparse_iter_idx = iter_idx // q_subtile_factor
     subtile_offset = iter_idx % q_subtile_factor
 
@@ -1774,7 +1792,7 @@ def get_m_block_from_iter_bwd(
     else:
         sparse_m_block = curr_q_idx[sparse_iter_idx]
 
-    return sparse_m_block * q_subtile_factor + subtile_offset, is_full_block
+    return head_tile_offset + sparse_m_block * q_subtile_factor + subtile_offset, is_full_block
 
 
 @cute.jit

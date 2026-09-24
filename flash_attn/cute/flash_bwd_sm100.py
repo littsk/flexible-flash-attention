@@ -2,6 +2,7 @@
 import math
 from typing import Callable, Optional
 from functools import partial
+from dataclasses import replace
 
 import cuda.bindings.driver as cuda
 
@@ -25,6 +26,7 @@ from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.pack_gqa import pack_gqa_head_major
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
@@ -120,6 +122,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
+        pack_gqa: bool = False,
     ):
         # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
         # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
@@ -170,7 +173,8 @@ class FlashAttentionBackwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.pack_gqa = False
+        self.pack_gqa = pack_gqa
+        self.pack_gqa_factor = qhead_per_kvhead if pack_gqa else 1
         self.deterministic = deterministic
         self.spt_override = spt
 
@@ -575,6 +579,7 @@ class FlashAttentionBackwardSm100:
         mdGQA_finalize_state: Optional[cute.Tensor] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        prof_ptr: Optional[Int64] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -594,7 +599,7 @@ class FlashAttentionBackwardSm100:
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         # self.use_tma_store = not self.qhead_per_kvhead == 1
-        self.dKV_postprocess = self.qhead_per_kvhead > 1
+        self.dKV_postprocess = self.qhead_per_kvhead > 1 and not self.pack_gqa
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -618,6 +623,13 @@ class FlashAttentionBackwardSm100:
             for t in (mLSE, mdPsum, mdQaccum)
         ]
 
+        if const_expr(self.pack_gqa):
+            mQ = pack_gqa_head_major(mQ, self.qhead_per_kvhead, 2)
+            mdO = pack_gqa_head_major(mdO, self.qhead_per_kvhead, 2)
+            mLSE = pack_gqa_head_major(mLSE, self.qhead_per_kvhead, 1)
+            mdPsum = pack_gqa_head_major(mdPsum, self.qhead_per_kvhead, 1)
+            mdQaccum = pack_gqa_head_major(mdQaccum, self.qhead_per_kvhead, 1)
+
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
         else:
@@ -636,8 +648,10 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=semaphore_transpose)
+            if const_expr(self.pack_gqa):
+                mdQ_semaphore = pack_gqa_head_major(mdQ_semaphore, self.qhead_per_kvhead, 2)
 
-        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+        if const_expr(self.deterministic and self.dKV_postprocess):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
@@ -837,7 +851,7 @@ class FlashAttentionBackwardSm100:
             assert self.spt_override is not None
             self.spt = self.spt_override and self.deterministic
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
+            Int32(cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0])),  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
             cute.size(mK.shape[3])
             if const_expr(mCuSeqlensK is None)
@@ -853,7 +867,7 @@ class FlashAttentionBackwardSm100:
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
-            qhead_per_kvhead_packgqa=1,  # pack_gqa disabled for bwd
+            qhead_per_kvhead_packgqa=1,  # mQ already exposes the packed head count
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
@@ -1138,6 +1152,7 @@ class FlashAttentionBackwardSm100:
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
+            prof_ptr,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1225,6 +1240,7 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        prof_ptr: Optional[Int64] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1232,11 +1248,8 @@ class FlashAttentionBackwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
-        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
-        # recording at compile time. 16 warps per CTA (reduce/compute/mma/load/relay/empty).
-        prof_buf = (
-            blocksparse_tensors.prof_buf if const_expr(blocksparse_tensors is not None) else None
-        )
+        # None removes profiler calls from the compiled kernel.
+        prof_buf = prof_ptr
         prof_nw = 16
 
         # Prefetch tma descriptor
@@ -1571,7 +1584,7 @@ class FlashAttentionBackwardSm100:
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
+            seqlen_q_static=cute.size(mQ.shape[0]),
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -1840,7 +1853,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            head_idx_kv = (
+                head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+            )
 
             process_tile = (
                 const_expr(not self.is_local and not self.is_varlen_q) or m_block_min < m_block_max
@@ -1855,6 +1870,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    pack_gqa_factor=self.pack_gqa_factor,
                 )
                 process_tile = num_iters > Int32(0)
 
@@ -1962,7 +1978,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            head_idx_kv = (
+                head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+            )
             n_block_cta_group = n_block // self.cta_group_size
             n_block_sparse = n_block // self.kv_subtile_factor
 
@@ -2369,6 +2387,7 @@ class FlashAttentionBackwardSm100:
                     n_block_sparse,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    pack_gqa_factor=self.pack_gqa_factor,
                 )
                 if const_expr(blocksparse_tensors.kv_block_signal is not None):
                     if sparse_work_count > Int32(0):
@@ -2464,6 +2483,7 @@ class FlashAttentionBackwardSm100:
                         should_load_dO,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        pack_gqa_factor=self.pack_gqa_factor,
                         use_2cta_instrs=self.use_2cta_instrs,
                         producer_state_Qt=producer_state_Qt,
                         producer_state_Kt=producer_state_Kt,
@@ -2656,6 +2676,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    pack_gqa_factor=self.pack_gqa_factor,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -3334,7 +3355,10 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            mask = AttentionMaskCls(seqlen)
+            mask_seqlen = seqlen
+            if const_expr(self.pack_gqa):
+                mask_seqlen = replace(seqlen, seqlen_q=seqlen.seqlen_q // self.qhead_per_kvhead)
+            mask = AttentionMaskCls(mask_seqlen)
             cluster_n_block = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
             mask_fn = partial(
@@ -3391,6 +3415,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    pack_gqa_factor=self.pack_gqa_factor,
                 )
                 process_tile = loop_count > Int32(0)
 
@@ -3410,6 +3435,7 @@ class FlashAttentionBackwardSm100:
                         curr_full_idx,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        pack_gqa_factor=self.pack_gqa_factor,
                     )
                     m_block_oob = m_block >= m_block_max
                 # Prefetch 1 stage of LSE
@@ -3472,9 +3498,16 @@ class FlashAttentionBackwardSm100:
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
+                mask_m_block = m_block
+                mask_head_idx = head_idx
+                if const_expr(self.pack_gqa):
+                    blocks_per_head = m_block_max // self.qhead_per_kvhead
+                    mask_m_block = m_block % blocks_per_head
+                    mask_head_idx = head_idx * self.qhead_per_kvhead + m_block // blocks_per_head
                 mask_fn(
                     tSrS_t2r,
-                    m_block=m_block,
+                    m_block=mask_m_block,
+                    head_idx=mask_head_idx,
                     is_full_block=is_full_block,
                     check_m_boundary=check_m_boundary,
                 )
@@ -3774,7 +3807,7 @@ class FlashAttentionBackwardSm100:
                         mdGQA_finalize_state,
                         local_head_active,
                     )
-            if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+            if const_expr(self.deterministic and self.dKV_postprocess):
                 if not process_tile:
                     # Empty sparse Q heads perform no add, but later heads must
                     # not wait forever for their deterministic epilogue ticket.
@@ -3873,12 +3906,14 @@ class FlashAttentionBackwardSm100:
             assert blocksparse_tensors is not None
             if const_expr(blocksparse_tensors.dq_write_order is not None):
                 sparse_iter = iter_idx // self.q_subtile_factor
-                if sparse_iter < curr_q_cnt:
-                    assert curr_dq_write_order is not None
+                assert curr_dq_write_order is not None
+                if const_expr(curr_dq_write_order_full is None):
                     lock_value = curr_dq_write_order[sparse_iter]
                 else:
-                    assert curr_dq_write_order_full is not None
-                    lock_value = curr_dq_write_order_full[sparse_iter - curr_q_cnt]
+                    if sparse_iter < curr_q_cnt:
+                        lock_value = curr_dq_write_order[sparse_iter]
+                    else:
+                        lock_value = curr_dq_write_order_full[sparse_iter - curr_q_cnt]
                 if const_expr(self.kv_subtile_factor > self.cta_group_size):
                     groups_per_sparse_block = self.kv_subtile_factor // self.cta_group_size
                     local_group = n_block % groups_per_sparse_block
@@ -4030,6 +4065,7 @@ class FlashAttentionBackwardSm100:
                     n_block_sparse,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    pack_gqa_factor=self.pack_gqa_factor,
                 )
                 process_tile = loop_count > Int32(0)
             if const_expr(self.deterministic and self.use_block_sparsity):
@@ -4060,6 +4096,7 @@ class FlashAttentionBackwardSm100:
                         curr_full_idx,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        pack_gqa_factor=self.pack_gqa_factor,
                     )
                     m_block_oob_upper = m_block >= m_block_max
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
@@ -4093,7 +4130,9 @@ class FlashAttentionBackwardSm100:
                     if const_expr(self.deterministic and stage == 0):
                         if not m_block_oob_upper:
                             lock_value = self._dq_semaphore_lock_value(
-                                iter_idx,
+                                iter_idx % (loop_count // self.pack_gqa_factor)
+                                if const_expr(self.pack_gqa)
+                                else iter_idx,
                                 curr_q_cnt,
                                 curr_dq_write_order,
                                 curr_dq_write_order_full,
@@ -4405,7 +4444,7 @@ class FlashAttentionBackwardSm100:
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
-        head_idx_kv = head_idx // self.qhead_per_kvhead
+        head_idx_kv = head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
         if const_expr(not self.dKV_postprocess):
             assert not seqlen.has_cu_seqlens_k, "varlen uses non tma store path"
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
@@ -4434,7 +4473,7 @@ class FlashAttentionBackwardSm100:
                 gdKV, (flat_epi_tile,)
             )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
-        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
+        deterministic_KV = self.deterministic and self.dKV_postprocess
         if const_expr(deterministic_KV):
             assert mdKV_semaphore is not None
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
@@ -4517,7 +4556,11 @@ class FlashAttentionBackwardSm100:
             # SMEM -> GMEM
             if leader_warp:
                 if const_expr(not self.dKV_postprocess):
-                    cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                    if const_expr(self.use_2cta_instrs and self.use_block_sparsity):
+                        if n_block * self.tile_n < seqlen.seqlen_k:
+                            cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
+                    else:
+                        cute.copy(tma_atom_dKV, tdKVsdKV, tdKVgdKV[None, epi_stage])
                 else:
                     with cute.arch.elect_one():
                         if const_expr(self.use_2cta_instrs and self.use_block_sparsity):
@@ -4601,12 +4644,31 @@ class FlashAttentionBackwardSm100:
                                 scope="sys",
                             )
 
+        # Packed GQA owns the complete BF16 partial. Drain every issuing
+        # warpgroup's dV/dK stores before publishing one physical-tile arrival.
+        if const_expr(self.pack_gqa and mdKV_done is not None and K_or_V == "K"):
+            if leader_warp:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+                with cute.arch.elect_one():
+                    fence_proxy_async_global()
+            self.compute_sync_barrier.arrive_and_wait()
+            if leader_warp and wg_idx == 0 and local_head_active:
+                if n_block * self.tile_n < seqlen.seqlen_k:
+                    with cute.arch.elect_one():
+                        fence_proxy_async_global()
+                        num_head_kv = cute.size(mdKV.shape[2])
+                        flat = (batch_idx * num_head_kv + head_idx_kv) * self.dkv_done_nblk + n_block
+                        cute.arch.atomic_add(
+                            mdKV_done.iterator + flat, Int32(1), sem="release", scope="sys"
+                        )
+
         # Per-block "done" signal for distributed CP backward reduce-scatter: after this
         # rank finishes dK for (n_block, head_kv, batch), bump a per-block counter (with
         # a system-scope release so the dK/dV writes are visible before the count). The
         # owner of this kv block gates its multimem.ld_reduce on this counter reaching the
         # number of contributing ranks. Guarded -> default path is byte-for-byte unchanged.
-        if const_expr(mdKV_done is not None and mdGQA_local_done is None and K_or_V == "K"):
+        if const_expr(not self.pack_gqa and mdKV_done is not None and mdGQA_local_done is None and K_or_V == "K"):
             # One signal per (n_block, head_kv, batch) per rank. Dedupe across:
             #  - warpgroups: only wg 0 (the dK epilogue runs on both),
             #  - q-heads of a GQA group: only the last (head % R == R-1), so a kv-head

@@ -93,9 +93,9 @@ def _trace_store_globaltimer(trace, idx):
 
     First-touch semantics: the persistent scheduler re-loads each kv-block once per
     q-tile, but only the *first* visit can observe a real wait (later visits find the
-    signal already set). We therefore write only when the slot is still 0, so the trace
-    captures the genuine first-touch wait/ready/consume of each block rather than the
-    last (already-ready) re-load.
+    signal already set). The bypass load keeps the common nonzero path cheap; the CAS
+    resolves concurrent first visits so later warps cannot overwrite the winning
+    wait/ready/consume timestamp.
     """
     view = cute.make_tensor(trace.iterator + idx, cute.make_layout((1,), stride=(1,)))
     cur = cute_dist.ld_bypass(view)[0]
@@ -105,7 +105,7 @@ def _trace_store_globaltimer(trace, idx):
         _llvm.inline_asm(
             None,
             [ptr.toint().ir_value(), ts.ir_value()],
-            "st.global.u64 [$0], $1;",
+            "{ .reg .u64 old; atom.global.cas.b64 old, [$0], 0, $1; }",
             "l,l",
             has_side_effects=True,
             asm_dialect=0,
@@ -131,61 +131,37 @@ _PROF_PHASE_END = 2
 
 
 @cute.jit
-def _cta_lifetime_mark(trace, signal, num_warps, phase):
-    if cute.arch.lane_idx() == 0:
-        offset = cute.size(signal.shape) * 3
-        idx = offset + (cute.arch.block_idx()[0] * num_warps + cute.arch.warp_idx()) * 3
-        trace[idx + phase] = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
-        if const_expr(phase == 0):
-            trace[idx + 2] = Int64(_llvm.inline_asm(
-                _mlir_T.i64(), [],
-                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
-                has_side_effects=True, asm_dialect=0,
-            ))
-
-
-@cute.jit
-def _prof_mark(prof_buf, num_warps, max_events, event_no, phase):
+def _prof_mark(prof_ptr, num_warps, max_events, event_no, phase):
     """Record one warp-granular profiler event for the calling (block, warp)."""
-    if cute.arch.lane_idx() == 0:
-        block_x, block_y, block_z = cute.arch.block_idx()
-        grid_x, grid_y, _ = cute.arch.grid_dim()
-        bidx = block_x + grid_x * (block_y + grid_y * block_z)
-        warp = cute.arch.warp_idx()
-        region = (Int64(bidx) * Int64(num_warps) + Int64(warp)) * Int64(
-            1 + max_events * _PROF_EVENT_WORDS
-        )
-        cnt_ptr = prof_buf.iterator + region
-        cnt_view = cute.make_tensor(cnt_ptr, cute.make_layout((1,), stride=(1,)))
-        count = cute_dist.ld_bypass(cnt_view)[0]
-        if count < Int64(max_events):
-            ts = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
-            # Read %smid (u32) and zero-extend to u64 in PTX so the Python-side
-            # Int64 wrap is unambiguous.
-            smid = Int64(_llvm.inline_asm(
-                _mlir_T.i64(), [],
-                "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
-                has_side_effects=True, asm_dialect=0,
-            ))
-            # meta = (smid << 32) | (event_no << 2) | phase, built with plain
-            # arithmetic since event_no/phase are compile-time constants.
-            meta = smid * Int64(1 << 32) + Int64(event_no * 4 + phase)
-            evt = region + Int64(1) + count * Int64(_PROF_EVENT_WORDS)
-            ts_ptr = prof_buf.iterator + evt
-            meta_ptr = prof_buf.iterator + evt + Int64(1)
-            _llvm.inline_asm(
-                None, [ts_ptr.toint().ir_value(), ts.ir_value()],
-                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
+    base = Int64(prof_ptr)
+    if base != Int64(0):
+        if cute.arch.lane_idx() == 0:
+            block_x, block_y, block_z = cute.arch.block_idx()
+            grid_x, grid_y, _ = cute.arch.grid_dim()
+            bidx = block_x + grid_x * (block_y + grid_y * block_z)
+            warp = cute.arch.warp_idx()
+            region = (Int64(bidx) * Int64(num_warps) + Int64(warp)) * Int64(
+                1 + max_events * _PROF_EVENT_WORDS
             )
-            _llvm.inline_asm(
-                None, [meta_ptr.toint().ir_value(), meta.ir_value()],
-                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
+            cnt_ptr = cute.make_ptr(
+                Int64, base + region * 8, cute.AddressSpace.gmem, assumed_align=8
             )
-            new_count = count + Int64(1)
-            _llvm.inline_asm(
-                None, [cnt_ptr.toint().ir_value(), new_count.ir_value()],
-                "st.global.u64 [$0], $1;", "l,l", has_side_effects=True, asm_dialect=0,
-            )
+            count = cnt_ptr[0]
+            if count < Int64(max_events):
+                ts = Int64(_nvvm.read_ptx_sreg_globaltimer(_mlir_T.i64()))
+                smid = Int64(_llvm.inline_asm(
+                    _mlir_T.i64(), [],
+                    "{ .reg .u32 t; mov.u32 t, %smid; cvt.u64.u32 $0, t; }", "=l",
+                    has_side_effects=True, asm_dialect=0,
+                ))
+                meta = smid * Int64(1 << 32) + Int64(event_no * 4 + phase)
+                evt = region + Int64(1) + count * Int64(_PROF_EVENT_WORDS)
+                evt_ptr = cute.make_ptr(
+                    Int64, base + evt * 8, cute.AddressSpace.gmem, assumed_align=8
+                )
+                evt_ptr[0] = ts
+                evt_ptr[1] = meta
+                cnt_ptr[0] = count + Int64(1)
 
 
 # Profiler event ids (registered names live in the host harness / Profiler).
@@ -599,6 +575,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        prof_ptr: Optional[Int64] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -1001,6 +978,7 @@ class FlashAttentionForwardSm100:
             learnable_sink,
             descale_tensors,
             blocksparse_tensors,
+            prof_ptr,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -1064,6 +1042,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor],
         descale_tensors: Optional[DescaleTensors],
         blocksparse_tensors: Optional[BlockSparseTensors],
+        prof_ptr: Optional[Int64],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1099,17 +1078,9 @@ class FlashAttentionForwardSm100:
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        # Warp-granular profiler buffer (mega_attention.profiler). None disables all
-        # recording at compile time (const_expr-gated call sites emit nothing).
-        prof_buf = (
-            blocksparse_tensors.prof_buf
-            if const_expr(blocksparse_tensors is not None)
-            else None
-        )
+        # None removes profiler calls from the compiled kernel.
+        prof_buf = prof_ptr
         prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
-
-        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
-            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 0)
 
         # Prefetch tma descriptor
         if warp_idx == 0:
@@ -1482,6 +1453,7 @@ class FlashAttentionForwardSm100:
                 num_splits,
                 SeqlenInfoCls,
                 blocksparse_tensors,
+                prof_ptr,
                 tile_scheduler=tile_scheduler,
             )
 
@@ -1642,8 +1614,6 @@ class FlashAttentionForwardSm100:
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_END)
             tmem_alloc_barrier.arrive()
 
-        if const_expr(blocksparse_tensors is not None and blocksparse_tensors.kv_block_trace is not None):
-            _cta_lifetime_mark(blocksparse_tensors.kv_block_trace, blocksparse_tensors.kv_block_signal, prof_nw, 1)
         return
 
     @cute.jit
@@ -1669,6 +1639,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        prof_ptr: Optional[Int64],
         tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
@@ -1794,11 +1765,7 @@ class FlashAttentionForwardSm100:
                 if const_expr(blocksparse_tensors is not None)
                 else None
             )
-            prof_buf = (
-                blocksparse_tensors.prof_buf
-                if const_expr(blocksparse_tensors is not None)
-                else None
-            )
+            prof_buf = prof_ptr
             prof_nw = self.threads_per_cta // cute.arch.WARP_SIZE
             if const_expr(prof_buf is not None and self.is_semantic_split):
                 if issue_kv_for_this_warp:
@@ -3489,7 +3456,7 @@ class FlashAttentionForwardSm100:
         extra_tx_count: Optional[Int32] = None,
         kv_signal: Optional[cute.Tensor] = None,
         kv_trace: Optional[cute.Tensor] = None,
-        prof_buf: Optional[cute.Tensor] = None,
+        prof_buf: Int64 = Int64(0),
         prof_nw: int = 0,
         head_idx: Int32 = Int32(0),
         signal_head_idx: Optional[Int32] = None,
