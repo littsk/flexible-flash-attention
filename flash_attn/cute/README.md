@@ -32,6 +32,32 @@ pip install -e "flash_attn/cute[dev,cu13]"  # CUDA 13.x (e.g. B200)
 pytest tests/cute/
 ```
 
+## HSTU function-encoded masks
+
+`flash_attn.cute.hstu_mask` runs attention under an HSTU function mask on the
+existing `mask_mod` + block-sparsity path, without new kernels. A func tensor is
+int32 `[n_func, seqlen_q]` (or `[1, 1, n_func, L]`) with odd `n_func`; row `q`
+attends key `k` iff `k < F[0, q]` or `F[2i+1, q] <= k < F[2i+2, q]`. One mask is
+shared by all batches and heads.
+
+```python
+from flash_attn.cute.hstu_mask import hstu_attn_func, magi_to_hstu
+
+# mask_types: 0=full, 1=causal, 2=inverse causal, 3=bi-causal
+func = magi_to_hstu(q_ranges, k_ranges, mask_types, seqlen_q, seqlen_k)
+out = hstu_attn_func(q, k, v, func, deterministic=True)
+```
+
+`magi_to_hstu` sorts and merges each row's slice intervals like the MagiAttention
+CUDA converter. `hstu_block_sparse_tensors` derives forward (Q-outer) and backward
+(KV-outer) sparse tensors, plus dQ tickets when deterministic;
+`hstu_mask_mod`/`hstu_aux_tensors` evaluate the mask on partial tiles. On
+SM100/SM110 forward, `hstu_attn_func` uses the packed form (`vec_size=32`): each
+row loads its bounds once and every interval `[lo, hi)` becomes
+`below(hi) & ~below(lo)` over 32 contiguous columns, OR-ed and applied with R2P.
+Backward and SM90 use the scalar form. Blocks crossing the sequence boundary are
+always treated as partial.
+
 ## Deterministic block-sparse PackGQA backward
 
 The SM100/SM110 backward supports an opt-in head-major PackGQA path. One CTA

@@ -130,27 +130,54 @@ def hstu_aux_tensors(func: torch.Tensor, seqlen_q: int) -> list[torch.Tensor]:
     return list(padded.unbind(0))
 
 
-def hstu_mask_mod(n_func: int) -> Callable:
-    """CuTe ``mask_mod`` for ``hstu_aux_tensors`` of an ``n_func`` func tensor."""
+def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
+    """CuTe ``mask_mod`` for ``hstu_aux_tensors`` of an ``n_func`` func tensor.
+
+    ``vec_size=32`` (SM100/SM110 forward) returns one packed keep mask per 32
+    contiguous KV columns: each interval ``[lo, hi)`` is ``below(hi) & ~below(lo)``
+    and the OR of all intervals lowers to R2P, like a native interval mask.
+    Backward and SM90 always call the scalar form.
+    """
     if n_func <= 0 or n_func % 2 != 1:
         raise ValueError("n_func must be a positive odd number")
-    if n_func in _MASK_MODS:
-        return _MASK_MODS[n_func]
+    if vec_size not in (1, 32):
+        raise ValueError("vec_size must be 1 or 32")
+    key = (n_func, vec_size)
+    if key in _MASK_MODS:
+        return _MASK_MODS[key]
     import cutlass
     import cutlass.cute as cute
 
     from flash_attn.cute import utils
+    from flash_attn.cute.mask import r2p_bitmask_below
+
+    num_intervals = (n_func - 1) // 2
 
     @cute.jit
     def hstu(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
-        valid = n_idx < utils.scalar_to_ssa(aux_tensors[0][m_idx[0]], cutlass.Int32)
-        for i in cutlass.range_constexpr((n_func - 1) // 2):
-            lo = utils.scalar_to_ssa(aux_tensors[2 * i + 1][m_idx[0]], cutlass.Int32)
-            hi = utils.scalar_to_ssa(aux_tensors[2 * i + 2][m_idx[0]], cutlass.Int32)
-            valid = valid | ((n_idx >= lo) & (n_idx < hi))
-        return valid
+        if cutlass.const_expr(cute.size(n_idx.shape) == 1):
+            valid = n_idx < utils.scalar_to_ssa(aux_tensors[0][m_idx[0]], cutlass.Int32)
+            for i in cutlass.range_constexpr(num_intervals):
+                lo = utils.scalar_to_ssa(aux_tensors[2 * i + 1][m_idx[0]], cutlass.Int32)
+                hi = utils.scalar_to_ssa(aux_tensors[2 * i + 2][m_idx[0]], cutlass.Int32)
+                valid = valid | ((n_idx >= lo) & (n_idx < hi))
+            return valid
+        else:
+            assert cute.size(n_idx.shape) == 32
+            # The kernel passes 32 contiguous KV indices starting at n_idx[0].
+            base = n_idx[0]
+            row = m_idx[0]
+            keep = r2p_bitmask_below(aux_tensors[0][row] - base, 0)
+            for i in cutlass.range_constexpr(num_intervals):
+                below_lo = r2p_bitmask_below(aux_tensors[2 * i + 1][row] - base, 0)
+                below_hi = r2p_bitmask_below(aux_tensors[2 * i + 2][row] - base, 0)
+                keep = keep | (below_hi & (below_lo ^ cutlass.Uint32(0xFFFFFFFF)))
+            result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+            result[0] = keep
+            return result.load()
 
-    _MASK_MODS[n_func] = hstu
+    hstu.__vec_size__ = vec_size
+    _MASK_MODS[key] = hstu
     return hstu
 
 
@@ -264,9 +291,10 @@ def hstu_attn_func(
 
     seqlen_q, seqlen_k = q.shape[1], k.shape[1]
     func = _check_func(func, seqlen_q)
+    major = torch.cuda.get_device_capability(q.device)[0]
+    blackwell = major in (10, 11)
     if block_size is None:
-        major = torch.cuda.get_device_capability(q.device)[0]
-        block_size = (256, 128) if major in (10, 11) else (128, 128)
+        block_size = (256, 128) if blackwell else (128, 128)
     fwd, bwd = hstu_block_sparse_tensors(
         func, seqlen_q, seqlen_k, block_size, deterministic=deterministic
     )
@@ -275,7 +303,8 @@ def hstu_attn_func(
         k,
         v,
         softmax_scale=softmax_scale,
-        mask_mod=hstu_mask_mod(func.shape[0]),
+        # SM100/SM110 forward masks partial tiles 32 columns at a time with R2P.
+        mask_mod=hstu_mask_mod(func.shape[0], vec_size=32 if blackwell else 1),
         aux_tensors=hstu_aux_tensors(func, seqlen_q),
         block_sparse_tensors=fwd,
         block_sparse_tensors_bwd=bwd,
