@@ -70,12 +70,29 @@ def magi_to_hstu(
     active = (q >= q_start) & (q < q_end) & (start < end)
     if bool(((start < 0) | (end > seqlen_k))[active].any()):
         raise ValueError("slice intervals must lie within [0, seqlen_k)")
+    return intervals_to_hstu(torch.where(active, start, 0), torch.where(active, end, 0), n_max_func)
+
+
+def intervals_to_hstu(
+    starts: torch.Tensor, ends: torch.Tensor, n_max_func: int | None = None
+) -> torch.Tensor:
+    """Encode per-row KV intervals ``[starts, ends)`` as an HSTU func tensor.
+
+    ``starts``/``ends`` are ``[seqlen_q, m]``; an interval with start >= end is
+    empty. Each row's intervals are sorted and merged (touching intervals merge);
+    ``n_func`` is the largest count used by any row, at least 1.
+    """
+    if starts.shape != ends.shape or starts.ndim != 2:
+        raise ValueError("starts and ends must both be [seqlen_q, m]")
+    seqlen_q, num_slices = starts.shape
+    device = starts.device
+    starts, ends = starts.long(), ends.long()
+    active = starts < ends
     big = torch.iinfo(torch.int64).max
-    start = torch.where(active, start, big)
+    start = torch.where(active, starts, big)
     order = torch.argsort(start, dim=1, stable=True)
     start = torch.gather(start, 1, order)
-    end = torch.gather(torch.where(active, end, -1), 1, order)
-    num_slices = start.shape[1]
+    end = torch.gather(torch.where(active, ends, -1), 1, order)
     merged_start = torch.zeros(seqlen_q, num_slices, dtype=torch.int64, device=device)
     merged_end = torch.zeros_like(merged_start)
     count = torch.zeros(seqlen_q, dtype=torch.int64, device=device)
@@ -92,7 +109,7 @@ def magi_to_hstu(
         merged_start[rows[opens], count[opens]] = s[opens]
         merged_end[rows[opens], count[opens]] = e[opens]
         count += opens.long()
-    if int(count.max()) > (n_max_func + 1) // 2:
+    if n_max_func is not None and int(count.max()) > (n_max_func + 1) // 2:
         raise ValueError(f"a query row needs more than n_max_func={n_max_func} functions")
     # Rows whose first interval starts at 0 use [0, F0); others keep [0, 0).
     lead = (count > 0) & (merged_start[:, 0] == 0)
@@ -121,13 +138,17 @@ def hstu_dense_mask(func: torch.Tensor, seqlen_q: int, seqlen_k: int) -> torch.T
 
 
 def hstu_aux_tensors(func: torch.Tensor, seqlen_q: int) -> list[torch.Tensor]:
-    """One padded int32 row vector per function, indexed by the kernel q index."""
+    """One row-interleaved int32 vector: bound ``j`` of row ``q`` at ``q * n_func + j``.
+
+    Interleaving keeps a row's bounds in one cache line; the masks read every
+    bound of a row per element in backward.
+    """
     func = _check_func(func, seqlen_q)
     padded = torch.zeros(
-        func.shape[0], seqlen_q + HSTU_ROW_PADDING, dtype=torch.int32, device=func.device
+        seqlen_q + HSTU_ROW_PADDING, func.shape[0], dtype=torch.int32, device=func.device
     )
-    padded[:, :seqlen_q] = func
-    return list(padded.unbind(0))
+    padded[:seqlen_q] = func.T
+    return [padded.view(-1)]
 
 
 def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
@@ -155,22 +176,23 @@ def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
 
     @cute.jit
     def hstu(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        bounds = aux_tensors[0]
+        row = m_idx[0] * n_func
         if cutlass.const_expr(cute.size(n_idx.shape) == 1):
-            valid = n_idx < utils.scalar_to_ssa(aux_tensors[0][m_idx[0]], cutlass.Int32)
+            valid = n_idx < utils.scalar_to_ssa(bounds[row], cutlass.Int32)
             for i in cutlass.range_constexpr(num_intervals):
-                lo = utils.scalar_to_ssa(aux_tensors[2 * i + 1][m_idx[0]], cutlass.Int32)
-                hi = utils.scalar_to_ssa(aux_tensors[2 * i + 2][m_idx[0]], cutlass.Int32)
+                lo = utils.scalar_to_ssa(bounds[row + 2 * i + 1], cutlass.Int32)
+                hi = utils.scalar_to_ssa(bounds[row + 2 * i + 2], cutlass.Int32)
                 valid = valid | ((n_idx >= lo) & (n_idx < hi))
             return valid
         else:
             assert cute.size(n_idx.shape) == 32
             # The kernel passes 32 contiguous KV indices starting at n_idx[0].
             base = n_idx[0]
-            row = m_idx[0]
-            keep = r2p_bitmask_below(aux_tensors[0][row] - base, 0)
+            keep = r2p_bitmask_below(bounds[row] - base, 0)
             for i in cutlass.range_constexpr(num_intervals):
-                below_lo = r2p_bitmask_below(aux_tensors[2 * i + 1][row] - base, 0)
-                below_hi = r2p_bitmask_below(aux_tensors[2 * i + 2][row] - base, 0)
+                below_lo = r2p_bitmask_below(bounds[row + 2 * i + 1] - base, 0)
+                below_hi = r2p_bitmask_below(bounds[row + 2 * i + 2] - base, 0)
                 keep = keep | (below_hi & (below_lo ^ cutlass.Uint32(0xFFFFFFFF)))
             result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
             result[0] = keep
