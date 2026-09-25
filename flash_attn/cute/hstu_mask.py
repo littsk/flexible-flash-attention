@@ -22,7 +22,7 @@ from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, compute_dq_w
 # Kernels evaluate mask_mod on whole tiles, so rows past seqlen_q read padding.
 HSTU_ROW_PADDING = 256
 
-_MASK_MODS: dict[int, Callable] = {}
+_MASK_MODS: dict[tuple[int, int, bool], Callable] = {}
 
 
 def _check_func(func: torch.Tensor, seqlen_q: int) -> torch.Tensor:
@@ -151,19 +151,23 @@ def hstu_aux_tensors(func: torch.Tensor, seqlen_q: int) -> list[torch.Tensor]:
     return [padded.view(-1)]
 
 
-def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
+def hstu_mask_mod(n_func: int, vec_size: int = 1, *, kv_positions: bool = False) -> Callable:
     """CuTe ``mask_mod`` for ``hstu_aux_tensors`` of an ``n_func`` func tensor.
 
     ``vec_size=32`` (SM100/SM110 forward) returns one packed keep mask per 32
     contiguous KV columns: each interval ``[lo, hi)`` is ``below(hi) & ~below(lo)``
     and the OR of all intervals lowers to R2P, like a native interval mask.
     Backward and SM90 always call the scalar form.
+
+    ``kv_positions=True`` compares bounds against ``aux_tensors[1][kv_idx]``, the
+    global position of each kernel KV column, instead of ``kv_idx`` itself. With
+    ``vec_size=32`` each aligned 32-column group must be globally contiguous.
     """
     if n_func <= 0 or n_func % 2 != 1:
         raise ValueError("n_func must be a positive odd number")
     if vec_size not in (1, 32):
         raise ValueError("vec_size must be 1 or 32")
-    key = (n_func, vec_size)
+    key = (n_func, vec_size, kv_positions)
     if key in _MASK_MODS:
         return _MASK_MODS[key]
     import cutlass
@@ -179,16 +183,21 @@ def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
         bounds = aux_tensors[0]
         row = m_idx[0] * n_func
         if cutlass.const_expr(cute.size(n_idx.shape) == 1):
-            valid = n_idx < utils.scalar_to_ssa(bounds[row], cutlass.Int32)
+            col = n_idx
+            if cutlass.const_expr(kv_positions):
+                col = utils.scalar_to_ssa(aux_tensors[1][n_idx[0]], cutlass.Int32)
+            valid = col < utils.scalar_to_ssa(bounds[row], cutlass.Int32)
             for i in cutlass.range_constexpr(num_intervals):
                 lo = utils.scalar_to_ssa(bounds[row + 2 * i + 1], cutlass.Int32)
                 hi = utils.scalar_to_ssa(bounds[row + 2 * i + 2], cutlass.Int32)
-                valid = valid | ((n_idx >= lo) & (n_idx < hi))
+                valid = valid | ((col >= lo) & (col < hi))
             return valid
         else:
             assert cute.size(n_idx.shape) == 32
             # The kernel passes 32 contiguous KV indices starting at n_idx[0].
             base = n_idx[0]
+            if cutlass.const_expr(kv_positions):
+                base = aux_tensors[1][n_idx[0]]
             keep = r2p_bitmask_below(bounds[row] - base, 0)
             for i in cutlass.range_constexpr(num_intervals):
                 below_lo = r2p_bitmask_below(bounds[row + 2 * i + 1] - base, 0)
@@ -203,26 +212,72 @@ def hstu_mask_mod(n_func: int, vec_size: int = 1) -> Callable:
     return hstu
 
 
-def _block_state(
-    valid: torch.Tensor, seqlen_q: int, seqlen_k: int, block_size: tuple[int, int]
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(partial, full)`` bool ``[num_q_blocks, num_kv_blocks]`` from dense visibility.
+def _disjoint_intervals(func: torch.Tensor, seqlen_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pairwise-disjoint ``[rows, m]`` starts/ends of a func's visible intervals."""
+    func = func.long().clamp(0, seqlen_k)
+    starts = torch.cat([torch.zeros_like(func[:1]), func[1::2]]).T
+    ends = func[0::2].T
+    live = starts < ends
+    overlap = (
+        live[:, :, None]
+        & live[:, None, :]
+        & (starts[:, :, None] < ends[:, None, :])
+        & (starts[:, None, :] < ends[:, :, None])
+    )
+    overlap &= ~torch.eye(starts.shape[1], dtype=torch.bool, device=func.device)
+    if bool(overlap.any()):
+        merged = intervals_to_hstu(starts, ends).long()
+        starts = torch.cat([torch.zeros_like(merged[:1]), merged[1::2]]).T
+        ends = merged[0::2].T
+    return starts, ends
 
-    Blocks that cross the Q or KV boundary are never full: the kernel's tile
-    masking still has to run for them.
+
+def _block_state(
+    func: torch.Tensor, seqlen_k: int, block_size: tuple[int, int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(partial, full)`` bool ``[num_q_blocks, num_kv_blocks]`` for func rows.
+
+    Sums visible columns per (Q block, KV block) straight from each row's
+    disjoint intervals: an interval adds ``kv_block`` to every KV block it covers
+    (via a difference array) plus point counts for its partial head and tail
+    blocks. No dense ``rows x seqlen_k`` mask is built. Blocks that cross the Q
+    or KV boundary are never full: the kernel's tile masking still has to run.
     """
     q_block, kv_block = block_size
-    num_q, num_kv = -(-seqlen_q // q_block), -(-seqlen_k // kv_block)
-    padded = torch.zeros(num_q * q_block, num_kv * kv_block, dtype=torch.bool, device=valid.device)
-    padded[:seqlen_q, :seqlen_k] = valid
-    tiles = padded.view(num_q, q_block, num_kv, kv_block)
-    any_valid = tiles.any(dim=3).any(dim=1)
-    all_valid = tiles.all(dim=3).all(dim=1)
-    in_bounds = (torch.arange(1, num_q + 1, device=valid.device) * q_block <= seqlen_q)[:, None] & (
-        torch.arange(1, num_kv + 1, device=valid.device) * kv_block <= seqlen_k
-    )[None, :]
-    full = all_valid & in_bounds
-    return any_valid & ~full, full
+    rows = func.shape[1]
+    device = func.device
+    num_q, num_kv = -(-rows // q_block), -(-seqlen_k // kv_block)
+    starts, ends = _disjoint_intervals(func, seqlen_k)
+    live = starts < ends
+    q_blk = (torch.arange(rows, device=device) // q_block)[:, None].expand_as(starts)
+    starts, ends, q_blk = starts[live], ends[live], q_blk[live]
+    stride = num_kv + 1
+    first_full = (starts + kv_block - 1) // kv_block
+    last_full = ends // kv_block
+    spans = first_full < last_full
+    covered = torch.zeros(num_q * stride, dtype=torch.int64, device=device)
+    weight = torch.full_like(starts[spans], kv_block)
+    covered.scatter_add_(0, q_blk[spans] * stride + first_full[spans], weight)
+    covered.scatter_add_(0, q_blk[spans] * stride + last_full[spans], -weight)
+    visible = covered.view(num_q, stride).cumsum(dim=1)[:, :num_kv]
+    points = torch.zeros(num_q * stride, dtype=torch.int64, device=device)
+    head = starts % kv_block != 0
+    head_end = torch.minimum(ends, (starts // kv_block + 1) * kv_block)
+    points.scatter_add_(
+        0, q_blk[head] * stride + starts[head] // kv_block, (head_end - starts)[head]
+    )
+    # A tail inside the head block was already counted by the head.
+    tail = (ends % kv_block != 0) & (last_full >= first_full)
+    points.scatter_add_(
+        0, q_blk[tail] * stride + last_full[tail], (ends - last_full * kv_block)[tail]
+    )
+    visible = visible + points.view(num_q, stride)[:, :num_kv]
+    q_rows = (rows - torch.arange(num_q, device=device) * q_block).clamp(max=q_block)
+    edges = (torch.arange(num_kv + 1, device=device) * kv_block).clamp(max=seqlen_k)
+    widths = edges[1:] - edges[:-1]
+    full = (visible == q_block * kv_block) & (q_rows == q_block)[:, None]
+    full &= (widths == kv_block)[None, :]
+    return (visible > 0) & ~full, full
 
 
 def _to_sparse(
@@ -253,28 +308,16 @@ def hstu_block_sparse_tensors(
     block_size: tuple[int, int],
     *,
     deterministic: bool = False,
-    q_rows_per_chunk: int = 4096,
 ) -> tuple[BlockSparseTensorsTorch, BlockSparseTensorsTorch]:
     """Forward (Q-outer) and backward (KV-outer) block-sparse tensors.
 
     Both use ``block_size=(q_block, kv_block)``, head/batch broadcast
     dimensions of 1, and ascending block indices. ``deterministic`` adds the
-    ascending dQ write-order tickets deterministic backward requires. Dense
-    visibility is built ``q_rows_per_chunk`` rows at a time to bound memory.
+    ascending dQ write-order tickets deterministic backward requires. Tiles are
+    classified in O(rows * n_func + blocks) from per-row intervals.
     """
     func = _check_func(func, seqlen_q)
-    q_block = block_size[0]
-    step = max(q_block, q_rows_per_chunk // q_block * q_block)
-    partial_rows, full_rows = [], []
-    for begin in range(0, seqlen_q, step):
-        rows = min(step, seqlen_q - begin)
-        valid = hstu_dense_mask(func[:, begin : begin + rows], rows, seqlen_k)
-        # Every chunk but the last spans whole Q blocks.
-        partial, full = _block_state(valid, rows, seqlen_k, block_size)
-        partial_rows.append(partial)
-        full_rows.append(full)
-    partial = torch.cat(partial_rows)
-    full = torch.cat(full_rows)
+    partial, full = _block_state(func, seqlen_k, block_size)
     fwd = _to_sparse(partial, full, block_size)
     bwd = _to_sparse(partial.T, full.T, block_size)
     if deterministic:
