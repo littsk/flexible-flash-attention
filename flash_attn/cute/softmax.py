@@ -2,12 +2,12 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Boolean
+from cutlass import Boolean, Float32, Uint32
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
@@ -417,7 +417,13 @@ class SoftmaxSm100(Softmax):
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
+        keep_bits: Optional[cute.Tensor] = None,
     ):
+        """exp2 in place; ``acc_S_row`` keeps the undropped values for the row sum.
+
+        ``keep_bits`` (bit ``k`` of word ``j`` for element ``32 * j + k``) zeroes
+        dropped entries of the converted P only.
+        """
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
         assert frg_tile % 2 == 0
@@ -449,9 +455,18 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-            )
+            if cutlass.const_expr(keep_bits is None):
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
+            else:
+                kept = cute.make_rmem_tensor(frg_tile, Float32)
+                for k in cutlass.range_constexpr(frg_tile):
+                    bit = (keep_bits[j] >> Uint32(k)) & Uint32(1)
+                    kept[k] = acc_S_row_frg[k, j] if bit != Uint32(0) else Float32(0.0)
+                acc_S_row_converted_frg[None, j].store(
+                    kept.load().to(acc_S_row_converted.element_type)
+                )
 
     @cute.jit
     def scale_apply_exp2_convert(

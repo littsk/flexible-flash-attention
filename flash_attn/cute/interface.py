@@ -65,6 +65,13 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHea
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.dropout import (
+    DropoutTensors,
+    dropout_compile_key,
+    next_rng_state,
+    to_dropout_args,
+    validate_dropout,
+)
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     block_sparse_bwd_supports_2cta,
@@ -587,6 +594,7 @@ def _flash_attn_fwd(
     out_partial_workspace: Optional[torch.Tensor] = None,
     lse_partial_workspace: Optional[torch.Tensor] = None,
     prof_ptr: int = 0,
+    dropout: Optional[DropoutTensors] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -601,8 +609,12 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
+        dropout: SM100 attention dropout (see ``flash_attn.cute.dropout``); ``None`` or
+            ``p == 0`` compiles the unchanged kernel.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if dropout is not None and dropout.p == 0.0:
+        dropout = None
     requires_grad = any(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
@@ -832,6 +844,18 @@ def _flash_attn_fwd(
     # Preserve the caller's hint.
     host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if dropout is not None:
+        if arch // 10 not in [10, 11] or use_dedicated_hd256_kernel or qv is not None:
+            raise NotImplementedError("dropout is only supported by the SM100/SM110 forward kernel")
+        validate_dropout(dropout, v.device)
+        if (dropout.q_positions is not None or dropout.kv_positions is not None) and (
+            cu_seqlens_q is not None or cu_seqlens_k is not None or page_table is not None
+        ):
+            raise NotImplementedError("dropout positions require fixed-length, non-paged inputs")
+        if dropout.q_positions is not None and dropout.q_positions.numel() != seqlen_q:
+            raise ValueError("dropout q_positions must have one entry per query token")
+        if dropout.kv_positions is not None and dropout.kv_positions.numel() != seqlen_k:
+            raise ValueError("dropout kv_positions must have one entry per key token")
     if use_dedicated_hd256_kernel or (arch // 10 in [10, 11] and cu_seqlens_q is not None):
         max_seqlen_q = host_max_seqlen_q
     if (
@@ -1302,6 +1326,7 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
+        dropout_compile_key(dropout),
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1588,6 +1613,12 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
+                    to_dropout_args(
+                        dropout,
+                        num_head,
+                        lambda t: to_cute_tensor(t, assumed_align=4, leading_dim=0),
+                        for_compile=True,
+                    ),
                 ])
             elif arch // 10 in [8, 9, 12]:
                 compile_args.extend([
@@ -1696,6 +1727,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                     blocks_to_batch_idx,
                     max_seqlen_q,
+                    to_dropout_args(dropout, num_head, lambda t: t, for_compile=False),
                 ])
             elif arch // 10 in [8, 9, 12]:
                 call_args.extend([
@@ -2030,6 +2062,7 @@ def _flash_attn_bwd(
     skip_dkv_postprocess: bool = False,
     paired_sparse_bwd: bool = False,
     prof_ptr: int = 0,
+    dropout: Optional[DropoutTensors] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """Run attention backward, preserving the public Q/K/V gradient layouts.
 
@@ -2038,8 +2071,12 @@ def _flash_attn_bwd(
     Paired mode requires KV-head-contracted work/CSR/tickets; both modes require
     shared masks and tile-aligned fixed Q length;
     see README.md for the supported combinations. None/False keeps unpacked GQA.
+    ``dropout`` must match the forward call (same p, rng_state and positions,
+    with ``kv_positions`` for this call's K/V layout).
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    if dropout is not None and dropout.p == 0.0:
+        dropout = None
     fake_mode = is_fake_mode()
     if block_sparse_tensors is not None and block_sparse_tensors.prof_buf is not None:
         if fake_mode:
@@ -2188,6 +2225,18 @@ def _flash_attn_bwd(
             assert dk_accum_external is not None and dv_accum_external is not None
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if dropout is not None:
+        if arch // 10 not in [10, 11] or use_dedicated_hd256_kernel:
+            raise NotImplementedError("dropout is only supported by the SM100/SM110 backward kernel")
+        validate_dropout(dropout, q.device)
+        if (dropout.q_positions is not None or dropout.kv_positions is not None) and (
+            cu_seqlens_q is not None or cu_seqlens_k is not None
+        ):
+            raise NotImplementedError("dropout positions require fixed-length inputs")
+        if dropout.q_positions is not None and dropout.q_positions.numel() != q.shape[1]:
+            raise ValueError("dropout q_positions must have one entry per query token")
+        if dropout.kv_positions is not None and dropout.kv_positions.numel() != k.shape[1]:
+            raise ValueError("dropout kv_positions must have one entry per key token")
     if (
         use_dedicated_hd256_kernel
         or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
@@ -2851,6 +2900,7 @@ def _flash_attn_bwd(
             block_sparse_tensors is None or block_sparse_tensors.fwd_work_order is None,
         )
 
+    compile_key += (dropout_compile_key(dropout),)
     if pack_gqa:
         # Head-major TMA tiles require the inner sequence extent to be static.
         # Specialize all view layouts and include their shape/stride in the key.
@@ -3071,6 +3121,15 @@ def _flash_attn_bwd(
             compile_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
+            if arch // 10 in [10, 11]:
+                compile_args.append(
+                    to_dropout_args(
+                        dropout,
+                        num_head,
+                        lambda t: to_cute_tensor(t, assumed_align=4, leading_dim=0),
+                        for_compile=True,
+                    )
+                )
         else:
             compile_args.extend(
                 (
@@ -3148,6 +3207,8 @@ def _flash_attn_bwd(
             call_args.append(Int64(prof_ptr) if prof_ptr else None)
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
+            if arch // 10 in [10, 11]:
+                call_args.append(to_dropout_args(dropout, num_head, lambda t: t, for_compile=False))
         else:
             call_args.extend(
                 (
@@ -3694,8 +3755,15 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        dropout_p: float = 0.0,
+        rng_state: Optional[torch.Tensor] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
+        dropout = None
+        if dropout_p > 0.0:
+            if rng_state is None:
+                rng_state = next_rng_state(v.device)
+            dropout = DropoutTensors(dropout_p, rng_state)
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
@@ -3723,6 +3791,7 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            dropout=dropout,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.shared_kv = shared_kv
@@ -3738,6 +3807,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
+        ctx.dropout = dropout
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -3766,9 +3836,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=ctx.causal,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 12)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 12)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3792,13 +3862,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
+                dropout=ctx.dropout,
             )
             if learnable_sink is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 12)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -4004,7 +4075,12 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    dropout_p: float = 0.0,
+    rng_state: Optional[torch.Tensor] = None,
 ):
+    """``dropout_p > 0`` applies SM100 attention dropout. ``rng_state`` is a device
+    ``int64[2]`` ``(seed, offset)``; ``None`` draws it from the CUDA generator (not
+    CUDA Graph safe: pass a caller-owned tensor when capturing)."""
     return FlashAttnFunc.apply(
         q,
         k,
@@ -4027,6 +4103,8 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        dropout_p,
+        rng_state,
     )
 
 

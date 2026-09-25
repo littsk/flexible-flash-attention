@@ -42,6 +42,7 @@ from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_i
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.cp_sync_sm90 import load_kv_ready
 from flash_attn.cute.utils import AuxData
+from flash_attn.cute.dropout import DropoutArgs, DropoutCtx, dropout_bit
 from flash_attn.cute.flash_fwd_sm100 import (
     _prof_mark,
     _PROF_MAX_EVENTS,
@@ -582,6 +583,7 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         prof_ptr: Optional[Int64] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        dropout: Optional[DropoutArgs] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -1191,6 +1193,7 @@ class FlashAttentionBackwardSm100:
             fastdiv_mods,
             blocksparse_tensors,
             prof_ptr,
+            dropout,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1279,6 +1282,7 @@ class FlashAttentionBackwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         prof_ptr: Optional[Int64] = None,
+        dropout: Optional[DropoutArgs] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1836,6 +1840,7 @@ class FlashAttentionBackwardSm100:
                 mdGQA_local_done,
                 mdGQA_local_expected,
                 mdGQA_finalize_state,
+                dropout=dropout,
             )
             if const_expr(prof_buf is not None):
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_END)
@@ -3248,6 +3253,7 @@ class FlashAttentionBackwardSm100:
         mdGQA_local_done: Optional[cute.Tensor] = None,
         mdGQA_local_expected: Optional[cute.Tensor] = None,
         mdGQA_finalize_state: Optional[cute.Tensor] = None,
+        dropout: Optional[DropoutArgs] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3368,6 +3374,7 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
 
+        dropout_ctx = DropoutCtx(dropout) if const_expr(dropout is not None) else None
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -3563,6 +3570,17 @@ class FlashAttentionBackwardSm100:
                     check_m_boundary=check_m_boundary,
                 )
                 num_stages = cute.size(tScS_t2r, mode=[1])
+                keep_bits = [None] * num_stages
+                if const_expr(dropout is not None):
+                    for stage in cutlass.range_constexpr(num_stages):
+                        keep_bits[stage] = mask.dropout_bits_sm100_transposed(
+                            tScS_t2r[None, stage, 0, 0],
+                            mask_m_block,
+                            cluster_n_block,
+                            batch_idx,
+                            mask_head_idx,
+                            dropout_ctx,
+                        )
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
                 # ---------------------------------------------
@@ -3593,7 +3611,15 @@ class FlashAttentionBackwardSm100:
                         )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                    utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                    if const_expr(dropout is not None):
+                        # dV consumes the dropped, rescaled P; dS below keeps the undropped P.
+                        tSrP_drop = cute.make_fragment_like(tSrS_cur)
+                        for i in cutlass.range_constexpr(cute.size(tSrS_cur)):
+                            kept = dropout_bit(keep_bits[stage], i)
+                            tSrP_drop[i] = tSrS_cur[i] * dropout_ctx.rp if kept else Float32(0.0)
+                        utils.cvt_f16(tSrP_drop, tSrP_r2t[None, stage, 0, 0])
+                    else:
+                        utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         if const_expr(self.split_P_dS):
                             # wait until the previous pdo UMMA has consumed the P slot
@@ -3655,6 +3681,11 @@ class FlashAttentionBackwardSm100:
                         cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                     else:
                         tSrdPsum = tSsdPsum_cur[lane_idx]
+                    if const_expr(dropout is not None):
+                        # dS = P * (Z * dP / (1 - p) - D): drop dP before subtracting D.
+                        for i in cutlass.range_constexpr(cute.size(tdPrdP_cur)):
+                            kept = dropout_bit(keep_bits[stage], i)
+                            tdPrdP_cur[i] = tdPrdP_cur[i] * dropout_ctx.rp if kept else Float32(0.0)
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         if const_expr(not self.shuffle_dPsum):
                             dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])

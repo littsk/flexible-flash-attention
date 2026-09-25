@@ -12,6 +12,7 @@ from cutlass.cutlass_dsl import min as dsl_min
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.dropout import DropoutCtx
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
 
@@ -772,6 +773,72 @@ class AttentionMask:
                         )
 
                     mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
+
+    @cute.jit
+    def dropout_bits_sm100(
+        self,
+        thr_mma: cute.TiledMma,
+        thr_tmem_load: cute.TiledCopy,
+        m_block: Int32,
+        n_block: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        dropout: DropoutCtx,
+        head_divmod=None,
+    ) -> cute.Tensor:
+        """Forward keep bits (bit ``i % 32`` of word ``i // 32``) for one score fragment.
+
+        Coordinates match ``apply_mask_mod_sm100_scalar``: Pack-GQA rows are split
+        back into logical (q, head) before the dropout hash.
+        """
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        tScS = thr_mma.partition_C(cS)[(None, None), 0, 0]
+        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        ncol = const_expr(cute.size(tScS_t2r.shape))
+        assert ncol % 32 == 0, "dropout bits pack 32 score columns per word"
+        bits = cute.make_rmem_tensor(ncol // 32, Uint32)
+        for w in cutlass.range_constexpr(ncol // 32):
+            word = Uint32(0)
+            for j in cutlass.range_constexpr(32):
+                i = w * 32 + j
+                global_row = tScS_t2r[i][0] + m_block * self.tile_m
+                col = tScS_t2r[i][1] + n_block * self.tile_n
+                if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                    row, head_offset = divmod(global_row, head_divmod)
+                    head = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+                else:
+                    row, head = global_row, head_idx
+                keep = dropout.keep(batch_idx, head, row, col)
+                word = word | (Uint32(1 << j) if keep else Uint32(0))
+            bits[w] = word
+        return bits
+
+    @cute.jit
+    def dropout_bits_sm100_transposed(
+        self,
+        tScS_t2r: cute.Tensor,
+        m_block: Int32,
+        n_block: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        dropout: DropoutCtx,
+    ) -> cute.Tensor:
+        """Backward keep bits for one S^T fragment; ROW is Q and COL is KV."""
+        ROW = 0 if const_expr(not self.swap_AB) else 1
+        COL = 1 if const_expr(not self.swap_AB) else 0
+        ncol = const_expr(cute.size(tScS_t2r.shape))
+        assert ncol % 32 == 0, "dropout bits pack 32 score columns per word"
+        bits = cute.make_rmem_tensor(ncol // 32, Uint32)
+        for w in cutlass.range_constexpr(ncol // 32):
+            word = Uint32(0)
+            for j in cutlass.range_constexpr(32):
+                i = w * 32 + j
+                q = tScS_t2r[i][ROW] + m_block * self.tile_m
+                k = tScS_t2r[i][COL] + n_block * self.tile_n
+                keep = dropout.keep(batch_idx, head_idx, q, k)
+                word = word | (Uint32(1 << j) if keep else Uint32(0))
+            bits[w] = word
+        return bits
 
     @cute.jit
     def apply_mask_sm100_transposed(

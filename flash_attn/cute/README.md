@@ -58,6 +58,24 @@ row loads its bounds once and every interval `[lo, hi)` becomes
 Backward and SM90 use the scalar form. Blocks crossing the sequence boundary are
 always treated as partial.
 
+## Attention dropout (SM100/SM110)
+
+```python
+out, lse = flash_attn_func(q, k, v, causal=True, dropout_p=0.1, rng_state=state)
+```
+
+Element `(b, h, q, k)` is kept iff a counter hash of `(seed, offset, b * H + h, q,
+k)` is at least `floor(p * 2**32)`; kept probabilities are scaled by `1 / (1 - p)`
+(applied to `O` in the forward epilogue). `rng_state` is a device `int64[2]`
+`(seed, offset)` read by the kernels, so CUDA Graph replays pick up in-place
+updates; `None` draws it from the CUDA generator and advances its offset. The mask
+depends only on the logical coordinates, so the backward regenerates it under any
+tiling, 2CTA, PackGQA, SplitKV or block sparsity. `_flash_attn_fwd/_bwd(dropout=
+DropoutTensors(p, rng_state, q_positions, kv_positions))` remap kernel-local rows
+and columns to the coordinates the mask is keyed by (context parallelism passes
+global token positions). `flash_attn.cute.dropout.dropout_keep_mask` is a
+bit-identical torch reference. SM90, the hd256 kernels and MLA reject dropout.
+
 ## Deterministic block-sparse PackGQA backward
 
 The SM100/SM110 backward supports an opt-in head-major PackGQA path. One CTA

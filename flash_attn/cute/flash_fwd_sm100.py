@@ -78,6 +78,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerProtocol,
 )
 from flash_attn.cute.utils import AuxData, smid
+from flash_attn.cute.dropout import DropoutArgs, DropoutCtx
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from cutlass.cute import FastDivmodDivisorV2
@@ -584,6 +585,7 @@ class FlashAttentionForwardSm100:
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
+        dropout: Optional[DropoutArgs] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -997,6 +999,7 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            dropout,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1061,6 +1064,7 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        dropout: Optional[DropoutArgs] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1556,6 +1560,7 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                dropout=dropout,
             )
 
             if const_expr(prof_buf is not None):
@@ -1609,6 +1614,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                dropout_rp=dropout.rp if const_expr(dropout is not None) else None,
             )
             if const_expr(prof_buf is not None):
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_EVT_CORRECTION, _PROF_PHASE_END)
@@ -2254,6 +2260,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        dropout: Optional[DropoutArgs] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2319,6 +2326,7 @@ class FlashAttentionForwardSm100:
         # self.warp_scheduler_barrier_init()
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        dropout_ctx = DropoutCtx(dropout) if const_expr(dropout is not None) else None
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2385,6 +2393,18 @@ class FlashAttentionForwardSm100:
                 )
             else:
                 mask_fn_none = None
+            dropout_bits_fn = None
+            if const_expr(dropout is not None):
+                dropout_bits_fn = partial(
+                    mask.dropout_bits_sm100,
+                    thr_mma=thr_mma_qk,
+                    thr_tmem_load=thr_tmem_load,
+                    m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    dropout=dropout_ctx,
+                    head_divmod=head_divmod,
+                )
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
@@ -2453,6 +2473,7 @@ class FlashAttentionForwardSm100:
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                dropout_bits_fn=dropout_bits_fn,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2637,6 +2658,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        dropout_bits_fn: Optional[Callable] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2724,12 +2746,16 @@ class FlashAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
+        keep_bits = None
+        if const_expr(dropout_bits_fn is not None):
+            keep_bits = dropout_bits_fn(n_block=n_block)
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
             ex2_emu_freq=self.ex2_emu_freq,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
+            keep_bits=keep_bits,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
@@ -2784,6 +2810,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        dropout_rp: Optional[Float32] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2954,6 +2981,8 @@ class FlashAttentionForwardSm100:
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * v_descale
+                    if const_expr(dropout_rp is not None):
+                        scale = scale * dropout_rp
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
