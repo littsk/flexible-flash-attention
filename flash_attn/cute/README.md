@@ -64,17 +64,22 @@ always treated as partial.
 out, lse = flash_attn_func(q, k, v, causal=True, dropout_p=0.1, rng_state=state)
 ```
 
-Element `(b, h, q, k)` is kept iff a counter hash of `(seed, offset, b * H + h, q,
-k)` is at least `floor(p * 2**32)`; kept probabilities are scaled by `1 / (1 - p)`
-(applied to `O` in the forward epilogue). `rng_state` is a device `int64[2]`
-`(seed, offset)` read by the kernels, so CUDA Graph replays pick up in-place
-updates; `None` draws it from the CUDA generator and advances its offset. The mask
-depends only on the logical coordinates, so the backward regenerates it under any
-tiling, 2CTA, PackGQA, SplitKV or block sparsity. `_flash_attn_fwd/_bwd(dropout=
-DropoutTensors(p, rng_state, q_positions, kv_positions))` remap kernel-local rows
-and columns to the coordinates the mask is keyed by (context parallelism passes
-global token positions). `flash_attn.cute.dropout.dropout_keep_mask` is a
-bit-identical torch reference. SM90, the hd256 kernels and MLA reject dropout.
+One 32-bit counter hash of `(seed, offset, b * H + h, q >> 1, k >> 1)` covers a
+2x2 group; element `(q, k)` is kept iff byte `2 * (q & 1) + (k & 1)` is at least
+`t = round(p * 256)`, and kept probabilities are scaled by `256 / (256 - t)`
+(applied to `O` in the forward epilogue), so the effective drop probability is
+`t / 256`. Row and column hash terms are separable: the forward hashes once per
+row, the backward once per KV row, and each hash serves two elements.
+`rng_state` is a device `int64[2]` `(seed, offset)` read by the kernels, so CUDA
+Graph replays pick up in-place updates; `None` draws it from the CUDA generator
+and advances its offset. The mask depends only on the logical coordinates, so the
+backward regenerates it under any tiling, 2CTA, PackGQA, SplitKV or block
+sparsity. `_flash_attn_fwd/_bwd(dropout=DropoutTensors(p, rng_state, q_positions,
+kv_positions))` remap kernel-local rows and columns to the coordinates the mask is
+keyed by (context parallelism passes global token positions); positions must map
+aligned pairs `(2i, 2i + 1)` to aligned pairs. `flash_attn.cute.dropout.
+dropout_keep_mask` is a bit-identical torch reference. SM90, the hd256 kernels and
+MLA reject dropout.
 
 ## Deterministic block-sparse PackGQA backward
 

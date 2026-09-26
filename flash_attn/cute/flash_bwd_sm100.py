@@ -42,7 +42,7 @@ from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_i
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.cp_sync_sm90 import load_kv_ready
 from flash_attn.cute.utils import AuxData
-from flash_attn.cute.dropout import DropoutArgs, DropoutCtx, dropout_bit
+from flash_attn.cute.dropout import DropoutArgs, DropoutCtx
 from flash_attn.cute.flash_fwd_sm100 import (
     _prof_mark,
     _PROF_MAX_EVENTS,
@@ -3570,17 +3570,11 @@ class FlashAttentionBackwardSm100:
                     check_m_boundary=check_m_boundary,
                 )
                 num_stages = cute.size(tScS_t2r, mode=[1])
-                keep_bits = [None] * num_stages
+                keep_pair = None
                 if const_expr(dropout is not None):
-                    for stage in cutlass.range_constexpr(num_stages):
-                        keep_bits[stage] = mask.dropout_bits_sm100_transposed(
-                            tScS_t2r[None, stage, 0, 0],
-                            mask_m_block,
-                            cluster_n_block,
-                            batch_idx,
-                            mask_head_idx,
-                            dropout_ctx,
-                        )
+                    keep_pair = mask.dropout_keep_fn_sm100_transposed(
+                        tScS_t2r, mask_m_block, cluster_n_block, batch_idx, mask_head_idx, dropout_ctx
+                    )
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
                 # ---------------------------------------------
@@ -3614,9 +3608,12 @@ class FlashAttentionBackwardSm100:
                     if const_expr(dropout is not None):
                         # dV consumes the dropped, rescaled P; dS below keeps the undropped P.
                         tSrP_drop = cute.make_fragment_like(tSrS_cur)
-                        for i in cutlass.range_constexpr(cute.size(tSrS_cur)):
-                            kept = dropout_bit(keep_bits[stage], i)
-                            tSrP_drop[i] = tSrS_cur[i] * dropout_ctx.rp if kept else Float32(0.0)
+                        for i in cutlass.range_constexpr(0, cute.size(tSrS_cur), 2):
+                            keep0, keep1 = keep_pair(stage, i)
+                            tSrP_drop[i] = tSrS_cur[i] * dropout_ctx.rp if keep0 else Float32(0.0)
+                            tSrP_drop[i + 1] = (
+                                tSrS_cur[i + 1] * dropout_ctx.rp if keep1 else Float32(0.0)
+                            )
                         utils.cvt_f16(tSrP_drop, tSrP_r2t[None, stage, 0, 0])
                     else:
                         utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
@@ -3682,10 +3679,12 @@ class FlashAttentionBackwardSm100:
                     else:
                         tSrdPsum = tSsdPsum_cur[lane_idx]
                     if const_expr(dropout is not None):
-                        # dS = P * (Z * dP / (1 - p) - D): drop dP before subtracting D.
-                        for i in cutlass.range_constexpr(cute.size(tdPrdP_cur)):
-                            kept = dropout_bit(keep_bits[stage], i)
-                            tdPrdP_cur[i] = tdPrdP_cur[i] * dropout_ctx.rp if kept else Float32(0.0)
+                        # dS = P * (Z * dP * rp - D): recompute Z (cheaper than keeping bits
+                        # live across the dP wait); rp is folded into the FMA below.
+                        for i in cutlass.range_constexpr(0, cute.size(tdPrdP_cur), 2):
+                            keep0, keep1 = keep_pair(stage, i)
+                            tdPrdP_cur[i] = tdPrdP_cur[i] if keep0 else Float32(0.0)
+                            tdPrdP_cur[i + 1] = tdPrdP_cur[i + 1] if keep1 else Float32(0.0)
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         if const_expr(not self.shuffle_dPsum):
                             dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
@@ -3694,9 +3693,16 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v),
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.sub_packed_f32x2(
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
-                        )
+                        if const_expr(dropout is not None):
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                                (dropout_ctx.rp, dropout_ctx.rp),
+                                (-dPsum_pair[0], -dPsum_pair[1]),
+                            )
+                        else:
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.sub_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                            )
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),

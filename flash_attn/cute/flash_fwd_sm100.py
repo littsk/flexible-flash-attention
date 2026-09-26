@@ -2393,16 +2393,15 @@ class FlashAttentionForwardSm100:
                 )
             else:
                 mask_fn_none = None
-            dropout_bits_fn = None
+            dropout_keep_fn = None
             if const_expr(dropout is not None):
-                dropout_bits_fn = partial(
-                    mask.dropout_bits_sm100,
-                    thr_mma=thr_mma_qk,
-                    thr_tmem_load=thr_tmem_load,
-                    m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
-                    batch_idx=batch_idx,
-                    head_idx=head_idx,
-                    dropout=dropout_ctx,
+                dropout_keep_fn = mask.dropout_keep_fn_sm100(
+                    thr_mma_qk,
+                    thr_tmem_load,
+                    (self.q_stage * m_block + stage) * self.cta_group_size,
+                    batch_idx,
+                    head_idx,
+                    dropout_ctx,
                     head_divmod=head_divmod,
                 )
 
@@ -2473,7 +2472,7 @@ class FlashAttentionForwardSm100:
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
-                dropout_bits_fn=dropout_bits_fn,
+                dropout_keep_fn=dropout_keep_fn,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2658,7 +2657,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
-        dropout_bits_fn: Optional[Callable] = None,
+        dropout_keep_fn: Optional[Callable] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2746,16 +2745,16 @@ class FlashAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
-        keep_bits = None
-        if const_expr(dropout_bits_fn is not None):
-            keep_bits = dropout_bits_fn(n_block=n_block)
+        keep_fn = None
+        if const_expr(dropout_keep_fn is not None):
+            keep_fn = partial(dropout_keep_fn, n_block=n_block)
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
             ex2_emu_freq=self.ex2_emu_freq,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
-            keep_bits=keep_bits,
+            keep_fn=keep_fn,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):

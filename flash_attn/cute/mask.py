@@ -774,47 +774,40 @@ class AttentionMask:
 
                     mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
-    @cute.jit
-    def dropout_bits_sm100(
+    def dropout_keep_fn_sm100(
         self,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
         m_block: Int32,
-        n_block: Int32,
         batch_idx: Int32,
         head_idx: Int32,
         dropout: DropoutCtx,
         head_divmod=None,
-    ) -> cute.Tensor:
-        """Forward keep bits (bit ``i % 32`` of word ``i // 32``) for one score fragment.
+    ) -> Callable:
+        """Forward ``keep_pair(i, n_block)`` for fragment elements ``i`` and ``i + 1``.
 
-        Coordinates match ``apply_mask_mod_sm100_scalar``: Pack-GQA rows are split
-        back into logical (q, head) before the dropout hash.
+        Each thread owns one score row, so the row term is hashed once. Coordinates
+        match ``apply_mask_mod_sm100_scalar``: Pack-GQA rows are split back into
+        logical (q, head) first; even ``i`` and ``i + 1`` are adjacent columns.
         """
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
-        tScS = thr_mma.partition_C(cS)[(None, None), 0, 0]
-        tScS_t2r = thr_tmem_load.partition_D(tScS)
-        ncol = const_expr(cute.size(tScS_t2r.shape))
-        assert ncol % 32 == 0, "dropout bits pack 32 score columns per word"
-        bits = cute.make_rmem_tensor(ncol // 32, Uint32)
-        for w in cutlass.range_constexpr(ncol // 32):
-            word = Uint32(0)
-            for j in cutlass.range_constexpr(32):
-                i = w * 32 + j
-                global_row = tScS_t2r[i][0] + m_block * self.tile_m
-                col = tScS_t2r[i][1] + n_block * self.tile_n
-                if const_expr(self.qhead_per_kvhead_packgqa != 1):
-                    row, head_offset = divmod(global_row, head_divmod)
-                    head = head_idx * self.qhead_per_kvhead_packgqa + head_offset
-                else:
-                    row, head = global_row, head_idx
-                keep = dropout.keep(batch_idx, head, row, col)
-                word = word | (Uint32(1 << j) if keep else Uint32(0))
-            bits[w] = word
-        return bits
+        tScS_t2r = thr_tmem_load.partition_D(thr_mma.partition_C(cS)[(None, None), 0, 0])
+        global_row = tScS_t2r[0][0] + m_block * self.tile_m
+        if const_expr(self.qhead_per_kvhead_packgqa != 1):
+            row, head_offset = divmod(global_row, head_divmod)
+            head = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+        else:
+            row, head = global_row, head_idx
+        q = dropout.global_q(row)
+        row_term = dropout.q_term(q) ^ dropout.head_key(batch_idx, head)
 
-    @cute.jit
-    def dropout_bits_sm100_transposed(
+        def keep_pair(i: int, n_block: Int32):
+            k0 = dropout.global_k(tScS_t2r[i][1] + n_block * self.tile_n)
+            return dropout.keep_pair_along_k(row_term, q, k0)
+
+        return keep_pair
+
+    def dropout_keep_fn_sm100_transposed(
         self,
         tScS_t2r: cute.Tensor,
         m_block: Int32,
@@ -822,23 +815,22 @@ class AttentionMask:
         batch_idx: Int32,
         head_idx: Int32,
         dropout: DropoutCtx,
-    ) -> cute.Tensor:
-        """Backward keep bits for one S^T fragment; ROW is Q and COL is KV."""
+    ) -> Callable:
+        """Backward ``keep_pair(stage, i)`` for S^T elements ``i`` and ``i + 1`` of a stage.
+
+        ROW is Q and COL is KV. Each thread owns one KV row, so the column term is
+        hashed once; even ``i`` and ``i + 1`` are adjacent Q rows sharing one hash.
+        """
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
-        ncol = const_expr(cute.size(tScS_t2r.shape))
-        assert ncol % 32 == 0, "dropout bits pack 32 score columns per word"
-        bits = cute.make_rmem_tensor(ncol // 32, Uint32)
-        for w in cutlass.range_constexpr(ncol // 32):
-            word = Uint32(0)
-            for j in cutlass.range_constexpr(32):
-                i = w * 32 + j
-                q = tScS_t2r[i][ROW] + m_block * self.tile_m
-                k = tScS_t2r[i][COL] + n_block * self.tile_n
-                keep = dropout.keep(batch_idx, head_idx, q, k)
-                word = word | (Uint32(1 << j) if keep else Uint32(0))
-            bits[w] = word
-        return bits
+        k = dropout.global_k(tScS_t2r[0][COL] + n_block * self.tile_n)
+        col_term = dropout.k_term(k) ^ dropout.head_key(batch_idx, head_idx)
+
+        def keep_pair(stage: int, i: int):
+            q0 = dropout.global_q(tScS_t2r[None, stage, 0, 0][i][ROW] + m_block * self.tile_m)
+            return dropout.keep_pair_along_q(col_term, q0, k)
+
+        return keep_pair
 
     @cute.jit
     def apply_mask_sm100_transposed(

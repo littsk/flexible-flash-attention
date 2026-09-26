@@ -1,12 +1,22 @@
 """Attention dropout keyed by logical coordinates.
 
-Element ``(b, h, q, k)`` is kept iff ``hash(seed, offset, b * H + h, q, k) >=
-threshold`` where ``threshold = floor(p * 2**32)``. Kept probabilities are
-scaled by ``1 / (1 - p)``. The hash only depends on the logical coordinates, so
-forward and backward kernels regenerate the same mask regardless of tiling,
-2CTA, PackGQA, SplitKV or KV slot order. ``q_positions`` / ``kv_positions``
-remap kernel-local rows / columns to the coordinates the mask is keyed by
-(context parallelism passes global token positions).
+One 32-bit hash covers the 2x2 group ``(q >> 1, k >> 1)``::
+
+    h = fmix32((q >> 1) * PHI_Q ^ (k >> 1) * PHI_K ^ fmix32((b * H + h) ^ key))
+
+and element ``(q, k)`` is kept iff byte ``2 * (q & 1) + (k & 1)`` of ``h`` is at
+least ``t = round(p * 256)``. Kept probabilities are scaled by
+``256 / (256 - t)``, so the effective drop probability is ``t / 256``. The row
+and column terms are separable: the forward hoists the row term (one row per
+thread) and the backward hoists the column term (one KV row per thread), and
+each hash serves two elements in both directions.
+
+The mask depends only on logical coordinates, so forward and backward kernels
+regenerate it regardless of tiling, 2CTA, PackGQA, SplitKV or KV slot order.
+``q_positions`` / ``kv_positions`` remap kernel-local rows / columns to the
+coordinates the mask is keyed by (context parallelism passes global token
+positions); they must map every aligned local pair ``(2i, 2i + 1)`` to an aligned
+pair ``(2j, 2j + 1)``.
 
 ``rng_state`` is a device ``int64[2]`` tensor ``(seed, offset)`` read by the
 kernel, so CUDA Graph replays can advance it without recapturing.
@@ -23,7 +33,8 @@ from cutlass import Float32, Int32, Uint32
 
 _M1 = 0x85EBCA6B
 _M2 = 0xC2B2AE35
-_GOLDEN = 0x9E3779B9
+_PHI_Q = 0x9E3779B9
+_PHI_K = 0x85EBCA77
 _MASK32 = 0xFFFFFFFF
 
 
@@ -55,9 +66,15 @@ def next_rng_state(device: torch.device) -> torch.Tensor:
 
 
 def dropout_threshold(p: float) -> int:
+    """Byte threshold ``t``; the effective drop probability is ``t / 256``."""
     if not 0.0 <= p < 1.0:
         raise ValueError(f"dropout p must be in [0, 1), got {p}")
-    return min(int(p * 2**32), _MASK32)
+    return min(round(p * 256), 255)
+
+
+def dropout_scale(p: float) -> float:
+    """Unbiased rescale ``1 / (1 - t / 256)`` for kept elements."""
+    return 256.0 / (256 - dropout_threshold(p))
 
 
 def validate_dropout(dropout: DropoutTensors, device: torch.device) -> None:
@@ -67,10 +84,20 @@ def validate_dropout(dropout: DropoutTensors, device: torch.device) -> None:
     for name in ("q_positions", "kv_positions"):
         positions = getattr(dropout, name)
         if positions is not None and (
-            positions.dtype != torch.int32 or positions.ndim != 1 or positions.device != device
+            positions.dtype != torch.int32
+            or positions.ndim != 1
+            or positions.device != device
+            or positions.numel() % 2
         ):
-            raise ValueError(f"dropout {name} must be a 1-D int32 tensor on {device}")
+            raise ValueError(f"dropout {name} must be a 1-D even-length int32 tensor on {device}")
     dropout_threshold(dropout.p)
+
+
+def check_pair_aligned(positions: torch.Tensor) -> None:
+    """Positions must map aligned local pairs to aligned global pairs (syncs the device)."""
+    pairs = positions.view(-1, 2)
+    if not bool(((pairs[:, 0] % 2 == 0) & (pairs[:, 1] == pairs[:, 0] + 1)).all()):
+        raise ValueError("dropout positions must map aligned pairs to aligned pairs")
 
 
 def to_dropout_args(
@@ -79,7 +106,7 @@ def to_dropout_args(
     """Compile args wrap scalars in DSL types; call args pass plain Python scalars."""
     if dropout is None:
         return None
-    threshold, rp = dropout_threshold(dropout.p), 1.0 / (1.0 - dropout.p)
+    threshold, rp = dropout_threshold(dropout.p), dropout_scale(dropout.p)
     return DropoutArgs(
         rng_state=to_tensor(dropout.rng_state),
         threshold=Uint32(threshold) if for_compile else threshold,
@@ -115,38 +142,60 @@ def dropout_key(rng_state: cute.Tensor) -> Uint32:
     return fmix32(Uint32(seed & _MASK32) ^ key)
 
 
-@cute.jit
-def dropout_keep(key: Uint32, bh: Int32, q: Int32, k: Int32, threshold: Uint32) -> cutlass.Boolean:
-    row = fmix32(Uint32(q) ^ fmix32(Uint32(bh) ^ key))
-    return fmix32(row ^ (Uint32(k) * Uint32(_GOLDEN))) >= threshold
-
-
-@cute.jit
-def dropout_bit(bits: cute.Tensor, i: cutlass.Constexpr[int]) -> cutlass.Boolean:
-    """Keep bit of fragment element ``i`` in a word-packed keep mask."""
-    return ((bits[i // 32] >> Uint32(i % 32)) & Uint32(1)) != Uint32(0)
-
-
 class DropoutCtx:
     """Per-kernel dropout constants; positions remap local rows / columns."""
 
     def __init__(self, args: DropoutArgs):
         self.key = dropout_key(args.rng_state)
-        self.threshold = args.threshold
+        self.threshold_top = args.threshold << Uint32(24)
         self.rp = args.rp
         self.num_heads_q = args.num_heads_q
         self.q_positions = args.q_positions
         self.kv_positions = args.kv_positions
 
     @cute.jit
-    def keep(self, batch_idx: Int32, head_idx: Int32, q: Int32, k: Int32) -> cutlass.Boolean:
-        """``q`` / ``k`` are kernel-local; out-of-range indices read the last position."""
+    def global_q(self, q: Int32) -> Int32:
+        """Local row -> keyed row; out-of-range rows read the last position."""
         if cutlass.const_expr(self.q_positions is not None):
             q = self.q_positions[cutlass.min(q, cute.size(self.q_positions) - 1)]
+        return q
+
+    @cute.jit
+    def global_k(self, k: Int32) -> Int32:
         if cutlass.const_expr(self.kv_positions is not None):
             k = self.kv_positions[cutlass.min(k, cute.size(self.kv_positions) - 1)]
-        bh = batch_idx * self.num_heads_q + head_idx
-        return dropout_keep(self.key, bh, q, k, self.threshold)
+        return k
+
+    @cute.jit
+    def head_key(self, batch_idx: Int32, head_idx: Int32) -> Uint32:
+        return fmix32(Uint32(batch_idx * self.num_heads_q + head_idx) ^ self.key)
+
+    @cute.jit
+    def q_term(self, q: Int32) -> Uint32:
+        return Uint32(q >> 1) * Uint32(_PHI_Q)
+
+    @cute.jit
+    def k_term(self, k: Int32) -> Uint32:
+        return Uint32(k >> 1) * Uint32(_PHI_K)
+
+    @cute.jit
+    def keep_byte(self, h: Uint32, byte: Int32) -> cutlass.Boolean:
+        # Byte ``byte`` moved to the top: the lower bits cannot change the comparison.
+        return (h << Uint32(24 - byte * 8)) >= self.threshold_top
+
+    @cute.jit
+    def keep_pair_along_k(self, row_term: Uint32, q: Int32, k0: Int32):
+        """Keep for ``(q, k0)`` and ``(q, k0 + 1)``; ``row_term = q_term(q) ^ head_key``."""
+        h = fmix32(row_term ^ self.k_term(k0))
+        byte = (q & 1) * 2
+        return self.keep_byte(h, byte), self.keep_byte(h, byte + 1)
+
+    @cute.jit
+    def keep_pair_along_q(self, col_term: Uint32, q0: Int32, k: Int32):
+        """Keep for ``(q0, k)`` and ``(q0 + 1, k)``; ``col_term = k_term(k) ^ head_key``."""
+        h = fmix32(col_term ^ self.q_term(q0))
+        byte = k & 1
+        return self.keep_byte(h, byte), self.keep_byte(h, byte + 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +231,10 @@ def dropout_keep_mask(
     key = mix((offset & _MASK32) ^ key)
     key = mix((seed >> 32) ^ key)
     key = mix((seed & _MASK32) ^ key)
-    bh = batch_idx * num_heads_q + head_idx
-    row = _fmix32_torch(q.to(torch.int64) ^ mix(torch.as_tensor(bh, device=device) ^ key))
-    col = (k.to(torch.int64) * _GOLDEN) & _MASK32
-    return _fmix32_torch(row[:, None] ^ col[None, :]) >= dropout_threshold(p)
+    head_key = mix((batch_idx * num_heads_q + head_idx) ^ key)
+    q, k = q.to(torch.int64), k.to(torch.int64)
+    q_term = ((q >> 1) * _PHI_Q) & _MASK32
+    k_term = ((k >> 1) * _PHI_K) & _MASK32
+    h = _fmix32_torch(q_term[:, None] ^ k_term[None, :] ^ head_key)
+    byte = 2 * (q[:, None] & 1) + (k[None, :] & 1)
+    return ((h >> (8 * byte)) & 0xFF) >= dropout_threshold(p)
