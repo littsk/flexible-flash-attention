@@ -3581,6 +3581,7 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                stage_keeps = [None] * num_stages
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3606,14 +3607,19 @@ class FlashAttentionBackwardSm100:
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
                     if const_expr(dropout is not None):
-                        # dV consumes the dropped, rescaled P; dS below keeps the undropped P.
+                        # dV consumes the dropped, rescaled P; dS below keeps the undropped P
+                        # and reuses these keeps (position gathers cannot be CSE'd across
+                        # the dP wait).
                         tSrP_drop = cute.make_fragment_like(tSrS_cur)
+                        keeps = []
                         for i in cutlass.range_constexpr(0, cute.size(tSrS_cur), 2):
                             keep0, keep1 = keep_pair(stage, i)
+                            keeps += [keep0, keep1]
                             tSrP_drop[i] = tSrS_cur[i] * dropout_ctx.rp if keep0 else Float32(0.0)
                             tSrP_drop[i + 1] = (
                                 tSrS_cur[i + 1] * dropout_ctx.rp if keep1 else Float32(0.0)
                             )
+                        stage_keeps[stage] = keeps
                         utils.cvt_f16(tSrP_drop, tSrP_r2t[None, stage, 0, 0])
                     else:
                         utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
@@ -3679,12 +3685,10 @@ class FlashAttentionBackwardSm100:
                     else:
                         tSrdPsum = tSsdPsum_cur[lane_idx]
                     if const_expr(dropout is not None):
-                        # dS = P * (Z * dP * rp - D): recompute Z (cheaper than keeping bits
-                        # live across the dP wait); rp is folded into the FMA below.
-                        for i in cutlass.range_constexpr(0, cute.size(tdPrdP_cur), 2):
-                            keep0, keep1 = keep_pair(stage, i)
-                            tdPrdP_cur[i] = tdPrdP_cur[i] if keep0 else Float32(0.0)
-                            tdPrdP_cur[i + 1] = tdPrdP_cur[i + 1] if keep1 else Float32(0.0)
+                        # dS = P * (Z * dP * rp - D); rp is folded into the FMA below.
+                        for i in cutlass.range_constexpr(cute.size(tdPrdP_cur)):
+                            kept = stage_keeps[stage][i]
+                            tdPrdP_cur[i] = tdPrdP_cur[i] if kept else Float32(0.0)
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         if const_expr(not self.shuffle_dPsum):
                             dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])

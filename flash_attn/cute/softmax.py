@@ -421,8 +421,9 @@ class SoftmaxSm100(Softmax):
     ):
         """exp2 in place; ``acc_S_row`` keeps the undropped values for the row sum.
 
-        ``keep_fn(i)`` returns the keep flags of elements ``i`` and ``i + 1`` (even
-        ``i``) and zeroes dropped entries of the converted P only.
+        ``keep_fn(i)`` returns the 32-bit AND-masks of the packed 16-bit pairs
+        ``(i, i + 1)`` and ``(i + 2, i + 3)`` (``i % 4 == 0``) and zeroes dropped
+        entries of the converted P only.
         """
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -433,6 +434,9 @@ class SoftmaxSm100(Softmax):
         acc_S_row_converted_frg = cute.logical_divide(
             acc_S_row_converted, cute.make_layout(frg_tile)
         )
+        if cutlass.const_expr(keep_fn is not None):
+            assert acc_S_row_converted.element_type.width == 16, "dropout masks 16-bit P pairs"
+            acc_S_row_packed = cute.recast_tensor(acc_S_row_converted, cutlass.Uint32)
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
@@ -455,19 +459,15 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            if cutlass.const_expr(keep_fn is None):
-                acc_S_row_converted_frg[None, j].store(
-                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-                )
-            else:
-                kept = cute.make_rmem_tensor(frg_tile, Float32)
-                for k in cutlass.range_constexpr(0, frg_tile, 2):
-                    keep0, keep1 = keep_fn(j * frg_tile + k)
-                    kept[k] = acc_S_row_frg[k, j] if keep0 else Float32(0.0)
-                    kept[k + 1] = acc_S_row_frg[k + 1, j] if keep1 else Float32(0.0)
-                acc_S_row_converted_frg[None, j].store(
-                    kept.load().to(acc_S_row_converted.element_type)
-                )
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+            if cutlass.const_expr(keep_fn is not None):
+                for k in cutlass.range_constexpr(0, frg_tile, 4):
+                    w = (j * frg_tile + k) // 2
+                    mask_a, mask_b = keep_fn(j * frg_tile + k)
+                    acc_S_row_packed[w] = acc_S_row_packed[w] & mask_a
+                    acc_S_row_packed[w + 1] = acc_S_row_packed[w + 1] & mask_b
 
     @cute.jit
     def scale_apply_exp2_convert(

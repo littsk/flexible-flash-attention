@@ -621,6 +621,29 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
     )
 
 
+@dsl_user_op
+def prmt_b32(
+    a: cutlass.Uint32, b: cutlass.Uint32, sel: cutlass.Uint32, *, loc=None, ip=None
+) -> cutlass.Uint32:
+    """PTX ``prmt.b32``: pick bytes of ``{b, a}``; a selector nibble with bit 3 set
+    replicates the sign of its byte instead of copying it."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Uint32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(b).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(sel).ir_value(loc=loc, ip=ip),
+            ],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 @cute.jit
 def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
     if const_expr(lane is None):

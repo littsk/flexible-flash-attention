@@ -784,11 +784,14 @@ class AttentionMask:
         dropout: DropoutCtx,
         head_divmod=None,
     ) -> Callable:
-        """Forward ``keep_pair(i, n_block)`` for fragment elements ``i`` and ``i + 1``.
+        """Forward ``block_keep_masks(n_block) -> keep_masks(i)``: bf16x2 AND-masks of
+        pairs ``(i, i + 1)`` and ``(i + 2, i + 3)`` for ``i % 4 == 0``.
 
         Each thread owns one score row, so the row term is hashed once. Coordinates
         match ``apply_mask_mod_sm100_scalar``: Pack-GQA rows are split back into
         logical (q, head) first; even ``i`` and ``i + 1`` are adjacent columns.
+        With KV positions, lane ``l`` gathers column pairs ``l, l + 32, ...`` of the
+        block once and the masks read them back with shuffles.
         """
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS_t2r = thr_tmem_load.partition_D(thr_mma.partition_C(cS)[(None, None), 0, 0])
@@ -800,12 +803,46 @@ class AttentionMask:
             row, head = global_row, head_idx
         q = dropout.global_q(row)
         row_term = dropout.q_term(q) ^ dropout.head_key(batch_idx, head)
+        byte_sel = dropout.row_byte_sel(q)
+        # Rows q and q ^ 1 of one head sit ``pair_lanes`` lanes apart and share
+        # every 2x2 hash, so each of the two lanes hashes half of the pairs.
+        pair_lanes = self.qhead_per_kvhead_packgqa
+        share = pair_lanes in (1, 2, 4, 8, 16)
+        odd = (row & 1) != 0
+        # The even row hashes column pair a, the odd row pair b = a + 1.
+        own_pair = Int32(odd)
+        gather_k = dropout.kv_positions is not None
+        if const_expr(gather_k):
+            lane = cute.arch.lane_idx()
 
-        def keep_pair(i: int, n_block: Int32):
-            k0 = dropout.global_k(tScS_t2r[i][1] + n_block * self.tile_n)
-            return dropout.keep_pair_along_k(row_term, q, k0)
+        def block_keep_masks(n_block: Int32):
+            pair0 = n_block * (self.tile_n // 2)
+            if const_expr(gather_k):
+                lane_k_terms = [
+                    dropout.k_term(dropout.global_k(2 * (pair0 + lane + 32 * r)))
+                    for r in range((self.tile_n + 63) // 64)
+                ]
 
-        return keep_pair
+            def k_term(pair: int, lane_offset=0):
+                """K term of the block's column pair ``pair (+ lane_offset)``."""
+                if const_expr(not gather_k):
+                    return dropout.pair_k_term(pair0 + pair + lane_offset)
+                return cute.arch.shuffle_sync(lane_k_terms[pair // 32], (pair % 32) | lane_offset)
+
+            def keep_masks(i: int):
+                pair_a = tScS_t2r[i][1] // 2
+                assert pair_a % 2 == 0 and tScS_t2r[i + 2][1] // 2 == pair_a + 1
+                if const_expr(share):
+                    own_k_term = k_term(pair_a, own_pair)
+                    h_a, h_b = dropout.shared_pair_hashes(row_term, own_k_term, pair_lanes)
+                else:
+                    h_a = dropout.pair_hash(row_term, k_term(pair_a))
+                    h_b = dropout.pair_hash(row_term, k_term(pair_a + 1))
+                return dropout.keep_mask(h_a, byte_sel), dropout.keep_mask(h_b, byte_sel)
+
+            return keep_masks
+
+        return block_keep_masks
 
     def dropout_keep_fn_sm100_transposed(
         self,

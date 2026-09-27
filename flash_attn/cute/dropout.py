@@ -31,6 +31,8 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint32
 
+from flash_attn.cute import utils
+
 _M1 = 0x85EBCA6B
 _M2 = 0xC2B2AE35
 _PHI_Q = 0x9E3779B9
@@ -148,6 +150,9 @@ class DropoutCtx:
     def __init__(self, args: DropoutArgs):
         self.key = dropout_key(args.rng_state)
         self.threshold_top = args.threshold << Uint32(24)
+        # Per halfword: 0x8000 + (byte - t) * 128 stays in [128, 0xFF80] and has
+        # bit 15 set iff byte >= t, so two bytes compare without carries.
+        self.keep_bias = (Uint32(0x8000) - (args.threshold << Uint32(7))) * Uint32(0x10001)
         self.rp = args.rp
         self.num_heads_q = args.num_heads_q
         self.q_positions = args.q_positions
@@ -176,7 +181,12 @@ class DropoutCtx:
 
     @cute.jit
     def k_term(self, k: Int32) -> Uint32:
-        return Uint32(k >> 1) * Uint32(_PHI_K)
+        return self.pair_k_term(k >> 1)
+
+    @cute.jit
+    def pair_k_term(self, pair: Int32) -> Uint32:
+        """``k_term`` of column pair ``pair = k >> 1``."""
+        return Uint32(pair) * Uint32(_PHI_K)
 
     @cute.jit
     def keep_byte(self, h: Uint32, byte: Int32) -> cutlass.Boolean:
@@ -184,11 +194,40 @@ class DropoutCtx:
         return (h << Uint32(24 - byte * 8)) >= self.threshold_top
 
     @cute.jit
-    def keep_pair_along_k(self, row_term: Uint32, q: Int32, k0: Int32):
-        """Keep for ``(q, k0)`` and ``(q, k0 + 1)``; ``row_term = q_term(q) ^ head_key``."""
-        h = fmix32(row_term ^ self.k_term(k0))
-        byte = (q & 1) * 2
-        return self.keep_byte(h, byte), self.keep_byte(h, byte + 1)
+    def row_byte_sel(self, q: Int32) -> Uint32:
+        """``prmt`` selector moving row ``q``'s two bytes to the low byte of each halfword."""
+        return Uint32(0x4140) + Uint32(q & 1) * Uint32(0x0202)
+
+    @cute.jit
+    def pair_hash(self, row_term: Uint32, k_term: Uint32) -> Uint32:
+        """Hash of the 2x2 group; ``row_term = q_term(q) ^ head_key``."""
+        return fmix32(row_term ^ k_term)
+
+    @cute.jit
+    def keep_halves(self, h: Uint32, byte_sel: Uint32) -> Uint32:
+        """Bit 15 of each halfword is set iff the byte of ``h`` that ``byte_sel`` moves there is kept."""
+        return utils.prmt_b32(h, Uint32(0), byte_sel) * Uint32(128) + self.keep_bias
+
+    @cute.jit
+    def keep_mask(self, h: Uint32, byte_sel: Uint32) -> Uint32:
+        """bf16x2 AND-mask from the two bytes of ``h`` picked by ``byte_sel = row_byte_sel(q)``."""
+        return utils.prmt_b32(self.keep_halves(h, byte_sel), Uint32(0), Uint32(0xBB99))
+
+    @cute.jit
+    def shared_pair_hashes(
+        self, row_term: Uint32, own_k_term: Uint32, pair_lanes: cutlass.Constexpr[int]
+    ):
+        """Hashes of column pairs a and b for rows ``q`` and ``q ^ 1``, ``pair_lanes`` lanes apart.
+
+        The even row hashes pair a and the odd row pair b (``own_k_term``). An idx
+        shuffle with segment mask ``~pair_lanes`` reads lane ``(lane & ~pair_lanes) |
+        offset``, so offsets 0 / ``pair_lanes`` fetch the even / odd lane's hash.
+        """
+        own = fmix32(row_term ^ own_k_term)
+        seg = ((31 ^ pair_lanes) << 8) | 31
+        h_a = cute.arch.shuffle_sync(own, 0, mask_and_clamp=seg)
+        h_b = cute.arch.shuffle_sync(own, pair_lanes, mask_and_clamp=seg)
+        return h_a, h_b
 
     @cute.jit
     def keep_pair_along_q(self, col_term: Uint32, q0: Int32, k: Int32):

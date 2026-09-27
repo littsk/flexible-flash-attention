@@ -666,6 +666,9 @@ class FlashAttentionForwardSm100:
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
+        if const_expr(dropout is not None):
+            # The dropout mask keeps the softmax warps ALU-bound; emulated exp2 adds to it.
+            self.ex2_emu_freq = 0
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = cute.nvgpu.OperandMajorMode.K
@@ -2747,7 +2750,7 @@ class FlashAttentionForwardSm100:
         )
         keep_fn = None
         if const_expr(dropout_keep_fn is not None):
-            keep_fn = partial(dropout_keep_fn, n_block=n_block)
+            keep_fn = dropout_keep_fn(n_block)
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
