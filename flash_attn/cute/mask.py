@@ -847,27 +847,45 @@ class AttentionMask:
     def dropout_keep_fn_sm100_transposed(
         self,
         tScS_t2r: cute.Tensor,
+        t0ScS_t2r: cute.Tensor,
         m_block: Int32,
         n_block: Int32,
         batch_idx: Int32,
         head_idx: Int32,
         dropout: DropoutCtx,
     ) -> Callable:
-        """Backward ``keep_pair(stage, i)`` for S^T elements ``i`` and ``i + 1`` of a stage.
+        """Backward ``keep_quad(stage, i)``: keeps of S^T elements ``i .. i + 3`` of a stage
+        (``i % 4 == 0``).
 
         ROW is Q and COL is KV. Each thread owns one KV row, so the column term is
         hashed once; even ``i`` and ``i + 1`` are adjacent Q rows sharing one hash.
+        KV rows ``k`` / ``k ^ 1`` sit in adjacent lanes and share every 2x2 hash, so
+        the even row hashes Q pair ``(i, i + 1)`` and the odd row ``(i + 2, i + 3)``.
         """
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         k = dropout.global_k(tScS_t2r[0][COL] + n_block * self.tile_n)
         col_term = dropout.k_term(k) ^ dropout.head_key(batch_idx, head_idx)
+        # Q row pair of element 0 plus this lane's pair (b on odd KV rows); the other
+        # elements sit at thread 0's static offsets from element 0.
+        t0_row0 = t0ScS_t2r[None, 0, 0, 0][0][ROW]
+        own_pair0 = ((tScS_t2r[None, 0, 0, 0][0][ROW] + m_block * self.tile_m) >> 1) + Int32(
+            (tScS_t2r[0][COL] & 1) != 0
+        )
 
-        def keep_pair(stage: int, i: int):
-            q0 = dropout.global_q(tScS_t2r[None, stage, 0, 0][i][ROW] + m_block * self.tile_m)
-            return dropout.keep_pair_along_q(col_term, q0, k)
+        def keep_quad(stage: int, i: int):
+            t0_rows = t0ScS_t2r[None, stage, 0, 0]
+            offset = t0_rows[i][ROW] - t0_row0
+            assert offset % 4 == 0 and t0_rows[i + 2][ROW] == t0_rows[i][ROW] + 2
+            own_pair = own_pair0 + offset // 2
+            if const_expr(dropout.q_positions is None):
+                own_term = dropout.pair_q_term(own_pair)
+            else:
+                own_term = dropout.q_term(dropout.global_q(2 * own_pair))
+            h_a, h_b = dropout.shared_pair_hashes(col_term, own_term, 1)
+            return (*dropout.col_keep_pair(h_a, k), *dropout.col_keep_pair(h_b, k))
 
-        return keep_pair
+        return keep_quad
 
     @cute.jit
     def apply_mask_sm100_transposed(

@@ -177,7 +177,12 @@ class DropoutCtx:
 
     @cute.jit
     def q_term(self, q: Int32) -> Uint32:
-        return Uint32(q >> 1) * Uint32(_PHI_Q)
+        return self.pair_q_term(q >> 1)
+
+    @cute.jit
+    def pair_q_term(self, pair: Int32) -> Uint32:
+        """``q_term`` of row pair ``pair = q >> 1``."""
+        return Uint32(pair) * Uint32(_PHI_Q)
 
     @cute.jit
     def k_term(self, k: Int32) -> Uint32:
@@ -215,24 +220,25 @@ class DropoutCtx:
 
     @cute.jit
     def shared_pair_hashes(
-        self, row_term: Uint32, own_k_term: Uint32, pair_lanes: cutlass.Constexpr[int]
+        self, lane_term: Uint32, own_term: Uint32, pair_lanes: cutlass.Constexpr[int]
     ):
-        """Hashes of column pairs a and b for rows ``q`` and ``q ^ 1``, ``pair_lanes`` lanes apart.
+        """Hashes of pairs a and b for two lanes ``pair_lanes`` apart that share every 2x2
+        hash: rows ``q`` / ``q ^ 1`` in the forward, KV rows ``k`` / ``k ^ 1`` in the backward.
 
-        The even row hashes pair a and the odd row pair b (``own_k_term``). An idx
-        shuffle with segment mask ``~pair_lanes`` reads lane ``(lane & ~pair_lanes) |
-        offset``, so offsets 0 / ``pair_lanes`` fetch the even / odd lane's hash.
+        ``lane_term`` is the lane's fixed term; the even lane hashes pair a and the odd
+        lane pair b (``own_term``). An idx shuffle with segment mask ``~pair_lanes`` reads
+        lane ``(lane & ~pair_lanes) | offset``, so offsets 0 / ``pair_lanes`` fetch the
+        even / odd lane's hash.
         """
-        own = fmix32(row_term ^ own_k_term)
+        own = fmix32(lane_term ^ own_term)
         seg = ((31 ^ pair_lanes) << 8) | 31
         h_a = cute.arch.shuffle_sync(own, 0, mask_and_clamp=seg)
         h_b = cute.arch.shuffle_sync(own, pair_lanes, mask_and_clamp=seg)
         return h_a, h_b
 
     @cute.jit
-    def keep_pair_along_q(self, col_term: Uint32, q0: Int32, k: Int32):
-        """Keep for ``(q0, k)`` and ``(q0 + 1, k)``; ``col_term = k_term(k) ^ head_key``."""
-        h = fmix32(col_term ^ self.q_term(q0))
+    def col_keep_pair(self, h: Uint32, k: Int32):
+        """Keep of ``(q0, k)`` and ``(q0 + 1, k)`` from the hash ``h`` of their 2x2 group."""
         byte = k & 1
         return self.keep_byte(h, byte), self.keep_byte(h, byte + 2)
 

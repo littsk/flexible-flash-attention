@@ -71,7 +71,8 @@ One 32-bit counter hash of `(seed, offset, b * H + h, q >> 1, k >> 1)` covers a
 `t / 256`. Row and column hash terms are separable: the forward hashes the row
 term once per row and the lanes of rows `q` and `q ^ 1` split every 2x2 hash
 (power-of-two PackGQA ratios); the backward hashes the column term once per KV
-row, each hash serves two elements, and dS reuses the keep bits of the P pass.
+row, the lanes of KV rows `k` and `k ^ 1` split every 2x2 hash, and dS reuses the
+keep bits of the P pass.
 Dropout forwards use hardware exp2 only (the mask keeps the softmax ALU-bound).
 `rng_state` is a device `int64[2]` `(seed, offset)` read by the kernels, so CUDA
 Graph replays pick up in-place updates; `None` draws it from the CUDA generator

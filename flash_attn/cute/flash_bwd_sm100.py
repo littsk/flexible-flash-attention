@@ -3570,10 +3570,16 @@ class FlashAttentionBackwardSm100:
                     check_m_boundary=check_m_boundary,
                 )
                 num_stages = cute.size(tScS_t2r, mode=[1])
-                keep_pair = None
+                keep_quad = None
                 if const_expr(dropout is not None):
-                    keep_pair = mask.dropout_keep_fn_sm100_transposed(
-                        tScS_t2r, mask_m_block, cluster_n_block, batch_idx, mask_head_idx, dropout_ctx
+                    keep_quad = mask.dropout_keep_fn_sm100_transposed(
+                        tScS_t2r,
+                        t0ScS_t2r,
+                        mask_m_block,
+                        cluster_n_block,
+                        batch_idx,
+                        mask_head_idx,
+                        dropout_ctx,
                     )
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
@@ -3612,12 +3618,11 @@ class FlashAttentionBackwardSm100:
                         # the dP wait).
                         tSrP_drop = cute.make_fragment_like(tSrS_cur)
                         keeps = []
-                        for i in cutlass.range_constexpr(0, cute.size(tSrS_cur), 2):
-                            keep0, keep1 = keep_pair(stage, i)
-                            keeps += [keep0, keep1]
-                            tSrP_drop[i] = tSrS_cur[i] * dropout_ctx.rp if keep0 else Float32(0.0)
-                            tSrP_drop[i + 1] = (
-                                tSrS_cur[i + 1] * dropout_ctx.rp if keep1 else Float32(0.0)
+                        for i in cutlass.range_constexpr(0, cute.size(tSrS_cur), 4):
+                            keeps += keep_quad(stage, i)
+                        for i in cutlass.range_constexpr(cute.size(tSrS_cur)):
+                            tSrP_drop[i] = (
+                                tSrS_cur[i] * dropout_ctx.rp if keeps[i] else Float32(0.0)
                             )
                         stage_keeps[stage] = keeps
                         utils.cvt_f16(tSrP_drop, tSrP_r2t[None, stage, 0, 0])
