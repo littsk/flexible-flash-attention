@@ -608,23 +608,22 @@ class FlashAttentionBackwardSm100:
         self.dKV_postprocess = self.qhead_per_kvhead > 1 and not self.pack_gqa
         # The load warp puts each dropout Q tile's first positions next to its LSE, so the
         # compute warps' m loop reads no global memory (a load there slows it ~6%).
-        self.q_positions_in_smem = (
-            dropout is not None and dropout.q_positions is not None and not self.pack_gqa
-        )
-        # Without positions, CUDA 13 ptxas spills the paired deterministic D128 compute
-        # warps' dropout state (undropped P, keeps) in the m loop at 152 registers. With
-        # positions it fits, and the smaller reduce budget would cost ~1%.
+        self.q_positions_in_smem = dropout is not None and dropout.q_positions is not None
+        # The paired deterministic D128 compute warps keep the undropped P and its keeps
+        # across the dP wait and spill them in the m loop at 152 registers (block-sparse
+        # mask_mod calls heavily). setmaxnreg can only raise the reduce warps above their
+        # launch budget of 128, so the extra registers come from the load/MMA warps.
         if const_expr(
             dropout is not None
-            and dropout.q_positions is None
-            and dropout.kv_positions is None
             and self.deterministic
             and self.use_2cta_instrs
             and self.tile_hdim == 128
             and self.tile_hdimv == 128
         ):
             self.num_regs_reduce = 128
-            self.num_regs_compute = 160
+            self.num_regs_compute = 176
+            self.num_regs_load = 32
+            self.num_regs_mma = 32
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -2205,7 +2204,12 @@ class FlashAttentionBackwardSm100:
 
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
             copy_stats = partial(cute.copy, copy_atom_stats)
-            copy_lse = partial(self.copy_lse_tile, copy_stats, gLSE, sLSE, mQpos, sQpos)
+            blocks_per_head = (
+                m_block_max // self.qhead_per_kvhead if const_expr(self.pack_gqa) else None
+            )
+            copy_lse = partial(
+                self.copy_lse_tile, copy_stats, gLSE, sLSE, mQpos, sQpos, blocks_per_head
+            )
             # copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SMulticastOp(), Float32)
             # sLSE = cute.logical_divide(sLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
             # gLSE = cute.logical_divide(gLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
@@ -2580,15 +2584,20 @@ class FlashAttentionBackwardSm100:
         sLSE: cute.Tensor,
         mQpos: Optional[cute.Tensor],
         sQpos: Optional[cute.Tensor],
+        blocks_per_head: Optional[Int32],
         m_block: Int32,
         stage: Int32,
         mbar_ptr,
     ):
         """Bulk-copy the LSE of Q tile ``m_block`` into LSE stage ``stage``; with dropout
-        Q positions, also the tile's first ``Q_POSITION_WORDS`` positions."""
+        Q positions, also the tile's first ``Q_POSITION_WORDS`` positions. Head-major
+        PackGQA tiles map to token tile ``m_block % blocks_per_head``."""
         copy_stats(gLSE[None, m_block], sLSE[None, stage], mbar_ptr=mbar_ptr)
         if const_expr(mQpos is not None):
-            gQpos = cute.local_tile(mQpos, (self.tile_m,), (m_block,))
+            q_block = m_block
+            if const_expr(blocks_per_head is not None):
+                q_block = m_block % blocks_per_head
+            gQpos = cute.local_tile(mQpos, (self.tile_m,), (q_block,))
             gQpos = cute.local_tile(gQpos, (Q_POSITION_WORDS,), (0,))
             copy_atom_pos = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Int32)
             cute.copy(copy_atom_pos, gQpos, sQpos[None, stage], mbar_ptr=mbar_ptr)
