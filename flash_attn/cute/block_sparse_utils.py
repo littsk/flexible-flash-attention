@@ -1359,9 +1359,8 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     load_Q,
     load_dO,
     copy_stats,
-    # Global tensors for LSE/dPsum
-    gLSE,
-    sLSE,
+    # copy_lse(m_block, stage, mbar_ptr) loads the LSE tile; dPsum tensors
+    copy_lse,
     gdPsum,
     sdPsum,
     # TMA copy bytes for extra_tx_count
@@ -1438,10 +1437,10 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
 
             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
             with cute.arch.elect_one():
-                copy_stats(
-                    gLSE[None, first_m_block],
-                    sLSE[None, producer_state_Q_LSE.index],
-                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                copy_lse(
+                    first_m_block,
+                    producer_state_Q_LSE.index,
+                    pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                 )
             producer_state_Q_LSE.advance()
 
@@ -1513,10 +1512,10 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
 
                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                 with cute.arch.elect_one():
-                    copy_stats(
-                        gLSE[None, m_block],
-                        sLSE[None, producer_state_Q_LSE.index],
-                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                    copy_lse(
+                        m_block,
+                        producer_state_Q_LSE.index,
+                        pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                     )
                 producer_state_Q_LSE.advance()
 
@@ -1585,9 +1584,8 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
     load_Kt,
     load_dOt,
     copy_stats,
-    # Global tensors for LSE/dPsum
-    gLSE,
-    sLSE,
+    # copy_lse(m_block, stage, mbar_ptr) loads the LSE tile; dPsum tensors
+    copy_lse,
     gdPsum,
     sdPsum,
     # TMA copy bytes for extra_tx_count
@@ -1636,10 +1634,10 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
         # LSE
         pipeline_LSE.producer_acquire(producer_state_LSE)
         with cute.arch.elect_one():
-            copy_stats(
-                gLSE[None, first_m_block],
-                sLSE[None, producer_state_LSE.index],
-                mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+            copy_lse(
+                first_m_block,
+                producer_state_LSE.index,
+                pipeline_LSE.producer_get_barrier(producer_state_LSE),
             )
         producer_state_LSE.advance()
 
@@ -1696,10 +1694,10 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
             # LSE
             pipeline_LSE.producer_acquire(producer_state_LSE)
             with cute.arch.elect_one():
-                copy_stats(
-                    gLSE[None, m_block],
-                    sLSE[None, producer_state_LSE.index],
-                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                copy_lse(
+                    m_block,
+                    producer_state_LSE.index,
+                    pipeline_LSE.producer_get_barrier(producer_state_LSE),
                 )
             producer_state_LSE.advance()
 

@@ -841,20 +841,19 @@ class AttentionMask:
         self,
         tScS_t2r: cute.Tensor,
         t0ScS_t2r: cute.Tensor,
-        m_block: Int32,
         n_block: Int32,
-        batch_idx: Int32,
-        head_idx: Int32,
         dropout: DropoutCtx,
     ) -> Callable:
-        """Backward ``keep_quad(stage, i)``: keeps of S^T elements ``i .. i + 3`` of a stage
-        (``i % 4 == 0``).
+        """Backward ``tile_keep_quads(m_block, batch_idx, head_idx, q_start=None) ->
+        keep_quad(stage, i)`` for KV block ``n_block``: keeps of S^T elements
+        ``i .. i + 3`` of a stage (``i % 4 == 0``).
 
-        ROW is Q and COL is KV. Each thread owns one KV row, so the column term is
-        hashed once; even ``i`` and ``i + 1`` are adjacent Q rows sharing one hash.
-        KV rows ``k`` / ``k ^ 1`` sit in adjacent lanes and share every 2x2 hash, so
-        the even row hashes Q pair ``(i, i + 1)`` and the odd row ``(i + 2, i + 3)``.
-        A Q tile lies in one position block, so its rows offset the first one's position.
+        ROW is Q and COL is KV. Each thread owns one KV row, whose position is read once
+        per KV block, so the column term is hashed once; even ``i`` and ``i + 1`` are
+        adjacent Q rows sharing one hash. KV rows ``k`` / ``k ^ 1`` sit in adjacent lanes
+        and share every 2x2 hash, so the even row hashes Q pair ``(i, i + 1)`` and the
+        odd row ``(i + 2, i + 3)``. A Q tile lies in one position block, so its rows
+        offset the first one's position: ``q_start``, or ``global_q`` of the tile's row.
         """
         assert dropout.q_positions is None or POSITION_BLOCK % self.tile_m == 0, (
             "a Q tile must lie in one position block"
@@ -862,25 +861,28 @@ class AttentionMask:
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         k = dropout.global_k(tScS_t2r[0][COL] + n_block * self.tile_n)
-        col_term = dropout.k_term(k) ^ dropout.head_key(batch_idx, head_idx)
         # Q row pair of element 0 plus this lane's pair (b on odd KV rows); the other
         # elements sit at thread 0's static offsets from element 0.
         t0_row0 = t0ScS_t2r[None, 0, 0, 0][0][ROW]
-        own_pair0 = (
-            (dropout.global_q(m_block * self.tile_m) >> 1)
-            + (tScS_t2r[None, 0, 0, 0][0][ROW] >> 1)
-            + Int32((tScS_t2r[0][COL] & 1) != 0)
-        )
+        own_row_pair = (tScS_t2r[None, 0, 0, 0][0][ROW] >> 1) + Int32((tScS_t2r[0][COL] & 1) != 0)
 
-        def keep_quad(stage: int, i: int):
-            t0_rows = t0ScS_t2r[None, stage, 0, 0]
-            offset = t0_rows[i][ROW] - t0_row0
-            assert offset % 4 == 0 and t0_rows[i + 2][ROW] == t0_rows[i][ROW] + 2
-            own_term = dropout.pair_q_term(own_pair0 + offset // 2)
-            h_a, h_b = dropout.shared_pair_hashes(col_term, own_term, 1)
-            return (*dropout.col_keep_pair(h_a, k), *dropout.col_keep_pair(h_b, k))
+        def tile_keep_quads(m_block: Int32, batch_idx: Int32, head_idx: Int32, q_start=None):
+            col_term = dropout.k_term(k) ^ dropout.head_key(batch_idx, head_idx)
+            if const_expr(q_start is None):
+                q_start = dropout.global_q(m_block * self.tile_m)
+            own_pair0 = (q_start >> 1) + own_row_pair
 
-        return keep_quad
+            def keep_quad(stage: int, i: int):
+                t0_rows = t0ScS_t2r[None, stage, 0, 0]
+                offset = t0_rows[i][ROW] - t0_row0
+                assert offset % 4 == 0 and t0_rows[i + 2][ROW] == t0_rows[i][ROW] + 2
+                own_term = dropout.pair_q_term(own_pair0 + offset // 2)
+                h_a, h_b = dropout.shared_pair_hashes(col_term, own_term, 1)
+                return (*dropout.col_keep_pair(h_a, k), *dropout.col_keep_pair(h_b, k))
+
+            return keep_quad
+
+        return tile_keep_quads
 
     @cute.jit
     def apply_mask_sm100_transposed(

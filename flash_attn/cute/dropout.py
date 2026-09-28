@@ -31,6 +31,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint32
+from torch._subclasses.fake_tensor import is_fake
 
 from flash_attn.cute import utils
 
@@ -111,6 +112,16 @@ def check_block_contiguous(positions: torch.Tensor) -> None:
         )
 
 
+def _bulk_copyable(positions: torch.Tensor) -> torch.Tensor:
+    """Positions 16-byte aligned with a multiple of 4 entries, as the SM100 backward
+    bulk-copies 4 per Q tile; padding continues the last block's run."""
+    pad = -positions.numel() % 4
+    if pad == 0 and (is_fake(positions) or positions.data_ptr() % 16 == 0):
+        return positions
+    tail = positions[-1:] + torch.arange(1, pad + 1, dtype=positions.dtype, device=positions.device)
+    return torch.cat((positions, tail))
+
+
 def to_dropout_args(
     dropout: DropoutTensors | None, num_heads_q: int, to_tensor, *, for_compile: bool
 ) -> DropoutArgs | None:
@@ -118,12 +129,13 @@ def to_dropout_args(
     if dropout is None:
         return None
     threshold, rp = dropout_threshold(dropout.p), dropout_scale(dropout.p)
+    q_positions = None if dropout.q_positions is None else _bulk_copyable(dropout.q_positions)
     return DropoutArgs(
         rng_state=to_tensor(dropout.rng_state),
         threshold=Uint32(threshold) if for_compile else threshold,
         rp=Float32(rp) if for_compile else rp,
         num_heads_q=Int32(num_heads_q) if for_compile else num_heads_q,
-        q_positions=None if dropout.q_positions is None else to_tensor(dropout.q_positions),
+        q_positions=None if q_positions is None else to_tensor(q_positions),
         kv_positions=None if dropout.kv_positions is None else to_tensor(dropout.kv_positions),
     )
 

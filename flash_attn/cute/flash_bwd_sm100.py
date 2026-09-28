@@ -66,6 +66,9 @@ _PROF_BWD_MMA = 2
 _PROF_BWD_COMPUTE = 3
 _PROF_BWD_REDUCE = 4
 
+# Positions copied per dropout Q tile: one 16-byte bulk copy starting at the tile's row.
+Q_POSITION_WORDS = 4
+
 
 # NOTE [hdim64 dedicated P/dS TMEM slots]
 # The 1-CTA hdim64 backward uses TMEM columns [0, 384), leaving room for two 64-column
@@ -603,6 +606,11 @@ class FlashAttentionBackwardSm100:
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         # self.use_tma_store = not self.qhead_per_kvhead == 1
         self.dKV_postprocess = self.qhead_per_kvhead > 1 and not self.pack_gqa
+        # The load warp puts each dropout Q tile's first positions next to its LSE, so the
+        # compute warps' m loop reads no global memory (a load there slows it ~6%).
+        self.q_positions_in_smem = (
+            dropout is not None and dropout.q_positions is not None and not self.pack_gqa
+        )
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -823,6 +831,8 @@ class FlashAttentionBackwardSm100:
             ]
         }
         self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
+        if const_expr(self.q_positions_in_smem):
+            self.tma_copy_bytes["LSE"] += Q_POSITION_WORDS * Int32.width // 8
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
@@ -907,6 +917,7 @@ class FlashAttentionBackwardSm100:
             assert sdV_bytes <= sV_bytes, "sdV doesn't fit in sV storage allocation (2-CTA)"
             assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
+        sQpos_size = Q_POSITION_WORDS * self.Q_stage if const_expr(self.q_positions_in_smem) else 0
         if const_expr(self.use_2cta_instrs):
             sQt_size = cute.cosize(self.sQt_layout) if const_expr(self.tile_hdim <= 128) else 0
             sdOt_size = cute.cosize(self.sdOt_layout) if const_expr(self.tile_hdim <= 128) else 0
@@ -982,6 +993,7 @@ class FlashAttentionBackwardSm100:
                     cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
                     128,
                 ]
+                sQpos: cute.struct.Align[cute.struct.MemRange[Int32, sQpos_size], 16]
                 sdPsum: cute.struct.Align[
                     cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
                     128,
@@ -1038,6 +1050,7 @@ class FlashAttentionBackwardSm100:
                     cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
                     128,
                 ]
+                sQpos: cute.struct.Align[cute.struct.MemRange[Int32, sQpos_size], 16]
                 sdPsum: cute.struct.Align[
                     cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
                     128,
@@ -1549,6 +1562,9 @@ class FlashAttentionBackwardSm100:
             )
 
         sLSE = storage.sLSE.get_tensor(sLSE_layout)
+        sQpos = None
+        if const_expr(self.q_positions_in_smem):
+            sQpos = storage.sQpos.get_tensor(cute.make_layout((Q_POSITION_WORDS, self.Q_stage)))
         sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
         if const_expr(self.use_2cta_instrs):
             if const_expr(not self.dKV_postprocess):
@@ -1719,6 +1735,8 @@ class FlashAttentionBackwardSm100:
                 blocksparse_tensors,
                 should_load_Q=True,
                 should_load_dO=True,
+                mQpos=dropout.q_positions if const_expr(self.q_positions_in_smem) else None,
+                sQpos=sQpos,
             )
             if const_expr(prof_buf is not None):
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_LOAD, _PROF_PHASE_END)
@@ -1841,6 +1859,7 @@ class FlashAttentionBackwardSm100:
                 mdGQA_local_expected,
                 mdGQA_finalize_state,
                 dropout=dropout,
+                sQpos=sQpos,
             )
             if const_expr(prof_buf is not None):
                 _prof_mark(prof_buf, prof_nw, _PROF_MAX_EVENTS, _PROF_BWD_COMPUTE, _PROF_PHASE_END)
@@ -1978,6 +1997,8 @@ class FlashAttentionBackwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         should_load_Q: bool = True,
         should_load_dO: bool = True,
+        mQpos: Optional[cute.Tensor] = None,
+        sQpos: Optional[cute.Tensor] = None,
     ):
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -2170,6 +2191,7 @@ class FlashAttentionBackwardSm100:
 
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
             copy_stats = partial(cute.copy, copy_atom_stats)
+            copy_lse = partial(self.copy_lse_tile, copy_stats, gLSE, sLSE, mQpos, sQpos)
             # copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SMulticastOp(), Float32)
             # sLSE = cute.logical_divide(sLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
             # gLSE = cute.logical_divide(gLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
@@ -2201,10 +2223,10 @@ class FlashAttentionBackwardSm100:
                         # LSE
                         pipeline_LSE.producer_acquire(producer_state_LSE)
                         with cute.arch.elect_one():
-                            copy_stats(
-                                gLSE[None, first_m_block],
-                                sLSE[None, producer_state_LSE.index],
-                                mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                            copy_lse(
+                                first_m_block,
+                                producer_state_LSE.index,
+                                pipeline_LSE.producer_get_barrier(producer_state_LSE),
                             )
                         producer_state_LSE.advance()
 
@@ -2249,10 +2271,10 @@ class FlashAttentionBackwardSm100:
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_LSE)
                             with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, m_block],
-                                    sLSE[None, producer_state_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                                copy_lse(
+                                    m_block,
+                                    producer_state_LSE.index,
+                                    pipeline_LSE.producer_get_barrier(producer_state_LSE),
                                 )
                             producer_state_LSE.advance()
 
@@ -2312,12 +2334,10 @@ class FlashAttentionBackwardSm100:
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                             with cute.arch.elect_one():
-                                copy_stats(
-                                    gLSE[None, first_m_block],
-                                    sLSE[None, producer_state_Q_LSE.index],
-                                    mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                        producer_state_Q_LSE
-                                    ),
+                                copy_lse(
+                                    first_m_block,
+                                    producer_state_Q_LSE.index,
+                                    pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                                 )
                             producer_state_Q_LSE.advance()
 
@@ -2372,12 +2392,10 @@ class FlashAttentionBackwardSm100:
                                 # LSE
                                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                                 with cute.arch.elect_one():
-                                    copy_stats(
-                                        gLSE[None, m_block],
-                                        sLSE[None, producer_state_Q_LSE.index],
-                                        mbar_ptr=pipeline_LSE.producer_get_barrier(
-                                            producer_state_Q_LSE
-                                        ),
+                                    copy_lse(
+                                        m_block,
+                                        producer_state_Q_LSE.index,
+                                        pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                                     )
                                 producer_state_Q_LSE.advance()
 
@@ -2485,8 +2503,7 @@ class FlashAttentionBackwardSm100:
                         load_Kt,
                         load_dOt,
                         copy_stats,
-                        gLSE,
-                        sLSE,
+                        copy_lse,
                         gdPsum,
                         sdPsum,
                         self.tma_copy_bytes["K"],
@@ -2516,8 +2533,7 @@ class FlashAttentionBackwardSm100:
                         load_Q,
                         load_dO,
                         copy_stats,
-                        gLSE,
-                        sLSE,
+                        copy_lse,
                         gdPsum,
                         sdPsum,
                         self.tma_copy_bytes["K"],
@@ -2541,6 +2557,27 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def copy_lse_tile(
+        self,
+        copy_stats: Callable,
+        gLSE: cute.Tensor,
+        sLSE: cute.Tensor,
+        mQpos: Optional[cute.Tensor],
+        sQpos: Optional[cute.Tensor],
+        m_block: Int32,
+        stage: Int32,
+        mbar_ptr,
+    ):
+        """Bulk-copy the LSE of Q tile ``m_block`` into LSE stage ``stage``; with dropout
+        Q positions, also the tile's first ``Q_POSITION_WORDS`` positions."""
+        copy_stats(gLSE[None, m_block], sLSE[None, stage], mbar_ptr=mbar_ptr)
+        if const_expr(mQpos is not None):
+            gQpos = cute.local_tile(mQpos, (self.tile_m,), (m_block,))
+            gQpos = cute.local_tile(gQpos, (Q_POSITION_WORDS,), (0,))
+            copy_atom_pos = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Int32)
+            cute.copy(copy_atom_pos, gQpos, sQpos[None, stage], mbar_ptr=mbar_ptr)
 
     @cute.jit
     def mma(
@@ -3254,6 +3291,7 @@ class FlashAttentionBackwardSm100:
         mdGQA_local_expected: Optional[cute.Tensor] = None,
         mdGQA_finalize_state: Optional[cute.Tensor] = None,
         dropout: Optional[DropoutArgs] = None,
+        sQpos: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3435,6 +3473,12 @@ class FlashAttentionBackwardSm100:
                 ),
             )
 
+            dropout_tile_keeps = None
+            if const_expr(dropout is not None):
+                dropout_tile_keeps = mask.dropout_keep_fn_sm100_transposed(
+                    tScS_t2r, t0ScS_t2r, cluster_n_block, dropout_ctx
+                )
+
             # prefetch_LSE = not self.is_causal
             prefetch_LSE = False
 
@@ -3572,15 +3616,10 @@ class FlashAttentionBackwardSm100:
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 keep_quad = None
                 if const_expr(dropout is not None):
-                    keep_quad = mask.dropout_keep_fn_sm100_transposed(
-                        tScS_t2r,
-                        t0ScS_t2r,
-                        mask_m_block,
-                        cluster_n_block,
-                        batch_idx,
-                        mask_head_idx,
-                        dropout_ctx,
-                    )
+                    q_start = None
+                    if const_expr(self.q_positions_in_smem):
+                        q_start = sQpos[0, consumer_state_LSE.index]
+                    keep_quad = dropout_tile_keeps(mask_m_block, batch_idx, mask_head_idx, q_start)
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
                 # ---------------------------------------------
