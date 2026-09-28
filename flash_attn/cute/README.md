@@ -74,6 +74,8 @@ term once per row and the lanes of rows `q` and `q ^ 1` split every 2x2 hash
 row, the lanes of KV rows `k` and `k ^ 1` split every 2x2 hash, and dS reuses the
 keep bits of the P pass.
 Dropout forwards use hardware exp2 only (the mask keeps the softmax ALU-bound).
+Without positions, the paired deterministic D128 dropout backward gives its compute
+warps 160 registers (reduce warps 128) so the P-pass state does not spill.
 `rng_state` is a device `int64[2]` `(seed, offset)` read by the kernels, so CUDA
 Graph replays pick up in-place updates; `None` draws it from the CUDA generator
 and advances its offset. The mask depends only on the logical coordinates, so the

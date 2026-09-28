@@ -611,6 +611,20 @@ class FlashAttentionBackwardSm100:
         self.q_positions_in_smem = (
             dropout is not None and dropout.q_positions is not None and not self.pack_gqa
         )
+        # Without positions, CUDA 13 ptxas spills the paired deterministic D128 compute
+        # warps' dropout state (undropped P, keeps) in the m loop at 152 registers. With
+        # positions it fits, and the smaller reduce budget would cost ~1%.
+        if const_expr(
+            dropout is not None
+            and dropout.q_positions is None
+            and dropout.kv_positions is None
+            and self.deterministic
+            and self.use_2cta_instrs
+            and self.tile_hdim == 128
+            and self.tile_hdimv == 128
+        ):
+            self.num_regs_reduce = 128
+            self.num_regs_compute = 160
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
