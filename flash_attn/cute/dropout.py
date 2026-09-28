@@ -15,8 +15,9 @@ The mask depends only on logical coordinates, so forward and backward kernels
 regenerate it regardless of tiling, 2CTA, PackGQA, SplitKV or KV slot order.
 ``q_positions`` / ``kv_positions`` remap kernel-local rows / columns to the
 coordinates the mask is keyed by (context parallelism passes global token
-positions); they must map every aligned local pair ``(2i, 2i + 1)`` to an aligned
-pair ``(2j, 2j + 1)``.
+positions). Within every ``POSITION_BLOCK``-aligned block of local indices they
+must ascend by one from an even position: the kernels read one position per
+block and offset it, which also keeps aligned pairs aligned.
 
 ``rng_state`` is a device ``int64[2]`` tensor ``(seed, offset)`` read by the
 kernel, so CUDA Graph replays can advance it without recapturing.
@@ -38,6 +39,8 @@ _M2 = 0xC2B2AE35
 _PHI_Q = 0x9E3779B9
 _PHI_K = 0x85EBCA77
 _MASK32 = 0xFFFFFFFF
+# Local rows / columns of one block share a single position read (see module docstring).
+POSITION_BLOCK = 128
 
 
 class DropoutArgs(NamedTuple):
@@ -95,11 +98,17 @@ def validate_dropout(dropout: DropoutTensors, device: torch.device) -> None:
     dropout_threshold(dropout.p)
 
 
-def check_pair_aligned(positions: torch.Tensor) -> None:
-    """Positions must map aligned local pairs to aligned global pairs (syncs the device)."""
-    pairs = positions.view(-1, 2)
-    if not bool(((pairs[:, 0] % 2 == 0) & (pairs[:, 1] == pairs[:, 0] + 1)).all()):
-        raise ValueError("dropout positions must map aligned pairs to aligned pairs")
+def check_block_contiguous(positions: torch.Tensor) -> None:
+    """Positions must ascend by one within each ``POSITION_BLOCK``-aligned block, from an
+    even position (syncs the device)."""
+    idx = torch.arange(positions.numel(), device=positions.device)
+    offset = idx % POSITION_BLOCK
+    first = positions.long()[idx - offset]
+    if not bool(((positions.long() == first + offset) & (first % 2 == 0)).all()):
+        raise ValueError(
+            f"dropout positions must ascend by one within each {POSITION_BLOCK}-token block "
+            "from an even position"
+        )
 
 
 def to_dropout_args(
@@ -144,6 +153,13 @@ def dropout_key(rng_state: cute.Tensor) -> Uint32:
     return fmix32(Uint32(seed & _MASK32) ^ key)
 
 
+@cute.jit
+def block_position(positions: cute.Tensor, i: Int32) -> Int32:
+    """Position of local index ``i``, read through the first entry of its block."""
+    start = cutlass.min(i, cute.size(positions) - 1) & -POSITION_BLOCK
+    return positions[start] + (i - start)
+
+
 class DropoutCtx:
     """Per-kernel dropout constants; positions remap local rows / columns."""
 
@@ -160,16 +176,23 @@ class DropoutCtx:
 
     @cute.jit
     def global_q(self, q: Int32) -> Int32:
-        """Local row -> keyed row; out-of-range rows read the last position."""
+        """Local row -> keyed row; rows past the end extend the last block."""
         if cutlass.const_expr(self.q_positions is not None):
-            q = self.q_positions[cutlass.min(q, cute.size(self.q_positions) - 1)]
+            q = block_position(self.q_positions, q)
         return q
 
     @cute.jit
     def global_k(self, k: Int32) -> Int32:
         if cutlass.const_expr(self.kv_positions is not None):
-            k = self.kv_positions[cutlass.min(k, cute.size(self.kv_positions) - 1)]
+            k = block_position(self.kv_positions, k)
         return k
+
+    @cute.jit
+    def prefetch_k(self, k: Int32):
+        """Prefetch the position read by ``global_k(k)`` into L1 (``k >= 0``)."""
+        if cutlass.const_expr(self.kv_positions is not None):
+            start = cutlass.min(k, cute.size(self.kv_positions) - 1) & -POSITION_BLOCK
+            cute.arch.prefetch((self.kv_positions.iterator + start).llvm_ptr, cache_level="L1")
 
     @cute.jit
     def head_key(self, batch_idx: Int32, head_idx: Int32) -> Uint32:

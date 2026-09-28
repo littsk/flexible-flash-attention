@@ -12,7 +12,7 @@ from cutlass.cutlass_dsl import min as dsl_min
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.dropout import DropoutCtx
+from flash_attn.cute.dropout import POSITION_BLOCK, DropoutCtx
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
 
@@ -789,10 +789,12 @@ class AttentionMask:
 
         Each thread owns one score row, so the row term is hashed once. Coordinates
         match ``apply_mask_mod_sm100_scalar``: Pack-GQA rows are split back into
-        logical (q, head) first; even ``i`` and ``i + 1`` are adjacent columns.
-        With KV positions, lane ``l`` gathers column pairs ``l, l + 32, ...`` of the
-        block once and the masks read them back with shuffles.
+        logical (q, head) first; even ``i`` and ``i + 1`` are adjacent columns. A KV
+        tile lies in one position block, so its columns offset the first one's position.
         """
+        assert dropout.kv_positions is None or POSITION_BLOCK % self.tile_n == 0, (
+            "a KV tile must lie in one position block"
+        )
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         tScS_t2r = thr_tmem_load.partition_D(thr_mma.partition_C(cS)[(None, None), 0, 0])
         global_row = tScS_t2r[0][0] + m_block * self.tile_m
@@ -811,33 +813,24 @@ class AttentionMask:
         odd = (row & 1) != 0
         # The even row hashes column pair a, the odd row pair b = a + 1.
         own_pair = Int32(odd)
-        gather_k = dropout.kv_positions is not None
-        if const_expr(gather_k):
-            lane = cute.arch.lane_idx()
 
         def block_keep_masks(n_block: Int32):
-            pair0 = n_block * (self.tile_n // 2)
-            if const_expr(gather_k):
-                lane_k_terms = [
-                    dropout.k_term(dropout.global_k(2 * (pair0 + lane + 32 * r)))
-                    for r in range((self.tile_n + 63) // 64)
-                ]
-
-            def k_term(pair: int, lane_offset=0):
-                """K term of the block's column pair ``pair (+ lane_offset)``."""
-                if const_expr(not gather_k):
-                    return dropout.pair_k_term(pair0 + pair + lane_offset)
-                return cute.arch.shuffle_sync(lane_k_terms[pair // 32], (pair % 32) | lane_offset)
+            if const_expr(dropout.kv_positions is None):
+                pair0 = n_block * (self.tile_n // 2)
+            else:
+                pair0 = dropout.global_k(n_block * self.tile_n) >> 1
+                # KV blocks run downward; warm L1 for the next one.
+                dropout.prefetch_k(cutlass.max(n_block - 1, 0) * self.tile_n)
 
             def keep_masks(i: int):
                 pair_a = tScS_t2r[i][1] // 2
                 assert pair_a % 2 == 0 and tScS_t2r[i + 2][1] // 2 == pair_a + 1
                 if const_expr(share):
-                    own_k_term = k_term(pair_a, own_pair)
+                    own_k_term = dropout.pair_k_term(pair0 + pair_a + own_pair)
                     h_a, h_b = dropout.shared_pair_hashes(row_term, own_k_term, pair_lanes)
                 else:
-                    h_a = dropout.pair_hash(row_term, k_term(pair_a))
-                    h_b = dropout.pair_hash(row_term, k_term(pair_a + 1))
+                    h_a = dropout.pair_hash(row_term, dropout.pair_k_term(pair0 + pair_a))
+                    h_b = dropout.pair_hash(row_term, dropout.pair_k_term(pair0 + pair_a + 1))
                 return dropout.keep_mask(h_a, byte_sel), dropout.keep_mask(h_b, byte_sel)
 
             return keep_masks
@@ -861,7 +854,11 @@ class AttentionMask:
         hashed once; even ``i`` and ``i + 1`` are adjacent Q rows sharing one hash.
         KV rows ``k`` / ``k ^ 1`` sit in adjacent lanes and share every 2x2 hash, so
         the even row hashes Q pair ``(i, i + 1)`` and the odd row ``(i + 2, i + 3)``.
+        A Q tile lies in one position block, so its rows offset the first one's position.
         """
+        assert dropout.q_positions is None or POSITION_BLOCK % self.tile_m == 0, (
+            "a Q tile must lie in one position block"
+        )
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         k = dropout.global_k(tScS_t2r[0][COL] + n_block * self.tile_n)
@@ -869,19 +866,17 @@ class AttentionMask:
         # Q row pair of element 0 plus this lane's pair (b on odd KV rows); the other
         # elements sit at thread 0's static offsets from element 0.
         t0_row0 = t0ScS_t2r[None, 0, 0, 0][0][ROW]
-        own_pair0 = ((tScS_t2r[None, 0, 0, 0][0][ROW] + m_block * self.tile_m) >> 1) + Int32(
-            (tScS_t2r[0][COL] & 1) != 0
+        own_pair0 = (
+            (dropout.global_q(m_block * self.tile_m) >> 1)
+            + (tScS_t2r[None, 0, 0, 0][0][ROW] >> 1)
+            + Int32((tScS_t2r[0][COL] & 1) != 0)
         )
 
         def keep_quad(stage: int, i: int):
             t0_rows = t0ScS_t2r[None, stage, 0, 0]
             offset = t0_rows[i][ROW] - t0_row0
             assert offset % 4 == 0 and t0_rows[i + 2][ROW] == t0_rows[i][ROW] + 2
-            own_pair = own_pair0 + offset // 2
-            if const_expr(dropout.q_positions is None):
-                own_term = dropout.pair_q_term(own_pair)
-            else:
-                own_term = dropout.q_term(dropout.global_q(2 * own_pair))
+            own_term = dropout.pair_q_term(own_pair0 + offset // 2)
             h_a, h_b = dropout.shared_pair_hashes(col_term, own_term, 1)
             return (*dropout.col_keep_pair(h_a, k), *dropout.col_keep_pair(h_b, k))
 

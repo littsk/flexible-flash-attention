@@ -80,10 +80,12 @@ and advances its offset. The mask depends only on the logical coordinates, so th
 backward regenerates it under any tiling, 2CTA, PackGQA, SplitKV or block
 sparsity. `_flash_attn_fwd/_bwd(dropout=DropoutTensors(p, rng_state, q_positions,
 kv_positions))` remap kernel-local rows and columns to the coordinates the mask is
-keyed by (context parallelism passes global token positions); positions must map
-aligned pairs `(2i, 2i + 1)` to aligned pairs. `flash_attn.cute.dropout.
-dropout_keep_mask` is a bit-identical torch reference. SM90, the hd256 kernels and
-MLA reject dropout.
+keyed by (context parallelism passes global token positions). Within every
+128-aligned block of local indices (`POSITION_BLOCK`) positions must ascend by one
+from an even position, because the kernels read one position per tile and offset
+it; `check_block_contiguous` validates this (it syncs the device).
+`flash_attn.cute.dropout.dropout_keep_mask` is a bit-identical torch reference.
+SM90, the hd256 kernels and MLA reject dropout.
 
 ## Deterministic block-sparse PackGQA backward
 

@@ -2687,6 +2687,10 @@ class FlashAttentionForwardSm100:
         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
         tScS_shape = cta_qk_tiler  # (128, 128)
         tScP_shape = (tScS_shape[0], tilePlikeFP32)  # (128, 64)
+        keep_fn = None
+        if const_expr(dropout_keep_fn is not None):
+            # Issued before the S wait so a KV-position load overlaps it.
+            keep_fn = dropout_keep_fn(n_block)
 
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
@@ -2748,9 +2752,6 @@ class FlashAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
-        keep_fn = None
-        if const_expr(dropout_keep_fn is not None):
-            keep_fn = dropout_keep_fn(n_block)
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
